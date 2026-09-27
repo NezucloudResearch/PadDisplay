@@ -1,0 +1,22 @@
+# Build outputs
+host/build/
+host/dist/
+android/build/
+android/app/build/
+android/.gradle/
+android/.kotlin/
+*.apk
+*.aab
+
+# Machine-specific / personal
+android/local.properties
+.vscode/
+.idea/
+*.iml
+*.log
+cleanup-backup/
+
+# Signing keys: never commit
+*.jks
+*.keystore
+keystore.properties

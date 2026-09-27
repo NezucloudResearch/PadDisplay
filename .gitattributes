@@ -1,0 +1,13 @@
+# Normalize text to LF in the repository; keep Windows scripts CRLF on checkout.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.rc text eol=crlf
+android/gradlew text eol=lf
+
+# Binaries
+*.jar binary
+*.lib binary
+*.dll binary
+*.cat binary
+*.png binary

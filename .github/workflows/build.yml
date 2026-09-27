@@ -1,0 +1,44 @@
+# Builds the Windows host and the Android app on every push / pull request and keeps the results
+# as downloadable artifacts. Releases are made by hand from these artifacts.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build host (VS 2022, CMake, Ninja)
+        shell: cmd
+        run: host\build.cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PadDisplay-windows
+          path: host/dist/PadDisplay/
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PadDisplay-android
+          path: android/app/build/outputs/apk/release/*.apk
