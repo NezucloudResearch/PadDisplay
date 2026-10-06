@@ -189,22 +189,93 @@ void InputInjector::SendMouse(DWORD flags, POINT pt, DWORD data) {
     SendInput(1, &in, sizeof(in));
 }
 
+void InputInjector::SendMouseRel(DWORD flags, LONG dx, LONG dy, DWORD data) {
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dx = dx;
+    in.mi.dy = dy;
+    in.mi.dwFlags = flags;
+    in.mi.mouseData = data;
+    SendInput(1, &in, sizeof(in));
+}
+
+struct MouseButton {
+    DWORD down, up, data;
+};
+constexpr MouseButton kButtons[] = {
+    {MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0},     {MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0},
+    {MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0}, {MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1},
+    {MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2},
+};
+
+// Maps a button MouseKind to its index in kButtons. The kinds come in down/up pairs.
+static bool ButtonOf(uint8_t kind, int& button, bool& down) {
+    int first = 0;
+    if (kind >= MouseLeftDown && kind <= MouseRightUp) first = MouseLeftDown, button = 0;
+    else if (kind >= MouseMiddleDown && kind <= MouseX2Up) first = MouseMiddleDown, button = 2;
+    else return false;
+    button += (kind - first) / 2;
+    down = (kind - first) % 2 == 0;
+    return true;
+}
+
 void InputInjector::OnMouse(const uint8_t* p, size_t n) {
     if (n < 9) return;
     std::lock_guard lock(mutex_);
     POINT pt = Map(rd16(p + 1), rd16(p + 3));
     int16_t wheelV = int16_t(rd16(p + 5)), wheelH = int16_t(rd16(p + 7));
-    switch (p[0]) {
-    case MouseMove: SendMouse(0, pt); break;
-    case MouseLeftDown: SendMouse(MOUSEEVENTF_LEFTDOWN, pt), leftDown_ = true; break;
-    case MouseLeftUp: SendMouse(MOUSEEVENTF_LEFTUP, pt), leftDown_ = false; break;
-    case MouseRightDown: SendMouse(MOUSEEVENTF_RIGHTDOWN, pt), rightDown_ = true; break;
-    case MouseRightUp: SendMouse(MOUSEEVENTF_RIGHTUP, pt), rightDown_ = false; break;
-    case MouseWheel:
+    int button = 0;
+    bool down = false;
+    if (ButtonOf(p[0], button, down)) {
+        SendMouse(down ? kButtons[button].down : kButtons[button].up, pt, kButtons[button].data);
+        buttonsDown_ = uint8_t(down ? buttonsDown_ | (1 << button) : buttonsDown_ & ~(1 << button));
+    } else if (p[0] == MouseMove) {
+        SendMouse(0, pt);
+    } else if (p[0] == MouseWheel) {
         if (wheelV) SendMouse(MOUSEEVENTF_WHEEL, pt, DWORD(int32_t(wheelV)));
         if (wheelH) SendMouse(MOUSEEVENTF_HWHEEL, pt, DWORD(int32_t(wheelH)));
-        break;
     }
+}
+
+void InputInjector::OnMouseRel(const uint8_t* p, size_t n) {
+    if (n < 9) return;
+    std::lock_guard lock(mutex_);
+    int16_t dx = int16_t(rd16(p + 1)), dy = int16_t(rd16(p + 3));
+    int16_t wheelV = int16_t(rd16(p + 5)), wheelH = int16_t(rd16(p + 7));
+    int button = 0;
+    bool down = false;
+    if (ButtonOf(p[0], button, down)) {
+        SendMouseRel(down ? kButtons[button].down : kButtons[button].up, 0, 0, kButtons[button].data);
+        buttonsDown_ = uint8_t(down ? buttonsDown_ | (1 << button) : buttonsDown_ & ~(1 << button));
+    } else if (p[0] == MouseMove) {
+        if (dx || dy) SendMouseRel(MOUSEEVENTF_MOVE, dx, dy);
+    } else if (p[0] == MouseWheel) {
+        if (wheelV) SendMouseRel(MOUSEEVENTF_WHEEL, 0, 0, DWORD(int32_t(wheelV)));
+        if (wheelH) SendMouseRel(MOUSEEVENTF_HWHEEL, 0, 0, DWORD(int32_t(wheelH)));
+    }
+}
+
+// Scancodes, not virtual keys: the PC's own keyboard layout applies, as for a keyboard plugged into it.
+void InputInjector::SendKey(uint16_t code, bool down) {
+    INPUT in{};
+    in.type = INPUT_KEYBOARD;
+    in.ki.wScan = WORD(code & 0xFF);
+    if (code == kKeyPause) {
+        in.ki.wVk = VK_PAUSE; // its real scancode has an E1 prefix, which SendInput cannot express
+    } else {
+        in.ki.dwFlags = KEYEVENTF_SCANCODE | (code & kKeyExtended ? KEYEVENTF_EXTENDEDKEY : 0);
+    }
+    if (!down) in.ki.dwFlags |= KEYEVENTF_KEYUP;
+    SendInput(1, &in, sizeof(in));
+    keysDown_[code] = down;
+}
+
+void InputInjector::OnKey(const uint8_t* p, size_t n) {
+    if (n < 3) return;
+    uint16_t code = rd16(p + 1);
+    if (code >= keysDown_.size() || (code & 0xFF) == 0 || (code & 0xFF) >= 0x80) return; // not a make code
+    std::lock_guard lock(mutex_);
+    SendKey(code, (p[0] & KeyDown) != 0);
 }
 
 void InputInjector::Tick() {
@@ -226,10 +297,11 @@ void InputInjector::ReleaseAll() {
     if (used) Inject(touchDev_, frame.data(), used, "touch release");
     if (penInContact_) InjectPen(POINTER_FLAG_UP | POINTER_FLAG_INRANGE, POINTER_CHANGE_FIRSTBUTTON_UP);
     if (penInRange_) InjectPen(POINTER_FLAG_UPDATE, POINTER_CHANGE_NONE);
-    POINT cur;
-    GetCursorPos(&cur);
-    if (leftDown_) SendMouse(MOUSEEVENTF_LEFTUP, cur), leftDown_ = false;
-    if (rightDown_) SendMouse(MOUSEEVENTF_RIGHTUP, cur), rightDown_ = false;
+    for (int b = 0; b < int(std::size(kButtons)); ++b)
+        if (buttonsDown_ & (1 << b)) SendMouseRel(kButtons[b].up, 0, 0, kButtons[b].data);
+    buttonsDown_ = 0;
+    for (size_t code = 0; code < keysDown_.size(); ++code)
+        if (keysDown_[code]) SendKey(uint16_t(code), false);
 }
 
 } // namespace pd

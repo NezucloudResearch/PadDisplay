@@ -5,6 +5,7 @@ package com.nezucloud.paddisplay
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -12,6 +13,7 @@ import kotlin.math.abs
 import kotlin.math.atan
 import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.tan
 
@@ -21,10 +23,13 @@ import kotlin.math.tan
  * - Fingers: native multi-touch, or (mouseMode) mouse gestures: tap = click, drag = left-drag,
  *   long-press / two-finger tap = right click, two-finger drag = scroll.
  * Fingers are ignored while the pen is near the screen (palm rejection).
+ * - A mouse connected to the tablet (deviceInput): the PC pointer follows it over the picture, or,
+ *   while the activity holds pointer capture, its raw movement is sent for games.
  */
 class InputCapture(private val view: View, private val send: (ByteArray) -> Unit) {
 
     var mouseMode = false
+    var deviceInput = true
 
     private val handler = Handler(Looper.getMainLooper())
     private val slop = ViewConfiguration.get(view.context).scaledTouchSlop.toFloat()
@@ -40,12 +45,16 @@ class InputCapture(private val view: View, private val send: (ByteArray) -> Unit
     fun onTouch(ev: MotionEvent): Boolean {
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) view.requestUnbufferedDispatch(ev)
         if (isPen(ev)) return handlePen(ev)
+        if (isMouse(ev)) return handlePointer(ev)
         if (SystemClock.uptimeMillis() - lastPenMs < 400 || penInRange) return true // palm rejection
         if (mouseMode) handleMouse(ev) else handleTouch(ev)
         return true
     }
 
-    fun onHover(ev: MotionEvent): Boolean = if (isPen(ev)) handlePen(ev) else false
+    fun onHover(ev: MotionEvent): Boolean = if (isPen(ev)) handlePen(ev) else isMouse(ev) && handlePointer(ev)
+
+    /** Mouse wheel and button changes. */
+    fun onGenericMotion(ev: MotionEvent): Boolean = !isPen(ev) && isMouse(ev) && handlePointer(ev)
 
     private fun isPen(ev: MotionEvent): Boolean {
         val t = ev.getToolType(0)
@@ -291,6 +300,101 @@ class InputCapture(private val view: View, private val send: (ByteArray) -> Unit
                 state = State.IDLE
             }
         }
+    }
+
+    // ---- mouse connected to the tablet ----------------------------------------------------
+
+    // Android button -> the protocol's "down" kind; the "up" kind is the next value.
+    private val mouseButtons = arrayOf(
+        MotionEvent.BUTTON_PRIMARY to Protocol.MOUSE_LEFT_DOWN,
+        MotionEvent.BUTTON_SECONDARY to Protocol.MOUSE_RIGHT_DOWN,
+        MotionEvent.BUTTON_TERTIARY to Protocol.MOUSE_MIDDLE_DOWN,
+        MotionEvent.BUTTON_BACK to Protocol.MOUSE_X1_DOWN,
+        MotionEvent.BUTTON_FORWARD to Protocol.MOUSE_X2_DOWN,
+    )
+    private var buttonsDown = 0
+    private var relAccX = 0f
+    private var relAccY = 0f
+    private var padX = 0f
+    private var padY = 0f
+
+    private fun isMouse(ev: MotionEvent) = deviceInput && ev.isFromSource(InputDevice.SOURCE_MOUSE)
+
+    private fun mouseRel(kind: Int, dx: Int = 0, dy: Int = 0, wheelV: Int = 0, wheelH: Int = 0) {
+        send(Protocol.message(Protocol.MOUSE_REL, 9) {
+            it.put(kind.toByte())
+            it.putShort(dx.coerceIn(-32768, 32767).toShort())
+            it.putShort(dy.coerceIn(-32768, 32767).toShort())
+            it.putShort(wheelV.coerceIn(-32768, 32767).toShort())
+            it.putShort(wheelH.coerceIn(-32768, 32767).toShort())
+        })
+    }
+
+    /** Sends the buttons that changed since the last event. Every mouse event carries all of them. */
+    private fun syncButtons(state: Int, sendKind: (Int) -> Unit) {
+        val changed = state xor buttonsDown
+        if (changed == 0) return
+        for ((button, downKind) in mouseButtons) {
+            if (changed and button != 0) sendKind(if (state and button != 0) downKind else downKind + 1)
+        }
+        buttonsDown = state
+    }
+
+    // One wheel notch is 1.0 on Android and 120 on Windows.
+    private fun wheel(ev: MotionEvent, axis: Int) = (ev.getAxisValue(axis) * 120).roundToInt()
+
+    /** The mouse points at the picture: the PC pointer goes to the same place. */
+    private fun handlePointer(ev: MotionEvent): Boolean {
+        val x = ev.x
+        val y = ev.y
+        if (ev.actionMasked == MotionEvent.ACTION_SCROLL) {
+            mouse(Protocol.MOUSE_WHEEL, x, y, wheel(ev, MotionEvent.AXIS_VSCROLL), wheel(ev, MotionEvent.AXIS_HSCROLL))
+            return true
+        }
+        mouse(Protocol.MOUSE_MOVE, x, y)
+        syncButtons(ev.buttonState) { mouse(it, x, y) }
+        return true
+    }
+
+    /** With pointer capture (for games): raw movement, so the pointer is not bound to the picture. */
+    fun onCapturedPointer(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_SCROLL) {
+            mouseRel(Protocol.MOUSE_WHEEL, 0, 0, wheel(ev, MotionEvent.AXIS_VSCROLL), wheel(ev, MotionEvent.AXIS_HSCROLL))
+            return true
+        }
+        if (ev.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)) {
+            if (ev.actionMasked == MotionEvent.ACTION_MOVE) {
+                for (h in 0 until ev.historySize) {
+                    relAccX += ev.getHistoricalX(h)
+                    relAccY += ev.getHistoricalY(h)
+                }
+                relAccX += ev.x
+                relAccY += ev.y
+            }
+        } else { // a captured touchpad reports where the finger is, not how far it moved
+            if (ev.actionMasked == MotionEvent.ACTION_MOVE) {
+                relAccX += ev.x - padX
+                relAccY += ev.y - padY
+            }
+            padX = ev.x
+            padY = ev.y
+        }
+        val dx = relAccX.toInt()
+        val dy = relAccY.toInt()
+        if (dx != 0 || dy != 0) {
+            mouseRel(Protocol.MOUSE_MOVE, dx, dy)
+            relAccX -= dx
+            relAccY -= dy
+        }
+        syncButtons(ev.buttonState) { mouseRel(it) }
+        return true
+    }
+
+    /** Capture was switched on or off: no button may stay held on the PC. */
+    fun releaseMouseButtons() {
+        syncButtons(0) { mouseRel(it) }
+        relAccX = 0f
+        relAccY = 0f
     }
 
     fun release() {

@@ -25,7 +25,8 @@ struct CaptureTarget {
 bool FindOutput(const std::wstring& gdiName, CaptureTarget& target);
 
 // Creates a D3D11 device on the given adapter with video support (needed by both encoders).
-bool CreateDevice(IDXGIAdapter1* adapter, ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& ctx);
+// gamingMode raises this process's GPU scheduling priority from high to realtime.
+bool CreateDevice(IDXGIAdapter1* adapter, bool gamingMode, ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& ctx);
 
 class DesktopCapture {
 public:

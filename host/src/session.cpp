@@ -8,6 +8,7 @@
 #include <ws2tcpip.h>
 #include <qos2.h>
 #include <algorithm>
+#include <chrono>
 #include <cwchar>
 
 namespace pd {
@@ -18,6 +19,9 @@ Session::Session(SOCKET sock, const ClientHello& hello, bool usb, const Settings
 Session::~Session() {
     Stop();
     if (recvThread_.joinable()) recvThread_.join();
+    if (inputThread_.joinable()) inputThread_.join();
+    if (layoutThread_.joinable()) layoutThread_.join();
+    gamepads_.reset(); // its rumble threads send on the socket
     if (qos_) {
         if (qosFlow_) QOSRemoveSocketFromFlow(qos_, sock_, qosFlow_, 0);
         QOSCloseHandle(qos_);
@@ -37,7 +41,14 @@ bool Session::Send(Msg type, const void* payload, uint32_t len) {
         if (type == Msg::Frame && len > 9) fwrite(p + 9, 1, len - 9, dump_);
         return true;
     }
-    return sock_ != INVALID_SOCKET && SendMsg(sock_, type, payload, len);
+    if (sock_ == INVALID_SOCKET) return false;
+    std::lock_guard lock(sendMutex_);
+    return SendMsg(sock_, type, payload, len);
+}
+
+void Session::SendNotice(const char* text) {
+    Send(Msg::Notice, text, uint32_t(strlen(text)));
+    if (status_) status_(L"Error: " + Widen(text));
 }
 
 void Session::SendError(ErrorCode code, const char* text) {
@@ -55,6 +66,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     startUs_ = lastSecondUs_ = NowUs();
     lastRecvUs_ = startUs_;
     deadlineUs_ = dumpSeconds > 0 ? startUs_ + uint64_t(dumpSeconds) * 1000000 : 0;
+    CancelScreenRestore(); // this session arranges the screens now; an earlier one's retry must not undo that
 
     // Auto: H.264 over USB (bandwidth to spare, fastest encode), HEVC over Wi-Fi (better quality per bit).
     bool wantHevc = settings_.codec == L"hevc" || (settings_.codec == L"auto" && !usb_);
@@ -115,7 +127,28 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         SendError(ErrNoDisplay, "Could not attach the virtual display to the desktop.");
         return;
     }
-    if (settings_.displayOverride.empty()) RestoreHomeLayout(); // attaching/reloading may have moved real screens
+    onlyScreen_ = (hello_.flags & HelloOnlyScreen) != 0 && sock_ != INVALID_SOCKET && settings_.displayOverride.empty();
+    if (onlyScreen_ && !ShowOnlyOn(gdiName_)) {
+        onlyScreen_ = false;
+        SendNotice("Could not switch the PC's own screens off. The tablet is an extra screen for now. See the PadDisplay log.");
+    }
+    // In only-screen mode a UAC prompt on the secure desktop would be invisible and unanswerable. If the
+    // user opted in (and the host is elevated), move prompts to the normal desktop so the tablet can
+    // click them. Restored on teardown and at start-up; a no-op otherwise.
+    if (onlyScreen_ && settings_.uacClickableOnTablet) AllowUacClicksOnTablet();
+    // Attaching/reloading may have moved real screens. Windows re-applies its own layout for a
+    // moment afterwards, so watching for that takes 1.5 s: do it while the stream starts.
+    if (settings_.displayOverride.empty())
+        layoutThread_ = std::thread([this] {
+            if (!onlyScreen_) {
+                if (RestoreHomeLayout() > 0) layoutChanged_ = true;
+                return;
+            }
+            for (int i = 0; i < 8 && !stop_; ++i) { // that re-applied layout switches the real screens back on
+                Sleep(250);
+                if (!SnapshotRealDisplays().empty() && ShowOnlyOn(gdiName_)) layoutChanged_ = true;
+            }
+        });
     if (active.hz >= 10 && active.hz < fps_) {
         LOGI("session: tablet wants %d Hz but the virtual display offers %d Hz at this resolution", fps_, active.hz);
         fps_ = active.hz;
@@ -137,25 +170,45 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     if (sock_ != INVALID_SOCKET) {
         input_ = std::make_unique<InputInjector>();
         recvThread_ = std::thread([this] { RecvLoop(); });
+        inputThread_ = std::thread([this] { InputLoop(); });
     }
 
     int failures = 0;
+    bool toldAboutPrompt = false;
     while (!stop_) {
         int r = SetupPipeline();
-        if (r < 0 || (r == 0 && ++failures > 150)) { // ~30 s of retries (secure desktop, mode switch)
+        // ~30 s of retries (mode switch). A UAC prompt can stay up for minutes and is no failure: keep
+        // the tablet connected (it gives up after a few seconds of silence) and wait for the answer.
+        if (r < 0 || (r == 0 && !secureDesktop_ && ++failures > 150)) {
             SendError(ErrEncoder, "Could not start capture/encoding on the PC. See the host log.");
             break;
         }
         if (r == 0) {
+            if (secureDesktop_ && !toldAboutPrompt) {
+                toldAboutPrompt = true;
+                SendNotice(onlyScreen_ ? "Windows is asking for administrator approval (UAC). The tablet cannot show that prompt, and the PC's own screens are off. Answer it with the PC's keyboard, or disconnect the tablet to get the PC screens back."
+                                       : "Windows is asking for administrator approval (UAC). The tablet cannot show that prompt: answer it on the PC's own screen. The picture continues afterwards.");
+            }
+            if (!Heartbeat(NowUs())) break;
             Sleep(200);
             continue;
         }
         failures = 0;
+        toldAboutPrompt = false;
         if (!StreamLoop()) break;
     }
     stop_ = true;
     if (recvThread_.joinable()) recvThread_.join();
+    if (inputThread_.joinable()) inputThread_.join();
+    if (layoutThread_.joinable()) layoutThread_.join();
     if (input_) input_->ReleaseAll();
+    gamepads_.reset(); // unplugs the virtual controllers
+    if (onlyScreen_) {
+        RestoreSecureDesktop(); // put UAC prompts back on the secure desktop if we moved them off
+        // The PC's own screens come back first, whatever else happens below. If Windows refuses (a UAC
+        // prompt is up), ShowOnAllAgain keeps trying in the background and restores the layout itself.
+        if (ShowOnAllAgain()) RestoreHomeLayout();
+    }
     if (sock_ != INVALID_SOCKET && settings_.displayOverride.empty()) {
         // Remember how the user set things up (they may have moved or re-sized the virtual monitor
         // in Windows' display settings during the session) so the next connection restores it.
@@ -173,6 +226,26 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     LOGI("session: ended");
 }
 
+// Keeps the tablet's connection alive (it gives up after a few seconds of silence) and notices when
+// the tablet stopped answering. Also runs while the pipeline cannot be built, e.g. during a UAC prompt.
+bool Session::Heartbeat(uint64_t now) {
+    if (sock_ == INVALID_SOCKET) return true;
+    // Signed: the receive thread may have stamped lastRecvUs_ after `now` was read.
+    if (int64_t(now) - int64_t(lastRecvUs_.load()) > 10000000) {
+        LOGI("session: client stopped responding");
+        return false;
+    }
+    if (now - lastPingUs_ >= 500000) {
+        uint8_t ping[16];
+        wr64(ping, now);
+        wr32(ping + 8, lastRttUs_);
+        wr32(ping + 12, uint32_t(bitrateKbps_));
+        if (!Send(Msg::Ping, ping, sizeof(ping))) return false;
+        lastPingUs_ = now;
+    }
+    return true;
+}
+
 int Session::SetupPipeline() {
     CaptureTarget t;
     if (!FindOutput(gdiName_, t)) return 0; // display still settling
@@ -185,7 +258,9 @@ int Session::SetupPipeline() {
         capture_ = DesktopCapture();
         device_.Reset();
         ctx_.Reset();
-        if (!CreateDevice(t.adapter.Get(), device_, ctx_)) return -1;
+        // The tablet app decides; an app from before v3 cannot, so settings.ini does.
+        bool gamingMode = hello_.version >= 3 ? (hello_.flags & HelloGamingMode) != 0 : settings_.gamingMode;
+        if (!CreateDevice(t.adapter.Get(), gamingMode, device_, ctx_)) return -1;
         LOGI("session: capturing on %ls", t.adapterName.c_str());
         if (t.vendorId != 0x10DE)
             LOGI("session: the virtual display is not rendered by the NVIDIA GPU; using Media Foundation. "
@@ -194,6 +269,7 @@ int Session::SetupPipeline() {
     target_ = t;
 
     HRESULT hr = capture_.Init(device_.Get(), t.output.Get(), settings_.drawCursor);
+    secureDesktop_ = hr == E_ACCESSDENIED;
     if (FAILED(hr)) {
         static int logged = 0;
         if (logged++ < 5 || hr != E_ACCESSDENIED) LOGI("session: DuplicateOutput failed 0x%08lx%s", hr,
@@ -239,6 +315,8 @@ int Session::SetupPipeline() {
         hi[7] = uint8_t(fps_);
         wr32(hi + 8, uint32_t(bitrateKbps_));
         if (!Send(Msg::HostHello, hi, sizeof(hi))) return -1;
+        // The tablet restarts its decoder now and acks late for a moment: that is not congestion.
+        adaptHoldUntilUs_ = NowUs() + 2000000;
         configSent_ = false;
         keyframeRequested_ = true;
     }
@@ -248,26 +326,16 @@ int Session::SetupPipeline() {
 bool Session::StreamLoop() {
     int refines = 0;
     bool pendingIdr = false;
-    uint64_t lastEncodeUs = 0, lastPingUs = 0;
+    uint64_t lastEncodeUs = 0;
     std::vector<uint8_t> au, msg;
     while (!stop_) {
         uint64_t now = NowUs();
         if (deadlineUs_ && now >= deadlineUs_) return false;
-        if (sock_ != INVALID_SOCKET) {
-            // Signed: the receive thread may have stamped lastRecvUs_ after `now` was read.
-            if (int64_t(now) - int64_t(lastRecvUs_.load()) > 10000000) {
-                LOGI("session: client stopped responding");
-                return false;
-            }
-            if (now - lastPingUs >= 500000) {
-                uint8_t ping[16];
-                wr64(ping, now);
-                wr32(ping + 8, lastRttUs_);
-                wr32(ping + 12, uint32_t(bitrateKbps_));
-                if (!Send(Msg::Ping, ping, sizeof(ping))) return false;
-                lastPingUs = now;
-            }
+        if (layoutChanged_.exchange(false)) {
+            LOGI("session: real screens were put back, refreshing the capture target");
+            return true;
         }
+        if (!Heartbeat(now)) return false;
         if (now - lastSecondUs_ >= 1000000) {
             AdaptBitrate();
             ReportStatus(now);
@@ -283,8 +351,13 @@ bool Session::StreamLoop() {
 
         // Flow control: never queue more than a few frames in the network. Skipped updates are not
         // lost - duplication coalesces them and the next acquire returns the newest desktop.
-        if (flowControl_ && framesSent_ - framesAcked_ >= uint64_t(settings_.maxFramesInFlight)) {
-            SleepUs(1000);
+        const uint64_t maxInFlight = uint64_t(settings_.maxFramesInFlight);
+        if (flowControl_ && framesSent_ - framesAcked_ >= maxInFlight) {
+            // Woken by the next ack; the timeout keeps the pings and checks above running.
+            {
+                std::unique_lock lock(inflightMutex_);
+                ackCv_.wait_for(lock, std::chrono::milliseconds(5), [&] { return stop_ || framesSent_ - framesAcked_ < maxInFlight; });
+            }
             blockedUsThisSecond_ += NowUs() - now;
             continue;
         }
@@ -295,7 +368,8 @@ bool Session::StreamLoop() {
         bool force = pendingIdr || refine;
         bool fresh = false;
         ID3D11Texture2D* tex = encoder_->InputTexture();
-        auto r = capture_.Next(force ? 0 : (refines > 0 ? 20 : 100), tex, force, fresh);
+        // Short wait: a keyframe request must not sit behind an idle desktop.
+        auto r = capture_.Next(force ? 0 : 20, tex, force, fresh);
         uint64_t tCaptured = NowUs();
         if (r == DesktopCapture::Lost) {
             LOGI("session: duplication lost (mode change / secure desktop), restarting capture");
@@ -354,7 +428,7 @@ bool Session::StreamLoop() {
 }
 
 void Session::RecvLoop() {
-    MakeRealtimeThread(L"Games"); // input injection latency
+    MakeRealtimeThread(L"Games"); // ack and input latency
     std::vector<uint8_t> buf;
     Msg type{};
     while (!stop_) {
@@ -370,23 +444,37 @@ void Session::RecvLoop() {
             lastRecvUs_ = now;
             const uint8_t* p = buf.data();
             switch (type) {
-            case Msg::Touch: input_->OnTouch(p, buf.size()); break;
-            case Msg::Pen: input_->OnPen(p, buf.size()); break;
-            case Msg::Mouse: input_->OnMouse(p, buf.size()); break;
+            case Msg::Touch:
+            case Msg::Pen:
+            case Msg::Mouse:
+            case Msg::MouseRel:
+            case Msg::Key:
+            case Msg::Gamepad: {
+                {
+                    std::lock_guard lock(inputMutex_);
+                    inputQueue_.emplace_back(type, std::move(buf));
+                }
+                buf.clear(); // moved from
+                inputCv_.notify_one();
+                break;
+            }
             case Msg::KeyframeReq: keyframeRequested_ = true; break;
             case Msg::FrameAck:
                 if (buf.size() >= 8) {
                     uint64_t pts = rd64(p);
-                    std::lock_guard lock(inflightMutex_);
-                    while (!inflight_.empty() && inflight_.front().first < pts) inflight_.pop_front();
-                    if (!inflight_.empty() && inflight_.front().first == pts) {
-                        uint32_t lat = uint32_t(std::min<uint64_t>(now - inflight_.front().second, UINT32_MAX));
-                        inflight_.pop_front();
-                        lastLatencyUs_ = lat;
-                        latencySumUs_ += lat;
-                        ++latencyCount_;
+                    {
+                        std::lock_guard lock(inflightMutex_);
+                        while (!inflight_.empty() && inflight_.front().first < pts) inflight_.pop_front();
+                        if (!inflight_.empty() && inflight_.front().first == pts) {
+                            uint32_t lat = uint32_t(std::min<uint64_t>(now - inflight_.front().second, UINT32_MAX));
+                            inflight_.pop_front();
+                            lastLatencyUs_ = lat;
+                            latencySumUs_ += lat;
+                            ++latencyCount_;
+                        }
+                        ++framesAcked_;
                     }
-                    ++framesAcked_;
+                    ackCv_.notify_one(); // the capture thread may be waiting for room to send
                 }
                 break;
             case Msg::Pong:
@@ -400,10 +488,45 @@ void Session::RecvLoop() {
             default: break;
             }
         }
-        input_->Tick();
     }
     LOGI("session: connection closed");
     stop_ = true;
+    ackCv_.notify_all();
+    inputCv_.notify_all();
+}
+
+void Session::InputLoop() {
+    MakeRealtimeThread(L"Games"); // input injection latency
+    std::deque<std::pair<Msg, std::vector<uint8_t>>> batch;
+    while (!stop_) {
+        {
+            std::unique_lock lock(inputMutex_);
+            inputCv_.wait_for(lock, std::chrono::milliseconds(50), [&] { return stop_ || !inputQueue_.empty(); });
+            batch.swap(inputQueue_);
+        }
+        for (auto& [type, buf] : batch) {
+            switch (type) {
+            case Msg::Touch: input_->OnTouch(buf.data(), buf.size()); break;
+            case Msg::Pen: input_->OnPen(buf.data(), buf.size()); break;
+            case Msg::Mouse: input_->OnMouse(buf.data(), buf.size()); break;
+            case Msg::MouseRel: input_->OnMouseRel(buf.data(), buf.size()); break;
+            case Msg::Key: input_->OnKey(buf.data(), buf.size()); break;
+            case Msg::Gamepad:
+                if (!gamepads_)
+                    gamepads_ = std::make_unique<GamepadBridge>(
+                        [this](uint8_t index, uint8_t largeMotor, uint8_t smallMotor) {
+                            const uint8_t rumble[3] = {index, largeMotor, smallMotor};
+                            Send(Msg::Rumble, rumble, sizeof(rumble));
+                        },
+                        [this](const char* text) { SendNotice(text); });
+                gamepads_->OnState(buf.data(), buf.size());
+                break;
+            default: break;
+            }
+        }
+        batch.clear();
+        input_->Tick();
+    }
 }
 
 void Session::AdaptBitrate() {
@@ -415,6 +538,10 @@ void Session::AdaptBitrate() {
     lastBlockedMs_ = uint32_t(blockedUs / 1000);
     blockedUsThisSecond_ = 0;
     if (!settings_.adaptive || !encoder_) return;
+    if (NowUs() < adaptHoldUntilUs_) {
+        stableSeconds_ = 0;
+        return;
+    }
 
     bool congested = false, clear = false;
     uint64_t avg = 0, base = 0;
@@ -525,6 +652,7 @@ std::vector<uint8_t> ExtractParameterSets(const std::vector<uint8_t>& au, Codec 
 bool Server::Start() {
     listen_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listen_ == INVALID_SOCKET) return false;
+    NoInherit(listen_);
     DWORD off = 0;
     setsockopt(listen_, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char*>(&off), sizeof(off));
     sockaddr_in6 a{};
@@ -544,8 +672,8 @@ bool Server::Start() {
 
 void Server::Stop() {
     stopping_ = true;
+    if (acceptThread_.joinable()) acceptThread_.join(); // it polls stopping_: no need to wake it by closing the socket
     if (listen_ != INVALID_SOCKET) closesocket(listen_), listen_ = INVALID_SOCKET;
-    if (acceptThread_.joinable()) acceptThread_.join();
     for (int i = 0; i < 100 && handshakes_ > 0; ++i) Sleep(100); // they time out after 5 s at most
     std::lock_guard lock(sessionMutex_);
     StopSession();
@@ -569,6 +697,17 @@ void Server::UpdateSettings(const Settings& s) {
 
 void Server::AcceptLoop() {
     while (!stopping_) {
+        // Wait with a timeout rather than blocking in accept(): closing a socket does not reliably wake
+        // a thread blocked in accept(), and Exit has to be able to stop this loop.
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(listen_, &rs);
+        timeval tv{0, 200000};
+        int ready = select(0, &rs, nullptr, nullptr, &tv);
+        if (ready <= 0) {
+            if (ready < 0) Sleep(100);
+            continue;
+        }
         sockaddr_storage addr{};
         int len = sizeof(addr);
         SOCKET s = accept(listen_, reinterpret_cast<sockaddr*>(&addr), &len);
@@ -577,6 +716,7 @@ void Server::AcceptLoop() {
             Sleep(100);
             continue;
         }
+        NoInherit(s);
         // Each hello/PIN exchange runs on its own thread, so a client that connects and stays silent
         // cannot block others (it times out after 5 s). Cap the number in progress.
         if (handshakes_ >= 4) {
@@ -700,7 +840,9 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
     h.maxTouch = p[9];
     h.pin = rd32(&p[10]);
     h.maxFps = rd16(&p[14]);
-    memcpy(h.name, p.data() + 16, std::min<size_t>(p.size() - 16, sizeof(h.name) - 1));
+    size_t nameAt = 16;
+    if (h.version >= 3 && p.size() > 16) h.flags = p[nameAt++];
+    memcpy(h.name, p.data() + nameAt, std::min<size_t>(p.size() - nameAt, sizeof(h.name) - 1));
 
     Settings cfg;
     {
@@ -719,8 +861,9 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
     if (!CheckPin(s, addr, usb, h.pin, cfg)) return;
     DWORD zero = 0;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&zero), sizeof(zero));
-    LOGI("server: client '%s' from %s (%s) screen %ux%u@%u dpi %u codecs %u", h.name, AddrToString(addr).c_str(),
-         usb ? "USB" : "Wi-Fi", h.screenW, h.screenH, h.maxFps, h.dpi, h.codecMask);
+    LOGI("server: client '%s' from %s (%s) screen %ux%u@%u dpi %u codecs %u%s%s", h.name, AddrToString(addr).c_str(),
+         usb ? "USB" : "Wi-Fi", h.screenW, h.screenH, h.maxFps, h.dpi, h.codecMask, h.flags & HelloGamingMode ? ", gaming mode" : "",
+         h.flags & HelloOnlyScreen ? ", only screen" : "");
 
     std::lock_guard replace(sessionMutex_);
     if (stopping_) {

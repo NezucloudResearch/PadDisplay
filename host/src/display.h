@@ -60,6 +60,27 @@ std::vector<DisplayPlacement> LoadHomeLayout();
 // Puts the real screens back to the home layout (waits briefly for Windows to settle first).
 int RestoreHomeLayout();
 
+// "Only screen" mode: the virtual monitor becomes the PC's only active display, so the real screens
+// go dark. It is applied without saving it in Windows' display database: after a crash or a
+// restart, Windows returns to the stored setup (the real screens) by itself.
+bool ShowOnlyOn(const std::wstring& gdiName);
+// Back to the stored setup. true = the real screens are on (then restore the home layout). false = none
+// came back, usually because a security prompt (UAC) is up: it keeps trying in the background and
+// restores the home layout itself once they are on.
+bool ShowOnAllAgain();
+// A new session wants the screens its own way: stop that background attempt.
+void CancelScreenRestore();
+// At exit: give a running background attempt a moment to finish.
+void WaitScreenRestore(unsigned timeoutMs);
+
+// Only-screen mode + an elevated host: optionally move UAC prompts off the (uncapturable) secure
+// desktop onto the normal desktop, so the tablet can show and click them. This is a machine-wide
+// Windows security setting (see SECURITY.md), so it is applied only while a tablet is the PC's only
+// screen and always put back. The previous value is kept in a marker file, so a crash cannot leave
+// the secure desktop disabled: RestoreSecureDesktop (also called at start-up) recovers it.
+bool AllowUacClicksOnTablet(); // true = UAC prompts are now on the normal desktop (or already were)
+void RestoreSecureDesktop();   // undo AllowUacClicksOnTablet; a no-op if nothing was changed
+
 // Logs every display device and DXGI output (for --list and diagnostics).
 void LogDisplays();
 

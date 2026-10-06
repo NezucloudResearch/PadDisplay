@@ -85,6 +85,9 @@ class MainActivity : Activity() {
         col.addView(section("Input"))
         col.addView(switch("Touch acts as mouse (tap = click, two fingers = scroll / right-click)", "mouseMode", false))
         col.addView(hint("Off = real Windows multi-touch. The stylus always works as a pen with pressure and tilt."))
+        col.addView(switch("Send keyboard, mouse and game controllers connected to this tablet to the PC", "deviceInput", true))
+        col.addView(switch("Capture the mouse for games (relative movement)", "mouseCapture", false))
+        col.addView(hint("Ctrl+Alt+Shift+M switches mouse capture while connected. Game controllers need the ViGEmBus driver on the PC."))
         col.addView(switch("Show performance overlay", "stats", false))
 
         col.addView(section("Audio"))
@@ -93,6 +96,10 @@ class MainActivity : Activity() {
         col.addView(hint("Off = no audio is captured or sent at all. On uses about 1.5 Mbps and does not slow the picture."))
 
         col.addView(section("Display"))
+        col.addView(switch("Use this tablet as the PC's only screen", "onlyScreen", false))
+        col.addView(hint("Off = an extra screen next to the PC's own. On = the PC's own screens are switched off while this tablet is connected, and come back when it disconnects."))
+        col.addView(switch("Gaming mode (the stream gets GPU time ahead of the game)", "gamingMode", false))
+        col.addView(hint("Turn it on if the picture stutters while a game uses the whole GPU. With little free video memory it can freeze the NVIDIA encoder."))
         val rates = DisplayModes.rates(this)
         col.addView(hint("Refresh rate (the PC's virtual monitor switches to match)"))
         col.addView(radioGroup("refreshRate", 0,

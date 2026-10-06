@@ -26,6 +26,10 @@ const wchar_t kHardwareId[] = L"Root\\MttVDD";
 const wchar_t kSettingsDir[] = L"C:\\VirtualDisplayDriver";
 const wchar_t kTaskOn[] = L"\\PadDisplay\\VirtualMonitorOn";
 const wchar_t kTaskOff[] = L"\\PadDisplay\\VirtualMonitorOff";
+// {4d36e97d-e325-11ce-bfc1-08002be10318}: ViGEmBus, the virtual game controller bus, is a System device.
+const GUID kSystemClass = {0x4d36e97d, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+const wchar_t kVigemHardwareId[] = L"Nefarius\\ViGEmBus\\Gen1";
+const wchar_t kTaskGamepadOn[] = L"\\PadDisplay\\GameControllerOn";
 
 // Common tablet / monitor resolutions, landscape. The tablet's own mode is added on connect.
 const int kDefaultModes[][2] = {
@@ -34,20 +38,20 @@ const int kDefaultModes[][2] = {
 };
 const int kDefaultRates[] = {60, 90, 120, 144};
 
-bool HasHardwareId(HDEVINFO set, SP_DEVINFO_DATA& d) {
+bool HasHardwareId(HDEVINFO set, SP_DEVINFO_DATA& d, const wchar_t* hardwareId) {
     wchar_t buf[1024] = {};
     if (!SetupDiGetDeviceRegistryPropertyW(set, &d, SPDRP_HARDWAREID, nullptr, reinterpret_cast<BYTE*>(buf), sizeof(buf) - 4, nullptr))
         return false;
     for (const wchar_t* p = buf; *p; p += wcslen(p) + 1)
-        if (_wcsicmp(p, kHardwareId) == 0) return true;
+        if (_wcsicmp(p, hardwareId) == 0) return true;
     return false;
 }
 
-// Finds the VDD device node (present or not). Returns false if there is none.
-bool FindDevice(HDEVINFO set, SP_DEVINFO_DATA& out) {
+// Finds the device node with this hardware ID (present or not). Returns false if there is none.
+bool FindDevice(HDEVINFO set, SP_DEVINFO_DATA& out, const wchar_t* hardwareId = kHardwareId) {
     SP_DEVINFO_DATA d{sizeof(d)};
     for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &d); ++i) {
-        if (HasHardwareId(set, d)) {
+        if (HasHardwareId(set, d, hardwareId)) {
             out = d;
             return true;
         }
@@ -160,15 +164,15 @@ std::wstring LastErrorText(DWORD err) {
     return s + L" (" + std::to_wstring(err) + L")";
 }
 
-// Registers a hidden task that runs "pnputil /<verb>-device /deviceid Root\MttVDD" as SYSTEM (no
+// Registers a hidden task that runs "pnputil /<verb>-device /deviceid <hardwareId>" as SYSTEM (no
 // window). The security descriptor lets interactive users start it; it can only toggle this device.
-bool CreateToggleTask(const wchar_t* name, const wchar_t* verb, std::wstring& message) {
+bool CreateToggleTask(const wchar_t* name, const wchar_t* verb, const wchar_t* what, const wchar_t* hardwareId, std::wstring& message) {
     std::wstring xml =
         L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
         L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
         L"  <RegistrationInfo>\r\n"
         L"    <Author>PadDisplay</Author>\r\n"
-        L"    <Description>PadDisplay: " + std::wstring(verb) + L" the virtual monitor (Root\\MttVDD).</Description>\r\n"
+        L"    <Description>PadDisplay: " + std::wstring(verb) + L" the " + what + L" (" + hardwareId + L").</Description>\r\n"
         L"    <SecurityDescriptor>D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;IU)</SecurityDescriptor>\r\n"
         L"  </RegistrationInfo>\r\n"
         L"  <Principals><Principal id=\"System\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n"
@@ -183,9 +187,24 @@ bool CreateToggleTask(const wchar_t* name, const wchar_t* verb, std::wstring& me
         L"  </Settings>\r\n"
         L"  <Actions Context=\"System\"><Exec>\r\n"
         L"    <Command>%SystemRoot%\\System32\\pnputil.exe</Command>\r\n"
-        L"    <Arguments>/" + std::wstring(verb) + L"-device /deviceid \"Root\\MttVDD\"</Arguments>\r\n"
+        L"    <Arguments>/" + std::wstring(verb) + L"-device /deviceid \"" + hardwareId + L"\"</Arguments>\r\n"
         L"  </Exec></Actions>\r\n"
         L"</Task>\r\n";
+    return CreateTaskFromXml(name, xml, message);
+}
+
+bool InstallToggleTasks(std::wstring& message) {
+    bool ok = CreateToggleTask(kTaskOff, L"disable", L"virtual monitor", kHardwareId, message) &&
+              CreateToggleTask(kTaskOn, L"enable", L"virtual monitor", kHardwareId, message);
+    LOGI("vdd: on/off tasks %s", ok ? "registered" : "FAILED");
+    return ok;
+}
+
+bool InstallDriver(const std::wstring& driverDir, std::wstring& message);
+
+} // namespace
+
+bool CreateTaskFromXml(const wchar_t* name, const std::wstring& xml, std::wstring& message) {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     std::wstring path = std::wstring(tmp) + L"paddisplay-task.xml";
@@ -205,16 +224,6 @@ bool CreateToggleTask(const wchar_t* name, const wchar_t* verb, std::wstring& me
     }
     return true;
 }
-
-bool InstallToggleTasks(std::wstring& message) {
-    bool ok = CreateToggleTask(kTaskOff, L"disable", message) && CreateToggleTask(kTaskOn, L"enable", message);
-    LOGI("vdd: on/off tasks %s", ok ? "registered" : "FAILED");
-    return ok;
-}
-
-bool InstallDriver(const std::wstring& driverDir, std::wstring& message);
-
-} // namespace
 
 bool ToggleTasksExist() {
     DWORD a = 1, b = 1;
@@ -260,12 +269,12 @@ const wchar_t* VddStateText(VddState s) {
     }
 }
 
-VddState QueryVdd(std::wstring* detail) {
-    HDEVINFO set = SetupDiGetClassDevsW(&kDisplayClass, nullptr, nullptr, 0); // include non-present devices
+static VddState QueryDevice(const GUID& deviceClass, const wchar_t* hardwareId, std::wstring* detail) {
+    HDEVINFO set = SetupDiGetClassDevsW(&deviceClass, nullptr, nullptr, 0); // include non-present devices
     if (set == INVALID_HANDLE_VALUE) return VddState::NotInstalled;
     VddState state = VddState::NotInstalled;
     SP_DEVINFO_DATA d{sizeof(d)};
-    if (FindDevice(set, d)) {
+    if (FindDevice(set, d, hardwareId)) {
         ULONG status = 0, problem = 0;
         CONFIGRET cr = CM_Get_DevNode_Status(&status, &problem, d.DevInst, 0);
         if (cr != CR_SUCCESS) state = VddState::NotInstalled; // leftover, non-present device node
@@ -276,6 +285,41 @@ VddState QueryVdd(std::wstring* detail) {
     }
     SetupDiDestroyDeviceInfoList(set);
     return state;
+}
+
+VddState QueryVdd(std::wstring* detail) { return QueryDevice(kDisplayClass, kHardwareId, detail); }
+
+VddState QueryVigem() { return QueryDevice(kSystemClass, kVigemHardwareId, nullptr); }
+
+bool SetupVigem(std::wstring& message) {
+    HDEVINFO set = SetupDiGetClassDevsW(&kSystemClass, nullptr, nullptr, 0);
+    SP_DEVINFO_DATA d{sizeof(d)};
+    ULONG status = 0, problem = 0;
+    bool found = set != INVALID_HANDLE_VALUE && FindDevice(set, d, kVigemHardwareId) &&
+                 CM_Get_DevNode_Status(&status, &problem, d.DevInst, 0) == CR_SUCCESS;
+    if (found && problem == CM_PROB_DISABLED) {
+        bool ok = ChangeState(set, d, DICS_ENABLE, DICS_FLAG_GLOBAL) || ChangeState(set, d, DICS_ENABLE, DICS_FLAG_CONFIGSPECIFIC);
+        LOGI("vigem: enable device -> %s", ok ? "ok" : Narrow(LastErrorText(GetLastError())).c_str());
+    } else if (found && (status & DN_HAS_PROBLEM)) {
+        ChangeState(set, d, DICS_PROPCHANGE, DICS_FLAG_GLOBAL); // restart it
+    }
+    if (set != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(set);
+    if (!found) {
+        message = L"ViGEmBus (game controller driver) is not installed.";
+        return false;
+    }
+    for (int i = 0; i < 15 && QueryVigem() != VddState::Ready; ++i) Sleep(200);
+    bool task = CreateToggleTask(kTaskGamepadOn, L"enable", L"game controller driver", kVigemHardwareId, message);
+    VddState s = QueryVigem();
+    if (task) message = std::wstring(L"ViGEmBus (game controller driver) is ") + VddStateText(s) + L".";
+    return task && s == VddState::Ready;
+}
+
+bool EnableVigem() {
+    DWORD code = 1;
+    RunCapture(L"schtasks.exe /run /tn \"" + std::wstring(kTaskGamepadOn) + L"\"", 10000, &code);
+    LOGI("vigem: switch-on task %s", code == 0 ? "started" : "is not registered (run the admin setup from the tray)");
+    return code == 0;
 }
 
 bool InstallVdd(const std::wstring& driverDir, std::wstring& message) {

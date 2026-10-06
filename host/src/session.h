@@ -4,11 +4,13 @@
 #include "audio.h"
 #include "capture.h"
 #include "encoder.h"
+#include "gamepad.h"
 #include "input.h"
 #include "net.h"
 #include "settings.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -17,6 +19,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace pd {
 
@@ -34,9 +38,12 @@ public:
 private:
     int SetupPipeline();  // 1 ready, 0 retry later, -1 fatal
     bool StreamLoop();    // true = rebuild the pipeline, false = session over
+    bool Heartbeat(uint64_t now); // pings the tablet; false = it stopped answering or the connection is gone
     void RecvLoop();
+    void InputLoop();
     bool Send(Msg type, const void* payload, uint32_t len);
     void SendError(ErrorCode code, const char* text);
+    void SendNotice(const char* text); // shown on the tablet and as a tray warning; the session goes on
     void AdaptBitrate();
     void ReportStatus(uint64_t now);
 
@@ -46,6 +53,7 @@ private:
     Settings settings_;
     StatusFn status_;
     FILE* dump_ = nullptr;
+    std::mutex sendMutex_; // frames, rumble and notices are sent from different threads
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> keyframeRequested_{true};
@@ -60,6 +68,7 @@ private:
     std::atomic<uint64_t> framesAcked_{0};
     std::mutex inflightMutex_;
     std::deque<std::pair<uint64_t, uint64_t>> inflight_; // (ptsUs, sendUs)
+    std::condition_variable ackCv_;                      // with inflightMutex_: an ack arrived
     std::atomic<uint64_t> latencySumUs_{0};
     std::atomic<uint32_t> latencyCount_{0};
     std::atomic<uint32_t> lastLatencyUs_{0};
@@ -71,6 +80,17 @@ private:
     HANDLE qos_ = nullptr;
     uint32_t qosFlow_ = 0;
     std::thread recvThread_;
+
+    // Input is injected on its own thread so a slow injection cannot delay the acks.
+    std::thread inputThread_;
+    std::mutex inputMutex_;
+    std::condition_variable inputCv_;
+    std::deque<std::pair<Msg, std::vector<uint8_t>>> inputQueue_;
+    std::unique_ptr<GamepadBridge> gamepads_; // made by the input thread when a controller first reports
+
+    std::thread layoutThread_;               // puts the real screens back while the stream starts
+    bool onlyScreen_ = false;                // the tablet asked to be the PC's only screen: the real ones are off
+    std::atomic<bool> layoutChanged_{false}; // it moved one: the capture target must be re-read
 
     std::wstring gdiName_;
     CaptureTarget target_;
@@ -88,6 +108,7 @@ private:
     uint64_t deadlineUs_ = 0;
     uint64_t minRttUs_ = UINT64_MAX;
     int stableSeconds_ = 0;
+    uint64_t adaptHoldUntilUs_ = 0; // no bitrate adaptation while the tablet restarts its decoder
     uint32_t framesThisSecond_ = 0;
     uint64_t bytesThisSecond_ = 0;
     uint64_t encodeUsThisSecond_ = 0;
@@ -96,6 +117,8 @@ private:
     ComPtr<ID3D11Query> probe_;
     double copiedThisSecond_ = 0;
     uint64_t lastSecondUs_ = 0;
+    uint64_t lastPingUs_ = 0;         // session thread only
+    bool secureDesktop_ = false;      // Windows is showing a UAC prompt, which cannot be captured
     uint32_t statusCount_ = 0;
 };
 

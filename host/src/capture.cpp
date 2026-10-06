@@ -32,21 +32,29 @@ bool FindOutput(const std::wstring& gdiName, CaptureTarget& target) {
 }
 
 // D3DKMTSetProcessSchedulingPriorityClass (gdi32): lets our copy/encode work preempt normal GPU work.
-static void RaiseGpuPriority() {
+// High is enough next to desktop apps, but a game that keeps the GPU at 100% still starves it
+// (a frame took 30-40 ms instead of 6). Gaming mode asks for realtime, as Sunshine does. It is
+// opt-in: with realtime the NVIDIA encoder is known to freeze when video memory runs out.
+static void RaiseGpuPriority(bool realtime) {
     using Fn = LONG(APIENTRY*)(HANDLE, int);
-    static bool done = false;
-    if (done) return;
-    done = true;
+    const int kHigh = 4, kRealtime = 5; // D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH / _REALTIME
+    static int applied = 0;
+    int want = realtime ? kRealtime : kHigh;
+    if (applied == want) return;
+    applied = want;
     auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass"));
-    const int kHigh = 4; // D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH
-    if (fn) {
-        LONG st = fn(GetCurrentProcess(), kHigh);
+    if (!fn) return;
+    LONG st = fn(GetCurrentProcess(), want);
+    LOGI("gpu scheduling priority %s -> 0x%08lx", realtime ? "REALTIME (gaming mode)" : "HIGH", st);
+    if (st != 0 && realtime) { // not allowed on this system
+        applied = kHigh;
+        st = fn(GetCurrentProcess(), kHigh);
         LOGI("gpu scheduling priority HIGH -> 0x%08lx", st);
     }
 }
 
-bool CreateDevice(IDXGIAdapter1* adapter, ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& ctx) {
-    RaiseGpuPriority();
+bool CreateDevice(IDXGIAdapter1* adapter, bool gamingMode, ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& ctx) {
+    RaiseGpuPriority(gamingMode);
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 2, D3D11_SDK_VERSION,

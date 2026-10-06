@@ -13,6 +13,10 @@ import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.util.Log
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -33,12 +37,16 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         const val EXTRA_ERROR = "error"
         const val RESULT_BAD_PIN = 2
         const val RESULT_FAILED = 3
+        private const val SCANCODE_F24 = 0x76
     }
 
     private lateinit var root: FrameLayout
     private lateinit var surfaceView: SurfaceView
     private lateinit var stats: TextView
     private lateinit var input: InputCapture
+    private lateinit var gamepads: Gamepads
+    private var deviceInput = true    // forward the keyboard, mouse and controllers connected to the tablet
+    private var mouseCapture = false  // the mouse sends raw movement (games) instead of pointing at the picture
     private var decoder: VideoDecoder? = null
     private var connection: Connection? = null
     private var audio: AudioStream? = null
@@ -89,6 +97,21 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         surfaceView.setOnTouchListener { _, ev -> input.onTouch(ev) }
         surfaceView.setOnHoverListener { _, ev -> input.onHover(ev) }
         surfaceView.holder.addCallback(this)
+
+        deviceInput = prefs.getBoolean("deviceInput", true)
+        mouseCapture = deviceInput && prefs.getBoolean("mouseCapture", false)
+        input.deviceInput = deviceInput
+        gamepads = Gamepads(this) { msg -> connection?.send(msg) }
+        if (deviceInput) {
+            surfaceView.setOnGenericMotionListener { _, ev -> input.onGenericMotion(ev) }
+            surfaceView.setOnCapturedPointerListener { _, ev -> input.onCapturedPointer(ev) }
+            // The picture already shows the PC's pointer.
+            surfaceView.pointerIcon = PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL)
+            // Pointer capture is given to the focused view.
+            surfaceView.isFocusable = true
+            surfaceView.isFocusableInTouchMode = true
+            surfaceView.requestFocus()
+        }
     }
 
     private fun hideSystemUi() {
@@ -100,7 +123,64 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemUi()
+        if (hasFocus) {
+            hideSystemUi()
+            applyMouseCapture() // Android drops the capture whenever the window loses focus
+        }
+    }
+
+    // ---- keyboard, mouse and game controllers connected to the tablet ---------------------
+
+    private fun applyMouseCapture() {
+        if (mouseCapture) surfaceView.requestPointerCapture() else surfaceView.releasePointerCapture()
+    }
+
+    private fun toggleMouseCapture() {
+        mouseCapture = !mouseCapture
+        input.releaseMouseButtons()
+        applyMouseCapture()
+        Toast.makeText(this, if (mouseCapture) "Mouse captured for games. Ctrl+Alt+Shift+M releases it." else "Mouse released.",
+            Toast.LENGTH_SHORT).show()
+    }
+
+    override fun dispatchKeyEvent(ev: KeyEvent): Boolean = (deviceInput && forwardKey(ev)) || super.dispatchKeyEvent(ev)
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean =
+        (deviceInput && gamepads.onMotion(ev)) || super.dispatchGenericMotionEvent(ev)
+
+    /** true = the key went to the PC (or was used here), so Android must not act on it. */
+    private fun forwardKey(ev: KeyEvent): Boolean {
+        if (gamepads.onKey(ev)) return true
+        // A mouse's side buttons also arrive as Back/Forward keys. They are sent as mouse buttons.
+        if (ev.isFromSource(InputDevice.SOURCE_MOUSE) || ev.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE))
+            return ev.keyCode == KeyEvent.KEYCODE_BACK || ev.keyCode == KeyEvent.KEYCODE_FORWARD
+        val down = ev.action == KeyEvent.ACTION_DOWN
+        if (!down && ev.action != KeyEvent.ACTION_UP) return false
+        // The tablet's own volume buttons stay with the tablet; a keyboard's go to the PC.
+        val volume = ev.keyCode == KeyEvent.KEYCODE_VOLUME_UP || ev.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+            ev.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+        if (volume && ev.device?.isExternal != true) return false
+        val code = Keyboard.scancode(ev)
+        if (code == 0) return false
+        if (ev.keyCode == KeyEvent.KEYCODE_M && ev.isCtrlPressed && ev.isAltPressed && ev.isShiftPressed) {
+            if (down && ev.repeatCount == 0) {
+                toggleMouseCapture()
+                // The PC got Ctrl, Alt and Shift but not the M. Released with nothing in between, such
+                // a chord is how Windows switches the input language: put an unused key in between.
+                sendKey(SCANCODE_F24, true)
+                sendKey(SCANCODE_F24, false)
+            }
+            return true
+        }
+        sendKey(code, down) // repeats too: Windows does not repeat an injected key by itself
+        return true
+    }
+
+    private fun sendKey(code: Int, down: Boolean) {
+        connection?.send(Protocol.message(Protocol.KEY, 3) {
+            it.put((if (down) Protocol.KEY_DOWN else 0).toByte())
+            it.putShort(code.toShort())
+        })
     }
 
     // ---- surface lifecycle drives the connection ------------------------------------------
@@ -126,11 +206,14 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
                 Log.w("PadDisplay", "setFrameRate: $e")
             }
         }
-        val hello = Protocol.clientHello(w, h, metrics.densityDpi, mask, pin, refreshHz, "${Build.MANUFACTURER} ${Build.MODEL}")
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        var flags = 0
+        if (prefs.getBoolean("gamingMode", false)) flags = flags or Protocol.HELLO_GAMING_MODE
+        if (prefs.getBoolean("onlyScreen", false)) flags = flags or Protocol.HELLO_ONLY_SCREEN
+        val hello = Protocol.clientHello(w, h, metrics.densityDpi, mask, pin, refreshHz, flags, "${Build.MANUFACTURER} ${Build.MODEL}")
         gotFirstFrame = false
         if (host != "127.0.0.1" && host != "localhost") acquireWifiLock()
         connection = Connection(host, port, this).also { it.start(hello) }
-        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         if (prefs.getBoolean("audio", false)) {
             audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true)).also { it.start() }
         }
@@ -173,6 +256,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     override fun onDestroy() {
         input.release()
+        gamepads.release()
         super.onDestroy()
     }
 
@@ -183,7 +267,10 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         videoH = height
         hostKbps = bitrateKbps
         codecName = if (codec == Protocol.CODEC_HEVC) "HEVC" else "H.264"
-        runOnUiThread { fitSurface() }
+        runOnUiThread {
+            fitSurface()
+            if (deviceInput) gamepads.announce()
+        }
         try {
             decoder?.configure(codec, width, height, fps)
         } catch (e: Exception) {
@@ -219,6 +306,14 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             setResult(if (code == Protocol.ERR_BAD_PIN) RESULT_BAD_PIN else RESULT_FAILED, Intent().putExtra(EXTRA_ERROR, message))
             finish()
         }
+    }
+
+    override fun onRumble(index: Int, large: Int, small: Int) {
+        runOnUiThread { gamepads.onRumble(index, large, small) }
+    }
+
+    override fun onNotice(message: String) {
+        runOnUiThread { Toast.makeText(this, "PadDisplay: $message", Toast.LENGTH_LONG).show() }
     }
 
     override fun onClosed(reason: String?) {

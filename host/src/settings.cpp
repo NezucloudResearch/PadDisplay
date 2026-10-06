@@ -48,6 +48,7 @@ void Settings::Load() {
     maxFps = std::clamp(GetInt(L"maxFps", maxFps), 10, 240);
     encoder = GetStr(L"encoder", encoder);
     nvencPreset = std::clamp(GetInt(L"nvencPreset", nvencPreset), 0, 7);
+    gamingMode = GetInt(L"gamingMode", gamingMode) != 0;
     drawCursor = GetInt(L"drawCursor", drawCursor) != 0;
     matchClientResolution = GetInt(L"matchClientResolution", matchClientResolution) != 0;
     detachOnDisconnect = GetInt(L"detachOnDisconnect", detachOnDisconnect) != 0;
@@ -57,7 +58,10 @@ void Settings::Load() {
     displayOverride = GetStr(L"display", L"");
     adbPath = GetStr(L"adbPath", L"");
     requireUsbPin = GetInt(L"requireUsbPin", requireUsbPin) != 0;
-    pin = uint32_t(wcstoul(GetStr(L"pin", L"0").c_str(), nullptr, 10));
+    uacClickableOnTablet = GetInt(L"uacClickableOnTablet", uacClickableOnTablet) != 0;
+    runAsAdmin = GetInt(L"runAsAdmin", runAsAdmin) != 0;
+    autostartTask = GetInt(L"autostartTask", autostartTask) != 0;
+    pin =uint32_t(wcstoul(GetStr(L"pin", L"0").c_str(), nullptr, 10));
     if (pin < 100000 || pin > 999999) {
         std::random_device rd;
         pin = 100000 + rd() % 900000;
@@ -76,6 +80,7 @@ void Settings::Save() const {
     PutInt(L"maxFps", maxFps);
     PutStr(L"encoder", encoder);
     PutInt(L"nvencPreset", nvencPreset);
+    PutInt(L"gamingMode", gamingMode);
     PutInt(L"drawCursor", drawCursor);
     PutInt(L"matchClientResolution", matchClientResolution);
     PutInt(L"detachOnDisconnect", detachOnDisconnect);
@@ -84,6 +89,9 @@ void Settings::Save() const {
     PutStr(L"display", displayOverride);
     PutStr(L"adbPath", adbPath);
     PutInt(L"requireUsbPin", requireUsbPin);
+    PutInt(L"uacClickableOnTablet", uacClickableOnTablet);
+    PutInt(L"runAsAdmin", runAsAdmin);
+    PutInt(L"autostartTask", autostartTask);
     PutInt(L"pin", pin);
 }
 

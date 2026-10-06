@@ -20,6 +20,8 @@ bool RecvAll(SOCKET s, void* data, size_t len);
 bool SendMsg(SOCKET s, Msg type, const void* payload, uint32_t len);
 bool RecvMsg(SOCKET s, Msg& type, std::vector<uint8_t>& payload, uint32_t maxLen);
 void TuneSocket(SOCKET s, bool lowLatencyVideo);
+// A socket handle that a child process inherits keeps the connection (or the port) open after we close it.
+void NoInherit(SOCKET s);
 bool IsLoopback(const sockaddr_storage& addr);
 std::string AddrToString(const sockaddr_storage& addr);
 

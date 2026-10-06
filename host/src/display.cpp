@@ -7,7 +7,10 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cwctype>
+#include <thread>
 
 using Microsoft::WRL::ComPtr;
 
@@ -303,6 +306,166 @@ int RestoreHomeLayout() {
         fixed += RestoreRealDisplays(home);
     }
     return fixed;
+}
+
+bool ShowOnlyOn(const std::wstring& gdiName) {
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) return false;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+    paths.resize(pathCount);
+    for (auto& path : paths) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME name{};
+        name.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(name), path.sourceInfo.adapterId, path.sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&name.header) != ERROR_SUCCESS || _wcsicmp(name.viewGdiDeviceName, gdiName.c_str()) != 0) continue;
+        UINT32 source = path.sourceInfo.modeInfoIdx, target = path.targetInfo.modeInfoIdx;
+        if (source >= modeCount || target >= modeCount) return false;
+        // Only this path, as the primary display. No SDC_SAVE_TO_DATABASE: see display.h.
+        DISPLAYCONFIG_MODE_INFO only[2] = {modes[source], modes[target]};
+        only[0].sourceMode.position = {0, 0};
+        DISPLAYCONFIG_PATH_INFO p = path;
+        p.sourceInfo.modeInfoIdx = 0;
+        p.targetInfo.modeInfoIdx = 1;
+        LONG r = SetDisplayConfig(1, &p, 2, only, SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
+        LOGI("display: %ls is now the only screen (%u other screen%s off) -> %ld", gdiName.c_str(), pathCount - 1,
+             pathCount == 2 ? "" : "s", r);
+        return r == ERROR_SUCCESS;
+    }
+    return false;
+}
+
+namespace {
+std::atomic<bool> g_restoring{false};
+std::atomic<bool> g_cancelRestore{false};
+
+// While a security prompt (UAC) is up, Windows runs it on its own desktop and refuses every display
+// change from other programs (ERROR_ACCESS_DENIED) until it is answered. One failed attempt must
+// not leave the PC's own screens off for good, so keep trying, in the background, until they are on.
+void RestoreInBackground() {
+    if (g_restoring.exchange(true)) return;
+    g_cancelRestore = false;
+    std::thread([] {
+        const ULONGLONG giveUp = GetTickCount64() + 10 * 60 * 1000;
+        bool back = false;
+        LONG r = 0;
+        // 500 ms: a poll, because Windows has no event for "the prompt was answered"; it only runs while the screens are off.
+        while (!g_cancelRestore && GetTickCount64() < giveUp) {
+            r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_USE_DATABASE_CURRENT);
+            if (r == ERROR_SUCCESS && !SnapshotRealDisplays().empty()) {
+                back = true;
+                break;
+            }
+            Sleep(500);
+        }
+        if (back) {
+            LOGI("display: the PC's own screens are back");
+            RestoreHomeLayout();
+        } else {
+            LOGI("display: gave up bringing the PC's own screens back (last result %ld)", r);
+        }
+        g_restoring = false;
+    }).detach();
+}
+} // namespace
+
+bool ShowOnAllAgain() {
+    LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_USE_DATABASE_CURRENT);
+    bool back = false;
+    for (int i = 0; i < 10 && !back; ++i) {
+        if (i) Sleep(100);
+        back = !SnapshotRealDisplays().empty();
+    }
+    LOGI("display: back to the stored setup -> %ld, real screens %s", r, back ? "on" : "STILL OFF");
+    if (!back) RestoreInBackground();
+    return back;
+}
+
+void CancelScreenRestore() { g_cancelRestore = true; }
+
+void WaitScreenRestore(unsigned timeoutMs) {
+    for (ULONGLONG end = GetTickCount64() + timeoutMs; g_restoring && GetTickCount64() < end;) Sleep(50);
+}
+
+// --- UAC prompts the tablet can click, in only-screen mode -----------------------------------
+// A UAC prompt normally appears on the secure desktop, which Desktop Duplication cannot capture. In
+// only-screen mode the PC's real screens are off, so the prompt is invisible and unanswerable.
+// Setting PromptOnSecureDesktop = 0 moves prompts to the normal desktop: the tablet then shows them,
+// and - because an elevated host injects input at the same (high) integrity as the consent dialog -
+// can click them. The value is machine-wide, so it is changed only while a tablet is the only screen
+// and restored the moment that ends. The old value goes to a marker file first, so a crash is
+// recoverable (RestoreSecureDesktop runs at start-up too).
+namespace {
+constexpr wchar_t kUacPolicyKey[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
+constexpr wchar_t kUacPolicyValue[] = L"PromptOnSecureDesktop";
+
+std::wstring SecureDesktopMarker() { return AppDataDir() + L"\\secure-desktop.txt"; }
+
+bool IsProcessElevated() {
+    HANDLE token = nullptr;
+    TOKEN_ELEVATION e{};
+    DWORD n = 0;
+    bool elevated = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+                    GetTokenInformation(token, TokenElevation, &e, sizeof(e), &n) && e.TokenIsElevated;
+    if (token) CloseHandle(token);
+    return elevated;
+}
+
+bool ReadUacPolicy(DWORD& value) {
+    DWORD size = sizeof(value);
+    LONG r = RegGetValueW(HKEY_LOCAL_MACHINE, kUacPolicyKey, kUacPolicyValue, RRF_RT_REG_DWORD, nullptr, &value, &size);
+    if (r == ERROR_FILE_NOT_FOUND) { value = 1; return true; } // absent on a default install = secure desktop on
+    return r == ERROR_SUCCESS;
+}
+
+bool WriteUacPolicy(DWORD value) {
+    return RegSetKeyValueW(HKEY_LOCAL_MACHINE, kUacPolicyKey, kUacPolicyValue, REG_DWORD, &value, sizeof(value)) == ERROR_SUCCESS;
+}
+} // namespace
+
+bool AllowUacClicksOnTablet() {
+    if (!IsProcessElevated()) { // writing HKLM policy, and clicking the elevated prompt, both need elevation
+        LOGI("uac: not moving prompts off the secure desktop - PadDisplay is not elevated");
+        return false;
+    }
+    DWORD current = 1;
+    if (!ReadUacPolicy(current)) {
+        LOGI("uac: could not read PromptOnSecureDesktop");
+        return false;
+    }
+    if (current == 0) return true; // already on the normal desktop: nothing to change, nothing to undo
+    // Record the old value before touching the policy, so a crash cannot strand the secure desktop off.
+    if (FILE* f = nullptr; !_wfopen_s(&f, SecureDesktopMarker().c_str(), L"w") && f) {
+        fwprintf(f, L"%lu", current);
+        fclose(f);
+    }
+    if (!WriteUacPolicy(0)) {
+        LOGI("uac: could not move prompts off the secure desktop");
+        DeleteFileW(SecureDesktopMarker().c_str());
+        return false;
+    }
+    LOGI("uac: prompts moved to the normal desktop so the tablet can show and click them (was %lu)", current);
+    return true;
+}
+
+void RestoreSecureDesktop() {
+    const std::wstring marker = SecureDesktopMarker();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, marker.c_str(), L"r") || !f) return; // nothing was changed
+    unsigned long saved = 1;
+    if (fwscanf_s(f, L"%lu", &saved) != 1) saved = 1;
+    fclose(f);
+    if (!IsProcessElevated()) { // keep the marker: a later elevated run will put the policy back
+        LOGI("uac: secure desktop should be restored to %lu but PadDisplay is not elevated; will retry when elevated", saved);
+        return;
+    }
+    if (WriteUacPolicy(DWORD(saved))) {
+        LOGI("uac: secure desktop restored (PromptOnSecureDesktop = %lu)", saved);
+        DeleteFileW(marker.c_str());
+    } else {
+        LOGI("uac: could not restore PromptOnSecureDesktop to %lu (marker kept)", saved);
+    }
 }
 
 void LogDisplays() {

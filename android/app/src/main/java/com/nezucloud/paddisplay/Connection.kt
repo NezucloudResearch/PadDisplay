@@ -27,6 +27,8 @@ class Connection(private val host: String, private val port: Int, private val li
         fun onFrame(ptsUs: Long, keyframe: Boolean, data: ByteArray, offset: Int, length: Int)
         fun onPing(rttUs: Int, bitrateKbps: Int)
         fun onError(code: Int, message: String)
+        fun onRumble(index: Int, large: Int, small: Int)
+        fun onNotice(message: String)
         fun onClosed(reason: String?)
     }
 
@@ -118,6 +120,9 @@ class Connection(private val host: String, private val port: Int, private val li
                         send(Protocol.message(Protocol.PONG, 8) { it.putLong(hostTime) })
                         listener.onPing(pb.getInt(8), pb.getInt(12))
                     }
+                    Protocol.RUMBLE -> if (len >= 3) listener.onRumble(
+                        payload[0].toInt() and 0xFF, payload[1].toInt() and 0xFF, payload[2].toInt() and 0xFF)
+                    Protocol.NOTICE -> listener.onNotice(String(payload, 0, len, Charsets.UTF_8))
                     Protocol.ERROR -> {
                         val code = if (len > 0) payload[0].toInt() and 0xFF else 0
                         val text = if (len > 1) String(payload, 1, len - 1, Charsets.UTF_8) else "Error $code"

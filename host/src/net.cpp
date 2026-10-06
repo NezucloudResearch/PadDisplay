@@ -68,6 +68,8 @@ bool RecvMsg(SOCKET s, Msg& type, std::vector<uint8_t>& payload, uint32_t maxLen
     return len == 0 || RecvAll(s, payload.data(), len);
 }
 
+void NoInherit(SOCKET s) { SetHandleInformation(reinterpret_cast<HANDLE>(s), HANDLE_FLAG_INHERIT, 0); }
+
 void TuneSocket(SOCKET s, bool lowLatencyVideo) {
     BOOL one = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&one), sizeof(one));
@@ -168,13 +170,24 @@ std::string RunCapture(const std::wstring& cmdline, DWORD timeoutMs, DWORD* exit
     HANDLE rd = nullptr, wr = nullptr;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return {};
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-    STARTUPINFOW si{sizeof(si)};
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = si.hStdError = wr;
-    si.hStdInput = nullptr;
+    // Only the pipe's write end is inherited. Inheriting every inheritable handle leaked the listening
+    // socket into the adb server that `adb devices` starts and leaves running: after Exit the port stayed
+    // bound, and the accept thread could not be woken by closing the socket, so Exit hung.
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdOutput = si.StartupInfo.hStdError = wr;
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<uint8_t> attrBuf(attrSize);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    bool listOk = InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attrSize) &&
+                  UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &wr, sizeof(wr), nullptr, nullptr);
     PROCESS_INFORMATION pi{};
     std::wstring cmd = cmdline;
-    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    BOOL ok = listOk && CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                                       nullptr, nullptr, &si.StartupInfo, &pi);
+    if (listOk) DeleteProcThreadAttributeList(si.lpAttributeList);
     CloseHandle(wr);
     std::string out;
     if (ok) {

@@ -1,4 +1,4 @@
-# PadDisplay wire protocol (version 2)
+# PadDisplay wire protocol (version 3)
 
 There is one TCP connection per tablet. The tablet is the client and the host listens on **27183**, dual-stack. Over USB the tablet connects to `127.0.0.1:27183`, which `adb reverse` tunnels to the PC. The PIN is checked on every connection, USB included, unless the host sets `requireUsbPin=0`: the tunnel is reachable by any app on the tablet. All integers are **little-endian**.
 
@@ -24,20 +24,46 @@ The host may send another `HostHello`, followed by a new `Config`, at any time, 
 | 0x03 | Frame | u64 ptsUs, u8 flags (bit0 = keyframe), Annex-B access unit |
 | 0x04 | Ping | u64 hostTimeUs, u32 lastRttUs, u32 currentBitrateKbps. The client must answer with `Pong` |
 | 0x05 | Error | u8 code (1 bad PIN, 2 version, 3 no display, 4 encoder, 6 locked out after too many wrong PINs), UTF-8 text |
+| 0x08 | Rumble | u8 controller index, u8 largeMotor, u8 smallMotor (0–255, 0 = off). The level holds until the next `Rumble` for that controller (v3) |
+| 0x09 | Notice | UTF-8 text for the tablet to show. The session goes on. Used when a game controller cannot be created on the PC (v3) |
 
 The stream has no B-frames and an infinite GOP, so IDRs are sent only on request. After any decode problem the client sends `KeyframeReq`.
 
 ## Client → host
 | type | name | payload |
 |---|---|---|
-| 0x81 | ClientHello | u16 version, u16 screenW, u16 screenH, u16 dpi, u8 codecMask (bit0 H.264, bit1 HEVC), u8 maxTouch, u32 pin, u16 maxFps (the refresh rate chosen on the tablet; the host switches the virtual monitor to the closest mode), UTF-8 device name |
+| 0x81 | ClientHello | u16 version, u16 screenW, u16 screenH, u16 dpi, u8 codecMask (bit0 H.264, bit1 HEVC), u8 maxTouch, u32 pin, u16 maxFps (the refresh rate chosen on the tablet; the host switches the virtual monitor to the closest mode), v3 only: u8 flags (bit0 = gaming mode, bit1 = only screen), UTF-8 device name |
 | 0x82 | Touch | u8 count, then count × { u8 pointerId, u8 kind (0 down, 1 move, 2 up, 3 cancel), u16 x, u16 y, u16 pressure (0–1024), u16 size } |
 | 0x83 | Pen | u8 kind (0 hover, 1 down, 2 move, 3 up, 4 leave), u8 buttons (bit0 barrel, bit1 eraser), u16 x, u16 y, u16 pressure (0–1024), i8 tiltX, i8 tiltY (−90…90) |
-| 0x84 | Mouse | u8 kind (0 move, 1 left down, 2 left up, 3 right down, 4 right up, 5 wheel), u16 x, u16 y, i16 wheelV, i16 wheelH (120 = one notch) |
+| 0x84 | Mouse | u8 kind (0 move, 1 left down, 2 left up, 3 right down, 4 right up, 5 wheel; v3: 6 middle down, 7 middle up, 8 X1/back down, 9 X1 up, 10 X2/forward down, 11 X2 up), u16 x, u16 y, i16 wheelV, i16 wheelH (120 = one notch) |
 | 0x85 | KeyframeReq | empty |
 | 0x86 | Pong | u64 hostTimeUs, echoed from `Ping` |
 | 0x87 | FrameAck | u64 ptsUs of a `Frame`, sent once the frame has been read and queued to the decoder (v2) |
 | 0x88 | Keepalive | empty. Sent whenever the client has sent nothing for 20 ms. On ROMs that doze the Wi-Fi radio despite Wi-Fi locks (seen on HarmonyOS), the router holds or drops packets for the tablet until it transmits: without this, the PC → tablet direction lost 80% of packets and connecting took over 5 s |
+
+| 0x8A | Key | u8 flags (bit0 = down, else up), u16 scancode (v3). See *Keyboard* below |
+| 0x8B | MouseRel | u8 kind (as for `Mouse`), i16 dx, i16 dy, i16 wheelV, i16 wheelH (v3). A captured mouse: kind 0 moves the pointer by dx, dy; buttons and the wheel act where the pointer is |
+| 0x8C | Gamepad | u8 index (0–3), u8 flags (bit0 = connected), u16 buttons, u8 leftTrigger, u8 rightTrigger, i16 leftX, i16 leftY, i16 rightX, i16 rightY (v3). See *Game controllers* below |
+
+## Hello flags (v3)
+A v3 `ClientHello` has one more byte before the device name, with the choices made in the tablet app. v1 and v2 hellos don't have it.
+- **bit0, gaming mode:** the host asks Windows for realtime GPU scheduling, so a game that uses the whole GPU can't starve capture and encoding. For older clients the host uses `gamingMode` from `settings.ini` instead.
+- **bit1, only screen:** once the virtual monitor is attached, the host makes it the PC's only active display, so the PC's own screens go dark. When the session ends they come back. The host applies this without saving it in Windows' display database, so after a crash or a restart Windows returns to the stored setup by itself. If it can't be applied, the host sends a `Notice` and the tablet stays an extra screen.
+
+## Keyboard (v3)
+`Key` carries the key's **position**, as a PC scancode (set 1 make code, 1–0x7F), not a character: the PC applies its own keyboard layout, as for a keyboard plugged into it.
+- Bit 8 (0x100) is set for keys that have the E0 prefix, such as the arrows, right Ctrl and right Alt.
+- Pause is sent as 0x145, because its real code (E1 1D 45) doesn't fit this scheme.
+- The client sends key repeats as further "down" messages; the host does not repeat keys itself.
+- The host releases every key that is still down when the connection drops.
+
+## Game controllers (v3)
+`Gamepad` carries the whole state of one controller in the XInput layout, and is sent whenever it changes.
+- Buttons: 0x0001 d-pad up, 0x0002 down, 0x0004 left, 0x0008 right, 0x0010 start, 0x0020 back, 0x0040 left stick, 0x0080 right stick, 0x0100 left shoulder, 0x0200 right shoulder, 0x0400 guide, 0x1000 A, 0x2000 B, 0x4000 X, 0x8000 Y.
+- Sticks are −32768…32767 with up and right positive. Triggers are 0–255.
+- The first message for an index plugs a virtual Xbox 360 controller into the PC. A message with the connected bit clear unplugs it, and so does the end of the session.
+- This needs the ViGEmBus driver on the PC. Without it the host answers the first `Gamepad` with one `Notice` and ignores the rest.
+- For a moment after a controller is plugged in, the host repeats its latest state to Windows: a state sent while Windows is still starting the controller is dropped.
 
 ## Audio connection (optional)
 To receive PC audio, the tablet opens a **second** TCP connection to the same port and sends `AudioHello` first. The host checks the PIN exactly as for video, with the same rate limits. A newer audio connection replaces an older one. When audio is off, this connection is never opened and nothing is captured.
@@ -61,6 +87,13 @@ To receive PC audio, the tablet opens a **second** TCP connection to the same po
 The client acknowledges **every** `Frame`. The host stops encoding while `maxFramesInFlight` frames (default 3) are unacknowledged. Desktop updates made meanwhile are not lost; Desktop Duplication coalesces them into the next frame. This bounds queueing in the network to a few frames: over a slow link the frame rate drops instead of the delay growing. Adaptive bitrate uses the time spent waiting for acks and each frame's send-to-ack time.
 
 v1 clients (no acks) are still accepted, but they only get RTT-based bitrate adaptation, which can let seconds of video queue up on Wi-Fi.
+
+## Versions
+- **v1:** video, touch, pen, mouse gestures.
+- **v2:** `FrameAck` (flow control).
+- **v3:** `Key`, `MouseRel`, `Gamepad`, more `Mouse` buttons, `Rumble`, `Notice`, and the flags byte in `ClientHello`.
+
+A host accepts every client version up to its own, and rejects a newer one with error code 2. It only sends `Rumble` or `Notice` to a client that has sent `Gamepad`.
 
 Coordinates are normalized to the video frame: 0–65535 across its width and height.
 

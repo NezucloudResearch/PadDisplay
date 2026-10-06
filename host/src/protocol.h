@@ -7,7 +7,9 @@
 
 namespace pd {
 
-constexpr uint16_t kProtocolVersion = 2; // v2 adds FrameAck (flow control); v1 clients still accepted
+// v2 adds FrameAck (flow control); v3 adds keyboard, relative mouse and game controllers.
+// Older clients are still accepted.
+constexpr uint16_t kProtocolVersion = 3;
 constexpr uint16_t kMinProtocolVersion = 1;
 constexpr uint16_t kTcpPort = 27183;
 constexpr uint16_t kDiscoveryPort = 27184;
@@ -23,9 +25,11 @@ enum class Msg : uint8_t {
     Error = 0x05,       // u8 code, utf-8 message
     AudioFormat = 0x06, // audio connection: u32 sampleRate, u8 channels, u8 bitsPerSample
     AudioData = 0x07,   // audio connection: u64 ptsUs, interleaved s16le PCM
+    Rumble = 0x08,      // u8 index, u8 largeMotor, u8 smallMotor (0 = off); from a game on the PC (v3)
+    Notice = 0x09,      // utf-8 text for the tablet to show, e.g. the controller driver is missing (v3)
     // client -> host
     ClientHello = 0x81, // u16 version, u16 screenW, u16 screenH, u16 dpi, u8 codecMask,
-                        // u8 maxTouch, u32 pin, u16 maxFps, utf-8 device name
+                        // u8 maxTouch, u32 pin, u16 maxFps, [v3: u8 flags,] utf-8 device name
     Touch = 0x82,       // u8 count, count x {u8 id, u8 kind, u16 x, u16 y, u16 pressure, u16 size}
     Pen = 0x83,         // u8 kind, u8 buttons, u16 x, u16 y, u16 pressure, i8 tiltX, i8 tiltY
     Mouse = 0x84,       // u8 kind, u16 x, u16 y, i16 wheelV, i16 wheelH
@@ -34,18 +38,31 @@ enum class Msg : uint8_t {
     FrameAck = 0x87,    // u64 ptsUs of a Frame the client has read and queued to its decoder (v2)
     Keepalive = 0x88,   // empty; sent by the client every 20 ms when idle to keep its Wi-Fi radio awake
     AudioHello = 0x89,  // first message of an (optional) audio connection: u16 version, u32 pin, u8 flags
+    Key = 0x8A,         // u8 flags (bit0 down), u16 scancode: PC set-1 make code, bit 8 = E0-extended (v3)
+    MouseRel = 0x8B,    // u8 kind, i16 dx, i16 dy, i16 wheelV, i16 wheelH: a captured mouse; buttons and
+                        // the wheel act where the cursor is (v3)
+    Gamepad = 0x8C,     // u8 index, u8 flags (bit0 connected), u16 buttons, u8 leftTrigger, u8 rightTrigger,
+                        // i16 leftX, i16 leftY, i16 rightX, i16 rightY: the XInput layout (v3)
 };
 
 enum Codec : uint8_t { CodecH264 = 1, CodecHEVC = 2 };
 enum CodecMask : uint8_t { MaskH264 = 1, MaskHEVC = 2 };
 enum AudioFlags : uint8_t { AudioMutePc = 1 };
+// Choices made in the tablet app (v3). OnlyScreen: the PC's own screens are off while connected.
+enum HelloFlags : uint8_t { HelloGamingMode = 1, HelloOnlyScreen = 2 };
 enum ErrorCode : uint8_t { ErrBadPin = 1, ErrVersion = 2, ErrNoDisplay = 3, ErrEncoder = 4, ErrLockedOut = 6 };
 enum TouchKind : uint8_t { TouchDown = 0, TouchMove = 1, TouchUp = 2, TouchCancel = 3 };
 enum PenKind : uint8_t { PenHover = 0, PenDown = 1, PenMove = 2, PenUp = 3, PenLeave = 4 };
 enum PenButtons : uint8_t { PenBarrel = 1, PenEraser = 2 };
 enum MouseKind : uint8_t {
-    MouseMove = 0, MouseLeftDown = 1, MouseLeftUp = 2, MouseRightDown = 3, MouseRightUp = 4, MouseWheel = 5
+    MouseMove = 0, MouseLeftDown = 1, MouseLeftUp = 2, MouseRightDown = 3, MouseRightUp = 4, MouseWheel = 5,
+    MouseMiddleDown = 6, MouseMiddleUp = 7, MouseX1Down = 8, MouseX1Up = 9, MouseX2Down = 10, MouseX2Up = 11 // v3
 };
+enum KeyFlags : uint8_t { KeyDown = 1 };
+enum GamepadFlags : uint8_t { GamepadConnected = 1 };
+constexpr uint16_t kKeyExtended = 0x100; // the scancode has the E0 prefix (arrows, right Ctrl, ...)
+constexpr uint16_t kKeyPause = 0x145;    // Pause, whose real code (E1 1D 45) does not fit this scheme
+constexpr int kMaxGamepads = 4;          // as many as XInput reports
 
 // Coordinates are normalized to the video frame: 0..65535 across the width/height.
 constexpr uint32_t kCoordMax = 65535;
@@ -58,6 +75,7 @@ struct ClientHello {
     uint8_t maxTouch = 10;
     uint32_t pin = 0;
     uint16_t maxFps = 60;
+    uint8_t flags = 0;
     char name[64] = {};
 };
 

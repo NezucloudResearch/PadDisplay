@@ -24,10 +24,21 @@ bool InstallVdd(const std::wstring& driverDir, std::wstring& message);
 bool ToggleTasksExist();
 bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs);
 
+// Registers (or replaces) a scheduled task from its XML. Needs administrator rights.
+bool CreateTaskFromXml(const wchar_t* name, const std::wstring& xml, std::wstring& message);
+
 // Makes sure width x height and hz are listed in vdd_settings.xml; if the file had to change, asks
 // the running driver to reload it (no administrator rights needed). changed reports a reload.
 bool EnsureVddMode(int width, int height, int hz, bool& changed);
 
 std::wstring VddSettingsPath();
+
+// ViGEmBus (Nefarius), the virtual game controller bus. It is not bundled: the user installs it.
+VddState QueryVigem();
+// Needs administrator rights (part of the one-time setup run). Switches the bus device back on if
+// it is disabled or stuck, and registers a hidden task that lets normal users switch it on.
+bool SetupVigem(std::wstring& message);
+// Starts that task. false = it is not registered (no admin setup run since ViGEmBus was installed).
+bool EnableVigem();
 
 } // namespace pd
