@@ -469,14 +469,16 @@ void ShowMenu(HWND hwnd) {
                 fingerprint.empty() ? L"Wi-Fi encryption unavailable (see log)"
                                     : (L"Wi-Fi encrypted (TLS), fingerprint " + Widen(fingerprint.substr(0, 23)) + L"…").c_str());
     VddState vdd = QueryVdd();
+    // A tablet was told to choose one of the items below: it must be there, whatever would normally hide it.
+    const bool vddFailed = VddFailed();
     if (g_installing) {
         AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Installing virtual monitor driver…");
-    } else if (vdd == VddState::Ready && g_setupIncomplete == 1) {
+    } else if (vdd == VddState::Ready && g_setupIncomplete == 1 && !vddFailed) {
         AppendMenuW(m, MF_STRING, ID_DRIVER, L"Finish PadDisplay setup (admin)… (monitor off on exit, full GPU speed)");
-    } else if (vdd == VddState::Disabled && g_settings.monitorOnlyWhileConnected && g_setupIncomplete == 0) {
+    } else if (vdd == VddState::Disabled && g_settings.monitorOnlyWhileConnected && g_setupIncomplete == 0 && !vddFailed) {
         // Off because no tablet is connected: PadDisplay switches it on when one does. Nothing to fix.
         AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Virtual monitor: off until a tablet connects");
-    } else if (vdd != VddState::Ready) {
+    } else if (vdd != VddState::Ready || vddFailed) {
         AppendMenuW(m, MF_STRING | MF_DEFAULT, ID_DRIVER,
                     vdd == VddState::NotInstalled ? L"Install virtual monitor driver (admin)…"
                     : vdd == VddState::Disabled   ? L"Enable virtual monitor driver (admin)…"
@@ -615,6 +617,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp && s == VddState::Ready) {
+            SetVddFailed(false); // fixed: the tray goes back to its usual items
             Balloon(L"Virtual monitor ready", L"Connect the tablet to start using it as a second screen.");
             // Hybrid laptops: Desktop Duplication needs this process on the GPU that renders the new
             // monitor, and that preference only applies at start-up.

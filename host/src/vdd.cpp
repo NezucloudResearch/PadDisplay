@@ -19,6 +19,7 @@
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <cwctype>
 #include <fstream>
 #include <regex>
@@ -296,6 +297,13 @@ bool ToggleTasksExist() {
     RunCapture(L"schtasks.exe /query /tn \"" + std::wstring(kTaskOff) + L"\"", 10000, &b);
     return a == 0 && b == 0;
 }
+
+namespace {
+std::atomic<bool> vddFailed{false};
+}
+
+void SetVddFailed(bool failed) { vddFailed = failed; }
+bool VddFailed() { return vddFailed; }
 
 bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs) {
     VddState want = on ? VddState::Ready : VddState::Disabled;

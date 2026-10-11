@@ -30,6 +30,11 @@ void RemoveToggleTasks();
 bool ToggleTasksExist();
 bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs);
 
+// Set when a tablet was told to fix the virtual monitor from the tray. The tray then offers that fix even where it
+// normally hides it (the monitor is off between sessions on purpose). Cleared once a session gets its monitor.
+void SetVddFailed(bool failed);
+bool VddFailed();
+
 // Registers (or replaces) a scheduled task from its XML. Needs administrator rights.
 bool CreateTaskFromXml(const wchar_t* name, const std::wstring& xml, std::wstring& message);
 

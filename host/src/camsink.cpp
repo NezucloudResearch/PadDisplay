@@ -277,7 +277,7 @@ void CamSession::Run() {
         return end();
     }
     if (state == CamState::NotInstalled) {
-        SendNotice("The virtual camera is not set up on the PC. Right-click the PadDisplay tray icon and choose 'Finish PadDisplay setup'.");
+        SendNotice("The virtual camera is not set up on the PC. Right-click the PadDisplay tray icon and choose 'Set up the tablet's camera as a webcam'.");
         return end();
     }
     if (width_ == 0 || height_ == 0 || width_ > kCamMaxWidth || height_ > kCamMaxHeight) {

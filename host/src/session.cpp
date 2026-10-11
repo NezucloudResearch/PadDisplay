@@ -103,20 +103,28 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     fps_ = std::clamp(std::min(settings_.maxFps, hello_.maxFps ? int(hello_.maxFps) : 60), 10, 240);
 
     VirtualDisplay vd;
-    bool switchedOn = false;
-    if (!FindVirtualDisplay(settings_.displayOverride, vd) && settings_.displayOverride.empty() && QueryVdd() == VddState::Disabled &&
-        SetVirtualMonitorEnabled(true, 5000)) {
-        switchedOn = true;
-        for (int i = 0; i < 30 && !FindVirtualDisplay(L"", vd); ++i) Sleep(100); // switched off on exit: bring it back
+    bool switchedOn = false, switchOnFailed = false;
+    if (!FindVirtualDisplay(settings_.displayOverride, vd) && settings_.displayOverride.empty() && QueryVdd() == VddState::Disabled) {
+        // Switched off on exit or while no tablet was connected: bring it back. The scheduled task, pnputil and the driver's
+        // monitor arrival can take several seconds together (more right after boot); a shorter wait ended the session while
+        // the monitor was still coming. The pings above keep the tablet waiting, and both waits end as soon as it is there.
+        switchedOn = SetVirtualMonitorEnabled(true, 15000);
+        switchOnFailed = !switchedOn;
+        for (int i = 0; switchedOn && i < 100 && !FindVirtualDisplay(L"", vd); ++i) Sleep(100);
     }
     if (gdiName_.empty() && vd.gdiName.empty()) {
         VddState state = settings_.displayOverride.empty() ? QueryVdd() : VddState::Ready;
+        // Each text names the item the tray shows for that state; SetVddFailed makes sure it is shown.
+        SetVddFailed(true);
         SendError(ErrNoDisplay,
                   state == VddState::NotInstalled ? "The virtual monitor driver is not installed on the PC. Right-click the PadDisplay tray icon and choose 'Install virtual monitor driver'."
-                  : state == VddState::Disabled   ? "The virtual monitor driver is disabled on the PC. Right-click the PadDisplay tray icon and choose 'Enable virtual monitor driver'."
-                                                  : "Virtual monitor not found on the PC. Right-click the PadDisplay tray icon and choose 'Repair virtual monitor driver'.");
+                  : state == VddState::Disabled && switchOnFailed
+                      ? "PadDisplay could not switch the virtual monitor on. Right-click the PadDisplay tray icon on the PC and choose 'Enable virtual monitor driver'."
+                  : state == VddState::Disabled ? "The virtual monitor driver is disabled on the PC. Right-click the PadDisplay tray icon and choose 'Enable virtual monitor driver'."
+                                                : "Virtual monitor not found on the PC. Right-click the PadDisplay tray icon and choose 'Repair virtual monitor driver'.");
         return;
     }
+    SetVddFailed(false);
     gdiName_ = vd.gdiName;
     // With the virtual monitor off the desktop, the real screens are exactly as the user arranged them: remember that
     // (never while it is attached: Windows shifts things then). Switching it on above has done so already, and the
