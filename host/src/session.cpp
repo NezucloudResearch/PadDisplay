@@ -203,7 +203,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
 
     waiting.reset();
     if (conn_.s != INVALID_SOCKET) {
-        input_ = std::make_unique<InputInjector>();
+        input_ = std::make_unique<InputInjector>(HostIsElevated(), [this](const char* text) { SendNotice(text); });
         recvThread_ = std::thread([this] { RecvLoop(); });
         inputThread_ = std::thread([this] { InputLoop(); });
     }

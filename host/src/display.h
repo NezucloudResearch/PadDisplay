@@ -86,6 +86,7 @@ void WaitScreenRestore(unsigned timeoutMs);
 // screen and always put back. The previous value is kept in a marker file, so a crash cannot leave
 // the secure desktop disabled: RestoreSecureDesktop (also called at start-up) recovers it.
 bool AllowUacClicksOnTablet(); // true = UAC prompts are now on the normal desktop (or already were)
+bool HostIsElevated();         // the PadDisplay process runs with administrator rights
 void RestoreSecureDesktop();   // undo AllowUacClicksOnTablet; a no-op if nothing was changed
 
 // Logs every display device and DXGI output (for --list and diagnostics).

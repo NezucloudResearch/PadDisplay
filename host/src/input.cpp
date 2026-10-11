@@ -8,7 +8,8 @@
 
 namespace pd {
 
-InputInjector::InputInjector() {
+InputInjector::InputInjector(bool elevated, std::function<void(const char*)> notice)
+    : elevated_(elevated), notice_(std::move(notice)) {
     touchDev_ = CreateSyntheticPointerDevice(PT_TOUCH, UINT32(contacts_.size()), POINTER_FEEDBACK_DEFAULT);
     penDev_ = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT);
     if (!touchDev_ || !penDev_) LOGI("input: CreateSyntheticPointerDevice failed (%lu)", GetLastError());
@@ -42,9 +43,26 @@ POINT InputInjector::Map(uint16_t x, uint16_t y) const {
 
 bool InputInjector::Inject(HSYNTHETICPOINTERDEVICE dev, const POINTER_TYPE_INFO* infos, UINT32 count, const char* what) {
     if (!dev || count == 0) return false;
-    if (InjectSyntheticPointerInput(dev, infos, count)) return true;
-    if (injectErrors_++ < 20) LOGI("input: inject %s failed (%lu)", what, GetLastError());
+    if (InjectSyntheticPointerInput(dev, infos, count)) { NoteInjectResult(true, 0); return true; }
+    const DWORD err = GetLastError();
+    if (injectErrors_++ < 20) LOGI("input: inject %s failed (%lu)", what, err);
+    NoteInjectResult(false, err);
     return false;
+}
+
+// UIPI drops mouse/keyboard (SendInput) and touch/pen (InjectSyntheticPointerInput) from a normal
+// process to an elevated foreground window; the call fails with ERROR_ACCESS_DENIED. Game controllers
+// are unaffected: ViGEmBus feeds them in as a virtual HID device, below UIPI. The remedy is running
+// PadDisplay elevated, which the tablet cannot do for the user, so it is told once. The flag clears on
+// the next injection that lands, so moving between a normal and an elevated window reminds again.
+void InputInjector::NoteInjectResult(bool ok, DWORD err) {
+    if (ok) { toldElevation_ = false; return; }
+    if (elevated_ || toldElevation_ || !notice_ || err != ERROR_ACCESS_DENIED) return;
+    toldElevation_ = true;
+    notice_("An app running as administrator has focus, so Windows is blocking the tablet's mouse, "
+            "keyboard, touch and pen from it (game controllers still work). To control it, run "
+            "PadDisplay as administrator: right-click the PadDisplay icon in the PC's tray and choose "
+            "\"Run as administrator\".");
 }
 
 void InputInjector::OnTouch(const uint8_t* p, size_t n) {
@@ -186,7 +204,8 @@ void InputInjector::SendMouse(DWORD flags, POINT pt, DWORD data) {
     in.mi.dy = LONG((int64_t(pt.y - vy) * 65535 + (vh - 1) / 2) / (vh - 1));
     in.mi.dwFlags = flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
     in.mi.mouseData = data;
-    SendInput(1, &in, sizeof(in));
+    const UINT sent = SendInput(1, &in, sizeof(in));
+    NoteInjectResult(sent != 0, GetLastError());
 }
 
 void InputInjector::SendMouseRel(DWORD flags, LONG dx, LONG dy, DWORD data) {
@@ -196,7 +215,8 @@ void InputInjector::SendMouseRel(DWORD flags, LONG dx, LONG dy, DWORD data) {
     in.mi.dy = dy;
     in.mi.dwFlags = flags;
     in.mi.mouseData = data;
-    SendInput(1, &in, sizeof(in));
+    const UINT sent = SendInput(1, &in, sizeof(in));
+    NoteInjectResult(sent != 0, GetLastError());
 }
 
 struct MouseButton {
@@ -266,7 +286,8 @@ void InputInjector::SendKey(uint16_t code, bool down) {
         in.ki.dwFlags = KEYEVENTF_SCANCODE | (code & kKeyExtended ? KEYEVENTF_EXTENDEDKEY : 0);
     }
     if (!down) in.ki.dwFlags |= KEYEVENTF_KEYUP;
-    SendInput(1, &in, sizeof(in));
+    const UINT sent = SendInput(1, &in, sizeof(in));
+    NoteInjectResult(sent != 0, GetLastError());
     keysDown_[code] = down;
 }
 

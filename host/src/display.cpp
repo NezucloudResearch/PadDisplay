@@ -623,6 +623,8 @@ bool WriteUacPolicy(DWORD value) {
 }
 } // namespace
 
+bool HostIsElevated() { return IsProcessElevated(); }
+
 bool AllowUacClicksOnTablet() {
     if (!IsProcessElevated()) { // writing HKLM policy, and clicking the elevated prompt, both need elevation
         LOGI("uac: not moving prompts off the secure desktop - PadDisplay is not elevated");
