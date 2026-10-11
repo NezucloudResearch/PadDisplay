@@ -50,19 +50,28 @@ bool InputInjector::Inject(HSYNTHETICPOINTERDEVICE dev, const POINTER_TYPE_INFO*
     return false;
 }
 
-// UIPI drops mouse/keyboard (SendInput) and touch/pen (InjectSyntheticPointerInput) from a normal
-// process to an elevated foreground window; the call fails with ERROR_ACCESS_DENIED. Game controllers
-// are unaffected: ViGEmBus feeds them in as a virtual HID device, below UIPI. The remedy is running
-// PadDisplay elevated, which the tablet cannot do for the user, so it is told once. The flag clears on
-// the next injection that lands, so moving between a normal and an elevated window reminds again.
+// UIPI drops mouse/keyboard (SendInput) and touch/pen (InjectSyntheticPointerInput) from a process to
+// a window of higher integrity; the call fails with ERROR_ACCESS_DENIED. Game controllers are
+// unaffected: ViGEmBus feeds them in as a virtual HID device, below UIPI. Two cases:
+//   - Not elevated, blocked by an elevated (High) window (Task Manager, an app run as administrator):
+//     running PadDisplay as administrator fixes it, so the tablet is told to.
+//   - Elevated and still blocked: the window is above High, i.e. System integrity. In practice that is
+//     a Windows security prompt (UAC / consent.exe), which no High-level process can click, elevated or
+//     not - it needs a System-level injector PadDisplay does not have. Answer it on the PC.
+// Told once; the flag clears on the next injection that lands, so moving between windows reminds again.
 void InputInjector::NoteInjectResult(bool ok, DWORD err) {
     if (ok) { toldElevation_ = false; return; }
-    if (elevated_ || toldElevation_ || !notice_ || err != ERROR_ACCESS_DENIED) return;
+    if (toldElevation_ || !notice_ || err != ERROR_ACCESS_DENIED) return;
     toldElevation_ = true;
-    notice_("An app running as administrator has focus, so Windows is blocking the tablet's mouse, "
-            "keyboard, touch and pen from it (game controllers still work). To control it, run "
-            "PadDisplay as administrator: right-click the PadDisplay icon in the PC's tray and choose "
-            "\"Run as administrator\".");
+    if (elevated_)
+        notice_("Windows is blocking the tablet from clicking this. It is a Windows security prompt "
+                "(User Account Control), which runs above administrator level, so not even PadDisplay "
+                "running as administrator can click it from the tablet. Answer it on the PC.");
+    else
+        notice_("An app running as administrator has focus, so Windows is blocking the tablet's mouse, "
+                "keyboard, touch and pen from it (game controllers still work). To control it, run "
+                "PadDisplay as administrator: right-click the PadDisplay icon in the PC's tray and choose "
+                "\"Run as administrator\".");
 }
 
 void InputInjector::OnTouch(const uint8_t* p, size_t n) {
