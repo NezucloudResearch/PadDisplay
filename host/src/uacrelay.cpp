@@ -4,7 +4,6 @@
 #include "log.h"
 #include "net.h"      // RunCapture
 #include "vdd.h"      // CreateTaskFromXml
-#include "settings.h" // AppDataDir
 
 #include <windows.h>
 #include <wtsapi32.h>
@@ -16,13 +15,23 @@
 namespace pd {
 namespace {
 
-// The executable basename of the foreground window's process ("?" if it cannot be read). Logged on an
+// The relay and injector run as SYSTEM, so their AppDataDir() is the SYSTEM profile (admin-only and
+// confusing). Log instead under %ProgramData%\PadDisplay, which users can read.
+std::wstring UacLogPath() {
+    wchar_t pd[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(pd) : std::wstring(L"C:\\ProgramData");
+    dir += L"\\PadDisplay";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\uac-relay.log";
+}
+
+// The executable basename of [win]'s process ("<...>" markers if it cannot be read). Logged on an
 // ignored command so a window that is not consent.exe (a differently named secure UI) can be spotted.
-std::wstring ForegroundImage() {
-    HWND fg = GetForegroundWindow();
-    if (!fg) return L"<none>";
+std::wstring WindowImage(HWND win) {
+    if (!win) return L"<none>";
     DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
+    GetWindowThreadProcessId(win, &pid);
     if (!pid) return L"<no-pid>";
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!proc) return L"<open-denied>"; // our System token should open consent.exe; if not, that is the clue
@@ -35,8 +44,30 @@ std::wstring ForegroundImage() {
     return slash ? slash + 1 : path;
 }
 
-// The consent prompt is drawn by consent.exe. Inject only when it is the foreground window.
-bool ForegroundIsConsent() { return _wcsicmp(ForegroundImage().c_str(), L"consent.exe") == 0; }
+bool IsConsent(HWND win) { return _wcsicmp(WindowImage(win).c_str(), L"consent.exe") == 0; }
+
+// The top-level consent window under the screen point, or null. The prompt opens in the background and
+// is created full-screen for an instant before it shrinks, so checking the window under the exact point
+// (not the foreground window, which is still the app behind it) is what tells us the tap hit the prompt.
+HWND ConsentRootAt(int x, int y) {
+    HWND w = WindowFromPoint(POINT{x, y});
+    if (!w) return nullptr;
+    HWND root = GetAncestor(w, GA_ROOT);
+    return IsConsent(root ? root : w) ? (root ? root : w) : nullptr;
+}
+
+BOOL CALLBACK FindConsentProc(HWND w, LPARAM lp) {
+    if (IsWindowVisible(w) && IsConsent(w)) { *reinterpret_cast<HWND*>(lp) = w; return FALSE; }
+    return TRUE;
+}
+
+// A visible top-level consent.exe window, or null. By process, not window class, so it does not depend
+// on a class name that can differ between Windows builds.
+HWND FindConsentWindow() {
+    HWND found = nullptr;
+    EnumWindows(FindConsentProc, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
 
 // Only these keys are forwarded to a UAC prompt. Anything else is dropped, so the channel cannot be
 // used to type arbitrary input as System.
@@ -54,6 +85,15 @@ bool KeyAllowed(WORD vk) {
     default:
         return false;
     }
+}
+
+// Bring the consent window forward before injecting, so the first click presses the button instead of
+// only activating a background window. As SYSTEM in the session this is permitted.
+void Activate(HWND consent) {
+    if (!consent) return;
+    SetForegroundWindow(consent);
+    SetActiveWindow(consent);
+    Sleep(30); // let the activation take effect before the click
 }
 
 void InjectClick(int x, int y) {
@@ -95,13 +135,20 @@ PSECURITY_DESCRIPTOR MakePipeSd() {
 
 // ================= main (elevated) side ==========================================================
 
-bool EnsureUacRelayTask(std::wstring& message) {
-    DWORD code = 1;
-    RunCapture(std::wstring(L"schtasks.exe /query /tn \"") + kUacRelayTask + L"\"", 10000, &code);
-    if (code == 0) return true; // already registered
+// Click gate (hot path): one window hit-test + a single process-name read on the window under the tap.
+bool WindowAtPointIsConsent(int x, int y) { return ConsentRootAt(x, y) != nullptr; }
 
+// Key gate (hot path, used for the few allowed keys incl. auto-repeat): a cheap top-level class lookup,
+// no per-window process reads. The class can differ between Windows builds, so keys may not reach the
+// prompt where clicks (point + process, robust) still do; the injector re-validates by process anyway.
+bool ConsentPromptOpen() { return FindWindowW(L"Credential Dialog Xaml Host", nullptr) != nullptr; }
+
+bool EnsureUacRelayTask(std::wstring& message) {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    // Always (re)register: CreateTaskFromXml uses schtasks /create /f, which overwrites any existing
+    // task of this name, so the action always points at the exe running now - never a stale path.
+
     // SYSTEM principal (System integrity), startable on demand by interactive users (GRGX;;;IU), like
     // the virtual-monitor on/off tasks. Its action is fixed: this exe with --uac-relay and nothing else.
     std::wstring xml =
@@ -153,9 +200,12 @@ UacClickClient::~UacClickClient() {
     if (pipe_ != INVALID_HANDLE_VALUE) CloseHandle(pipe_);
 }
 
-// Enqueue only - called on the input thread, so it must never block. A UAC prompt is clicked at human
-// speed, so a tiny bound is plenty; drop the oldest if somehow exceeded rather than grow unbounded.
+// Called on the input thread on a tap / allowed key. The consent test returns at once for a normal tap
+// (the overwhelming case), so this costs a window hit-test and - only when a prompt is actually there -
+// a process-name read; nothing is forwarded for ordinary input. Enqueue is the only thing passed to the
+// worker; the slow task/pipe work is all on the worker. Tiny bound, drop oldest (human-paced clicks).
 void UacClickClient::Click(int x, int y) {
+    if (!WindowAtPointIsConsent(x, y)) return;
     {
         std::lock_guard lock(mutex_);
         if (queue_.size() >= 32) queue_.pop_front();
@@ -165,6 +215,7 @@ void UacClickClient::Click(int x, int y) {
 }
 
 void UacClickClient::Key(WORD vk) {
+    if (!ConsentPromptOpen()) return;
     {
         std::lock_guard lock(mutex_);
         if (queue_.size() >= 32) queue_.pop_front();
@@ -178,7 +229,7 @@ void UacClickClient::Worker() {
         UacFrame f{};
         {
             std::unique_lock lock(mutex_);
-            cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+            cv_.wait(lock, [this] { return stop_ || !queue_.empty(); }); // purely event-driven: no idle poll
             if (stop_ && queue_.empty()) return;
             f = queue_.front();
             queue_.pop_front();
@@ -214,9 +265,9 @@ bool UacClickClient::Ensure() {
 }
 
 bool UacClickClient::Send(const UacFrame& f) {
-    // Two tries: the injector is time-limited (the task's ExecutionTimeLimit), so a long session finds
-    // it gone and the first write fails; drop the dead pipe and re-launch transparently before giving
-    // up. Both the re-trigger and the pipe wait run on this worker thread, never on the input thread.
+    // Two tries: the injector self-exits after its 2-minute cap, so a later click finds it gone and the
+    // first write fails; drop the dead pipe and re-launch transparently before giving up. Both the
+    // re-trigger and the pipe wait run on this worker thread, never on the input thread.
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (!Ensure()) return false;
         DWORD wrote = 0;
@@ -234,7 +285,7 @@ bool UacClickClient::Send(const UacFrame& f) {
 // ================= SYSTEM relay / injector =======================================================
 
 int RunUacRelayBootstrap() {
-    LogInit(AppDataDir() + L"\\uac-relay.log", false, true);
+    LogInit(UacLogPath(), false, true);
     // We are SYSTEM in session 0. Put a copy of our token into the active console session and start the
     // injector there, so its SendInput reaches the user's desktop (and the consent prompt on it).
     DWORD session = WTSGetActiveConsoleSessionId();
@@ -275,7 +326,7 @@ int RunUacRelayBootstrap() {
 }
 
 int RunUacInjector() {
-    LogInit(AppDataDir() + L"\\uac-relay.log", false, true);
+    LogInit(UacLogPath(), false, true);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); // match the host's coordinate mapping
 
     PSECURITY_DESCRIPTOR sd = MakePipeSd();
@@ -288,30 +339,47 @@ int RunUacInjector() {
     if (pipe == INVALID_HANDLE_VALUE) { LOGI("uac-inject: CreateNamedPipe failed (%lu)", GetLastError()); return 1; }
     LOGI("uac-inject: ready (SYSTEM, this session); waiting for the local client");
 
-    // Serve at most a couple of minutes total, so a forgotten injector does not linger as SYSTEM.
-    const ULONGLONG deadline = GetTickCount64() + 2 * 60 * 1000;
-    while (GetTickCount64() < deadline) {
+    // Hard lifetime cap: ConnectNamedPipe/ReadFile block, and the task does not bound this detached
+    // child, so a watchdog cancels the blocked I/O after 2 minutes and the SYSTEM process exits - it is
+    // re-launched transparently if a later click needs it, so it is never a long-lived SYSTEM process.
+    // static + capture the handle by value: the detached thread must not touch this function's stack
+    // after it returns. The injector runs once per process, so a static flag is fine.
+    static std::atomic<bool> expired{false};
+    std::thread([pipe] { Sleep(2 * 60 * 1000); expired = true; CancelIoEx(pipe, nullptr); }).detach();
+
+    while (!expired) {
         if (!ConnectNamedPipe(pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) break;
         for (;;) {
             UacFrame f{};
             DWORD got = 0;
             if (!ReadFile(pipe, &f, sizeof(f), &got, nullptr) || got != sizeof(f)) break;
-            std::wstring fg = ForegroundImage(); // read once: for the check and the log
-            if (_wcsicmp(fg.c_str(), L"consent.exe") != 0) { // authoritative: never inject into anything else
-                LOGI("uac-inject: ignored a command - foreground is %ls, not the UAC prompt", fg.c_str());
-                continue;
-            }
             if (f.cmd == uint32_t(UacCmd::Click)) {
+                // Authoritative gate: the window under the click point must be the consent prompt.
+                HWND consent = ConsentRootAt(f.a, f.b);
+                if (!consent) {
+                    LOGI("uac-inject: ignored a click at %d,%d - window there is %ls, not the UAC prompt",
+                         f.a, f.b, WindowImage(GetAncestor(WindowFromPoint(POINT{f.a, f.b}), GA_ROOT)).c_str());
+                    continue;
+                }
+                Activate(consent);
                 InjectClick(f.a, f.b);
                 LOGI("uac-inject: clicked the UAC prompt at %d,%d", f.a, f.b);
             } else if (f.cmd == uint32_t(UacCmd::Key) && f.a >= 0 && f.a <= 0xFFFF && KeyAllowed(WORD(f.a))) {
+                // No point for a key: require a consent prompt to exist, bring it forward, then type.
+                HWND consent = FindConsentWindow();
+                if (!consent) {
+                    LOGI("uac-inject: ignored a key - no UAC prompt is open");
+                    continue;
+                }
+                Activate(consent);
                 InjectKey(WORD(f.a));
                 LOGI("uac-inject: sent key 0x%02x to the UAC prompt", unsigned(f.a));
             }
         }
         DisconnectNamedPipe(pipe);
     }
-    CloseHandle(pipe);
+    // Not closed here: the watchdog thread may still CancelIoEx on this handle, and the process exits
+    // immediately after returning, so the OS closes it. Closing here could race the watchdog.
     LOGI("uac-inject: exiting");
     return 0;
 }

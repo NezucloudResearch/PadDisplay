@@ -218,8 +218,9 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         input_ = std::make_unique<InputInjector>(HostIsElevated(), [this](const char* text) { SendNotice(text); });
         if (uacClickable_) {
             uacClick_ = std::make_unique<UacClickClient>([this](const char* text) { SendNotice(text); });
-            // Called on the input thread when a click/key is refused because a UAC prompt is in front.
-            // These only enqueue; the client's worker thread does the slow work.
+            // Called on the input thread for every tap / allowed key while the feature is on. The client
+            // tests cheaply whether it lands on a UAC prompt and ignores it otherwise; only a real hit is
+            // enqueued, and the client's worker thread does the slow task/pipe work.
             input_->SetUacForward([this](bool click, int x, int y, WORD vk) {
                 if (click) uacClick_->Click(x, y); else uacClick_->Key(vk);
             });

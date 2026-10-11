@@ -83,7 +83,6 @@ bool InputInjector::Inject(HSYNTHETICPOINTERDEVICE dev, const POINTER_TYPE_INFO*
 //     tell the user to answer it on the PC.
 // Told once; the flag clears on the next injection that lands, so moving between windows reminds again.
 void InputInjector::NoteInjectResult(bool ok, DWORD err) {
-    blockedByUipi_ = !ok && err == ERROR_ACCESS_DENIED;
     if (ok) { toldElevation_ = false; return; }
     if (toldElevation_ || !notice_ || err != ERROR_ACCESS_DENIED) return;
     toldElevation_ = true;
@@ -160,10 +159,10 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
     }
     Inject(touchDev_, frame.data(), used, "touch");
     lastTouchInject_ = GetTickCount64();
-    // A finger landing on a UAC prompt is refused (blockedByUipi_ set by the inject just above): send a
-    // left click at each new contact to the System injector. Tied to this frame's own result and to the
-    // DOWN, so a lift or a move never becomes a stray click on the prompt.
-    if (blockedByUipi_ && uacForward_)
+    // Synthetic touch does not actuate a UAC prompt (the inject returns success but Windows drops it), so
+    // offer each new contact to the UAC click path too. The client ignores it unless a prompt is up, and
+    // the injector re-checks the window under the point, so a normal tap costs only an atomic read.
+    if (uacForward_)
         for (UINT32 i = 0; i < downs; ++i) uacForward_(true, downPts[i].x, downPts[i].y, 0);
 
     for (UINT32 i = 0; i < used; ++i) {
@@ -291,11 +290,11 @@ void InputInjector::OnMouse(const uint8_t* p, size_t n) {
     if (ButtonOf(p[0], button, down)) {
         SendMouse(down ? kButtons[button].down : kButtons[button].up, pt, kButtons[button].data);
         buttonsDown_ = uint8_t(down ? buttonsDown_ | (1 << button) : buttonsDown_ & ~(1 << button));
-        // Left-button press refused because a UAC prompt is in front: forward one full click to the
-        // System injector. Keyed to the DOWN's own result (blockedByUipi_ was just set by this
-        // SendMouse), so a press on a normal window followed by a prompt stealing focus before release
-        // does not turn the release into a stray click on the prompt.
-        if (button == 0 && down && blockedByUipi_ && uacForward_) uacForward_(true, pt.x, pt.y, 0);
+        // Left-button press: offer it to the UAC click path. Windows does not refuse injection into a
+        // consent prompt (it silently drops it, no ERROR_ACCESS_DENIED), so this cannot key off the
+        // inject result; the client ignores it unless a prompt is actually up and the injector re-checks
+        // the window under the point, so a normal press is a cheap atomic read and nothing more.
+        if (button == 0 && down && uacForward_) uacForward_(true, pt.x, pt.y, 0);
     } else if (p[0] == MouseMove) {
         SendMouse(0, pt);
     } else if (p[0] == MouseWheel) {
@@ -345,8 +344,9 @@ void InputInjector::OnKey(const uint8_t* p, size_t n) {
     std::lock_guard lock(mutex_);
     const bool down = (p[0] & KeyDown) != 0;
     SendKey(code, down);
-    // Enter / Esc / Tab / arrows on a UAC prompt (the key was refused): forward to the System injector.
-    if (down && blockedByUipi_ && uacForward_) {
+    // Enter / Esc / Tab / arrows: offer to the UAC click path (dropped unless a prompt is up). Not gated
+    // on the inject result, since injection into a consent prompt returns success but is dropped.
+    if (down && uacForward_) {
         WORD vk = UacVkFromWire(code);
         if (vk) uacForward_(false, 0, 0, vk);
     }

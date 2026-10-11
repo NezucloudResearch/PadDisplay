@@ -9,18 +9,19 @@
 // one there and feeds it a tightly limited set of clicks:
 //
 //   PadDisplay (elevated, High)                      --uac-relay (SYSTEM, session 0)
-//     registers + triggers the SYSTEM task  ───────▶   duplicates its token into the active console
-//     connects to the injector's pipe                  session and starts --uac-inject there
-//     forwards "click at (x,y)" / "key"    ◀────────▶ --uac-inject (SYSTEM, the user's session)
-//                                                        validates the foreground is consent.exe,
-//                                                        then injects the click; nothing else.
+//     a tap whose window is consent.exe  ───────────▶   duplicates its token into the active console
+//     is forwarded as "click at (x,y)"                  session and starts --uac-inject there
+//     connects to the injector's pipe      ◀────────▶ --uac-inject (SYSTEM, the user's session)
+//                                                        re-checks the window under the point is
+//                                                        consent.exe, then clicks it; nothing else.
 //
 // Everything here is OFF unless the user turned on "Let the tablet answer UAC prompts" AND the host is
-// elevated AND the tablet is the only screen. The injector forwards input ONLY while the UAC prompt is
-// the foreground window, and only a left click or Enter / Esc / Tab / arrow keys - never arbitrary
-// input. See SECURITY.md.
+// elevated AND the tablet is the only screen. A click is injected ONLY when the window directly under it
+// is the consent prompt (consent.exe), a key ONLY while a consent prompt is open, and only a left click
+// or Enter / Esc / Tab / Space / arrow keys - never arbitrary input. See SECURITY.md.
 #pragma once
 #include <windows.h>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -46,23 +47,30 @@ constexpr wchar_t kUacPipeName[] = L"\\\\.\\pipe\\PadDisplayUacClick";
 
 // --- used by the main (elevated) PadDisplay ------------------------------------------------------
 
-// Registers the SYSTEM scheduled task that launches the relay. Needs administrator rights; a no-op
-// that returns true if the task already exists. false + message on failure.
+// (Re)registers the SYSTEM scheduled task that launches the relay, overwriting any existing one so its
+// action always points at the running exe. Needs administrator rights. false + message on failure.
 bool EnsureUacRelayTask(std::wstring& message);
 void RemoveUacRelayTask(); // for uninstall; whoever registered it
 
-// Client the session uses while a UAC prompt is up. Click()/Key() are called from the input thread
-// and only enqueue; a private worker thread does the slow part (starting the relay task, waiting for
-// the injector's pipe, writing) so the input thread never blocks. [notice] is called (from the worker)
-// at most once if the helper cannot be reached, so the user is not left tapping a prompt that never
-// responds. Safe to construct even when the feature is off; then it is simply never fed.
+// Consent-prompt tests used by the client gate (and the injector). The elevated host can read the
+// consent process; from a normal-rights process these return false. Cheap enough for a tap/key DOWN.
+bool WindowAtPointIsConsent(int x, int y); // the top-level window under the screen point is consent.exe
+bool ConsentPromptOpen();                  // some top-level consent.exe window exists right now
+
+// Client the session uses while a UAC prompt is up. Click()/Key() are called from the input thread on a
+// tap/allowed key. They do a cheap consent test (WindowAtPointIsConsent / ConsentPromptOpen) and return
+// at once for a normal tap; only a tap that actually lands on a consent prompt is enqueued. A private
+// worker thread then does the slow part (starting the relay task, waiting for the injector's pipe,
+// writing) so the input thread never blocks. [notice] is called (from the worker) at most once if the
+// helper cannot be reached. Safe to construct when the feature is off; then it is simply never fed.
 class UacClickClient {
 public:
     explicit UacClickClient(std::function<void(const char*)> notice);
     ~UacClickClient();
-    // [x],[y] in virtual-desktop pixels (the same screen coordinates InputInjector::Map returns).
+    // [x],[y] in virtual-desktop pixels (the same screen coordinates InputInjector::Map returns). Dropped
+    // unless the window under the point is a consent prompt; the injector re-checks before it clicks.
     void Click(int x, int y);
-    // [vk] is checked against the small allow-list on the injector side too.
+    // [vk] is checked against the small allow-list on the injector side too. Dropped unless a prompt is up.
     void Key(WORD vk);
 
 private:
