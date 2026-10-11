@@ -168,8 +168,20 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     }
     // In only-screen mode a UAC prompt on the secure desktop would be invisible and unanswerable. If the
     // user opted in (and the host is elevated), move prompts to the normal desktop so the tablet can
-    // click them. Restored on teardown and at start-up; a no-op otherwise.
-    if (onlyScreen_ && settings_.uacClickableOnTablet) AllowUacClicksOnTablet();
+    // see them. Restored on teardown and at start-up; a no-op otherwise.
+    if (onlyScreen_ && settings_.uacClickableOnTablet) {
+        AllowUacClicksOnTablet();
+        // Seeing the prompt is not clicking it: the prompt runs above administrator level, so the click
+        // has to go through a System-level helper. Register its task now (needs the admin rights we have).
+        // Only forward clicks (uacClickable_) if the task is in place and we are elevated.
+        if (HostIsElevated()) {
+            std::wstring msg;
+            uacClickable_ = EnsureUacRelayTask(msg);
+            if (!uacClickable_) LOGI("session: UAC-click helper not available: %s", Narrow(msg).c_str());
+        } else {
+            LOGI("session: tablet cannot click UAC prompts (PadDisplay is not elevated); it can only show them");
+        }
+    }
     // Attaching/reloading may have moved real screens. Windows re-applies its own layout for a
     // moment afterwards, so watching for that takes 1.5 s: do it while the stream starts.
     if (settings_.displayOverride.empty())
@@ -204,6 +216,14 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     waiting.reset();
     if (conn_.s != INVALID_SOCKET) {
         input_ = std::make_unique<InputInjector>(HostIsElevated(), [this](const char* text) { SendNotice(text); });
+        if (uacClickable_) {
+            uacClick_ = std::make_unique<UacClickClient>([this](const char* text) { SendNotice(text); });
+            // Called on the input thread when a click/key is refused because a UAC prompt is in front.
+            // These only enqueue; the client's worker thread does the slow work.
+            input_->SetUacForward([this](bool click, int x, int y, WORD vk) {
+                if (click) uacClick_->Click(x, y); else uacClick_->Key(vk);
+            });
+        }
         recvThread_ = std::thread([this] { RecvLoop(); });
         inputThread_ = std::thread([this] { InputLoop(); });
     }

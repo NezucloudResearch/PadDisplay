@@ -22,6 +22,10 @@ public:
     ~InputInjector();
 
     void SetTarget(const RECT& desktopRect);
+    // While set, a click/key that Windows blocks because a UAC prompt (System integrity) is in front is
+    // forwarded here instead, with screen-pixel coordinates for a click or a virtual-key code for a key.
+    // The session points this at the System-level UAC injector (see uacrelay.*). Null = no forwarding.
+    void SetUacForward(std::function<void(bool click, int x, int y, WORD vk)> forward);
     void OnTouch(const uint8_t* p, size_t n);
     void OnPen(const uint8_t* p, size_t n);
     void OnMouse(const uint8_t* p, size_t n);
@@ -51,7 +55,9 @@ private:
 
     bool elevated_;
     std::function<void(const char*)> notice_;
+    std::function<void(bool click, int x, int y, WORD vk)> uacForward_; // set only in only-screen UAC mode
     bool toldElevation_ = false; // the elevation notice was sent; cleared by the next injection that lands
+    bool blockedByUipi_ = false; // the last SendInput / inject was refused with ERROR_ACCESS_DENIED
     std::mutex mutex_;
     RECT rect_{0, 0, 1, 1};
     HSYNTHETICPOINTERDEVICE touchDev_ = nullptr;

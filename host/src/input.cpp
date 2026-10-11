@@ -29,6 +29,28 @@ void InputInjector::SetTarget(const RECT& r) {
     rect_ = r;
 }
 
+void InputInjector::SetUacForward(std::function<void(bool click, int x, int y, WORD vk)> forward) {
+    std::lock_guard lock(mutex_);
+    uacForward_ = std::move(forward);
+}
+
+// Maps the wire scancode of one of the few keys allowed on a UAC prompt to its virtual-key code; 0
+// for anything else, so no other key is ever forwarded.
+static WORD UacVkFromWire(uint16_t code) {
+    const bool ext = (code & kKeyExtended) != 0;
+    switch (code & 0xFF) {
+    case 0x1C: return VK_RETURN;
+    case 0x01: return VK_ESCAPE;
+    case 0x0F: return VK_TAB;
+    case 0x39: return VK_SPACE;
+    case 0x48: return ext ? VK_UP : 0;
+    case 0x50: return ext ? VK_DOWN : 0;
+    case 0x4B: return ext ? VK_LEFT : 0;
+    case 0x4D: return ext ? VK_RIGHT : 0;
+    default: return 0;
+    }
+}
+
 // Synthetic pointer (touch/pen) injection takes coordinates relative to the top-left of the
 // virtual screen, not screen coordinates: with a monitor left of the primary they differ.
 static POINT ToVirtualScreen(POINT pt) {
@@ -56,18 +78,21 @@ bool InputInjector::Inject(HSYNTHETICPOINTERDEVICE dev, const POINTER_TYPE_INFO*
 //   - Not elevated, blocked by an elevated (High) window (Task Manager, an app run as administrator):
 //     running PadDisplay as administrator fixes it, so the tablet is told to.
 //   - Elevated and still blocked: the window is above High, i.e. System integrity. In practice that is
-//     a Windows security prompt (UAC / consent.exe), which no High-level process can click, elevated or
-//     not - it needs a System-level injector PadDisplay does not have. Answer it on the PC.
+//     a Windows security prompt (UAC / consent.exe), which no High-level process can click. If the
+//     System-level UAC injector is active (uacForward_ set) it will click it, so say nothing; otherwise
+//     tell the user to answer it on the PC.
 // Told once; the flag clears on the next injection that lands, so moving between windows reminds again.
 void InputInjector::NoteInjectResult(bool ok, DWORD err) {
+    blockedByUipi_ = !ok && err == ERROR_ACCESS_DENIED;
     if (ok) { toldElevation_ = false; return; }
     if (toldElevation_ || !notice_ || err != ERROR_ACCESS_DENIED) return;
     toldElevation_ = true;
-    if (elevated_)
+    if (elevated_) {
+        if (uacForward_) return; // the UAC injector handles this click; no notice needed
         notice_("Windows is blocking the tablet from clicking this. It is a Windows security prompt "
                 "(User Account Control), which runs above administrator level, so not even PadDisplay "
                 "running as administrator can click it from the tablet. Answer it on the PC.");
-    else
+    } else
         notice_("An app running as administrator has focus, so Windows is blocking the tablet's mouse, "
                 "keyboard, touch and pen from it (game controllers still work). To control it, run "
                 "PadDisplay as administrator: right-click the PadDisplay icon in the PC's tray and choose "
@@ -82,11 +107,13 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
 
     std::array<POINTER_TYPE_INFO, 10> frame{};
     std::array<int, 10> frameSlot{};
-    UINT32 used = 0;
+    std::array<POINT, 10> downPts{}; // screen points of contacts that begin (go down) in this frame
+    UINT32 used = 0, downs = 0;
     for (size_t i = 0; i < count && used < frame.size(); ++i) {
         const uint8_t* e = p + 1 + i * 10;
         uint8_t id = e[0], kind = e[1];
-        POINT pt = ToVirtualScreen(Map(rd16(e + 2), rd16(e + 4)));
+        POINT screen = Map(rd16(e + 2), rd16(e + 4));
+        POINT pt = ToVirtualScreen(screen);
         uint32_t pressure = std::min<uint32_t>(rd16(e + 6), kPressureMax);
 
         int slot = -1;
@@ -117,6 +144,7 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
         case TouchUp: ti.pointerInfo.pointerFlags = POINTER_FLAG_UP; break;
         default: ti.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_CANCELED; break;
         }
+        if (kind == TouchDown) downPts[downs++] = screen; // may become a UAC click if this frame is blocked
         c.active = true;
         c.clientId = id;
         frameSlot[used] = slot;
@@ -132,6 +160,11 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
     }
     Inject(touchDev_, frame.data(), used, "touch");
     lastTouchInject_ = GetTickCount64();
+    // A finger landing on a UAC prompt is refused (blockedByUipi_ set by the inject just above): send a
+    // left click at each new contact to the System injector. Tied to this frame's own result and to the
+    // DOWN, so a lift or a move never becomes a stray click on the prompt.
+    if (blockedByUipi_ && uacForward_)
+        for (UINT32 i = 0; i < downs; ++i) uacForward_(true, downPts[i].x, downPts[i].y, 0);
 
     for (UINT32 i = 0; i < used; ++i) {
         Contact& c = contacts_[frameSlot[i]];
@@ -258,6 +291,11 @@ void InputInjector::OnMouse(const uint8_t* p, size_t n) {
     if (ButtonOf(p[0], button, down)) {
         SendMouse(down ? kButtons[button].down : kButtons[button].up, pt, kButtons[button].data);
         buttonsDown_ = uint8_t(down ? buttonsDown_ | (1 << button) : buttonsDown_ & ~(1 << button));
+        // Left-button press refused because a UAC prompt is in front: forward one full click to the
+        // System injector. Keyed to the DOWN's own result (blockedByUipi_ was just set by this
+        // SendMouse), so a press on a normal window followed by a prompt stealing focus before release
+        // does not turn the release into a stray click on the prompt.
+        if (button == 0 && down && blockedByUipi_ && uacForward_) uacForward_(true, pt.x, pt.y, 0);
     } else if (p[0] == MouseMove) {
         SendMouse(0, pt);
     } else if (p[0] == MouseWheel) {
@@ -305,7 +343,13 @@ void InputInjector::OnKey(const uint8_t* p, size_t n) {
     uint16_t code = rd16(p + 1);
     if (code >= keysDown_.size() || (code & 0xFF) == 0 || (code & 0xFF) >= 0x80) return; // not a make code
     std::lock_guard lock(mutex_);
-    SendKey(code, (p[0] & KeyDown) != 0);
+    const bool down = (p[0] & KeyDown) != 0;
+    SendKey(code, down);
+    // Enter / Esc / Tab / arrows on a UAC prompt (the key was refused): forward to the System injector.
+    if (down && blockedByUipi_ && uacForward_) {
+        WORD vk = UacVkFromWire(code);
+        if (vk) uacForward_(false, 0, 0, vk);
+    }
 }
 
 void InputInjector::Tick() {

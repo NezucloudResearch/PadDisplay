@@ -21,6 +21,7 @@
 #include "settings.h"
 #include "setup.h"
 #include "gpu_profile.h"
+#include "uacrelay.h"
 #include "vcam.h"
 #include "vdd.h"
 
@@ -875,6 +876,7 @@ int RunUninstallSetup() {
     if (AddedByPadDisplay(kAddedVigem)) step("game controller driver", RemoveVigem(message));
     if (AddedByPadDisplay(kAddedCable)) step("VB-CABLE", RemoveCable(ExeDir() + L"\\driver\\vbcable", message));
     RemoveToggleTasks();
+    RemoveUacRelayTask();
     DeleteTaskFolder();
     step("driver publishers", UntrustDriverPublishers(message));
     if (QueryNvidiaProfile() == GpuProfileState::Set) step("NVIDIA profile", ConfigureNvidiaProfile(false, message));
@@ -943,6 +945,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     DisableProcessPowerThrottling();
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    // The UAC-click helper: these run as SYSTEM, started by the scheduled task (see uacrelay.*), never
+    // by the user. They do their one job and exit, well before any of the normal start-up below.
+    if (HasArg(argc, argv, L"--uac-relay")) return RunUacRelayBootstrap();
+    if (HasArg(argc, argv, L"--uac-inject")) return RunUacInjector();
     const wchar_t* dumpPath = ArgValue(argc, argv, L"--dump");
     bool list = HasArg(argc, argv, L"--list");
     const SetupCommand* setup = FindSetupCommand(argc, argv);

@@ -12,6 +12,7 @@
 #include "net.h"
 #include "settings.h"
 #include "tls.h"
+#include "uacrelay.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -120,6 +121,8 @@ private:
     DesktopCapture capture_;
     std::unique_ptr<Encoder> encoder_;
     std::unique_ptr<InputInjector> input_;
+    bool uacClickable_ = false;              // only-screen + elevated + opted in: the tablet may click UAC prompts
+    std::unique_ptr<UacClickClient> uacClick_; // the client side of the System-level UAC injector (uacrelay.*)
     Codec codec_ = CodecHEVC;
     int width_ = 0, height_ = 0, fps_ = 60;
     int bitrateKbps_ = 0, maxBitrateKbps_ = 0;
