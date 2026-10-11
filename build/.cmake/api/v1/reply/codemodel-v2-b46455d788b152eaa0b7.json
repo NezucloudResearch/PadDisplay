@@ -47,28 +47,28 @@
 				{
 					"directoryIndex" : 0,
 					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ALL_BUILD-Debug-d64002898f933c051602.json",
+					"jsonFile" : "target-ALL_BUILD-Debug-cbab4dd1a77ba14b9395.json",
 					"name" : "ALL_BUILD",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplay::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplay-Debug-73f2ee825776b68eee52.json",
+					"jsonFile" : "target-PadDisplay-Debug-5ba346829a210dfcdc9f.json",
 					"name" : "PadDisplay",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplayCamera::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplayCamera-Debug-96e52077512ccf26ee1e.json",
+					"jsonFile" : "target-PadDisplayCamera-Debug-051545bb2e2517e9eddc.json",
 					"name" : "PadDisplayCamera",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "ViGEmClient::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ViGEmClient-Debug-e18bb7a450f7e9b601ca.json",
+					"jsonFile" : "target-ViGEmClient-Debug-def4a34218dacffd7fee.json",
 					"name" : "ViGEmClient",
 					"projectIndex" : 0
 				},
@@ -127,28 +127,28 @@
 				{
 					"directoryIndex" : 0,
 					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ALL_BUILD-Release-d64002898f933c051602.json",
+					"jsonFile" : "target-ALL_BUILD-Release-cbab4dd1a77ba14b9395.json",
 					"name" : "ALL_BUILD",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplay::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplay-Release-6e3dc169599cf96e651d.json",
+					"jsonFile" : "target-PadDisplay-Release-db75afdbe3f5e770999d.json",
 					"name" : "PadDisplay",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplayCamera::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplayCamera-Release-1a26d3a9a810b8994b33.json",
+					"jsonFile" : "target-PadDisplayCamera-Release-707f00eaccce0e09dacf.json",
 					"name" : "PadDisplayCamera",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "ViGEmClient::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ViGEmClient-Release-49d0fe5f150d8904a059.json",
+					"jsonFile" : "target-ViGEmClient-Release-79a95abbf408b150a63b.json",
 					"name" : "ViGEmClient",
 					"projectIndex" : 0
 				},
@@ -207,28 +207,28 @@
 				{
 					"directoryIndex" : 0,
 					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ALL_BUILD-MinSizeRel-d64002898f933c051602.json",
+					"jsonFile" : "target-ALL_BUILD-MinSizeRel-cbab4dd1a77ba14b9395.json",
 					"name" : "ALL_BUILD",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplay::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplay-MinSizeRel-b473ef9b8500c605ad8e.json",
+					"jsonFile" : "target-PadDisplay-MinSizeRel-670b25ec421ac49dbe34.json",
 					"name" : "PadDisplay",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplayCamera::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplayCamera-MinSizeRel-dd2e9f78738ee203ff04.json",
+					"jsonFile" : "target-PadDisplayCamera-MinSizeRel-67c73241ee1dda416cd1.json",
 					"name" : "PadDisplayCamera",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "ViGEmClient::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ViGEmClient-MinSizeRel-9f292269c98daddbb4a7.json",
+					"jsonFile" : "target-ViGEmClient-MinSizeRel-35136610fb1f295db82f.json",
 					"name" : "ViGEmClient",
 					"projectIndex" : 0
 				},
@@ -287,28 +287,28 @@
 				{
 					"directoryIndex" : 0,
 					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ALL_BUILD-RelWithDebInfo-d64002898f933c051602.json",
+					"jsonFile" : "target-ALL_BUILD-RelWithDebInfo-cbab4dd1a77ba14b9395.json",
 					"name" : "ALL_BUILD",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplay::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplay-RelWithDebInfo-f9197cf21d770ac4a8f6.json",
+					"jsonFile" : "target-PadDisplay-RelWithDebInfo-911bb078577048b16022.json",
 					"name" : "PadDisplay",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "PadDisplayCamera::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-PadDisplayCamera-RelWithDebInfo-0de758593f480c6886d2.json",
+					"jsonFile" : "target-PadDisplayCamera-RelWithDebInfo-f239883933539058844d.json",
 					"name" : "PadDisplayCamera",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "ViGEmClient::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-ViGEmClient-RelWithDebInfo-c55d3770d287b2cebeae.json",
+					"jsonFile" : "target-ViGEmClient-RelWithDebInfo-ed9ded0ff4e2e48507b4.json",
 					"name" : "ViGEmClient",
 					"projectIndex" : 0
 				},

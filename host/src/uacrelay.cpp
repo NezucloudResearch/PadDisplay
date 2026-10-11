@@ -26,6 +26,10 @@ std::wstring UacLogPath() {
     return dir + L"\\uac-relay.log";
 }
 
+// What WindowImage returns for a process the caller may not open (a System process such as consent.exe
+// is closed even to an elevated administrator).
+const wchar_t* const kOpenDenied = L"<open-denied>";
+
 // The executable basename of [win]'s process ("<...>" markers if it cannot be read). Logged on an
 // ignored command so a window that is not consent.exe (a differently named secure UI) can be spotted.
 std::wstring WindowImage(HWND win) {
@@ -34,7 +38,7 @@ std::wstring WindowImage(HWND win) {
     GetWindowThreadProcessId(win, &pid);
     if (!pid) return L"<no-pid>";
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc) return L"<open-denied>"; // our System token should open consent.exe; if not, that is the clue
+    if (!proc) return kOpenDenied; // the System helper can open consent.exe; the elevated host cannot
     wchar_t path[MAX_PATH] = {};
     DWORD n = MAX_PATH;
     bool ok = QueryFullProcessImageNameW(proc, 0, path, &n) != 0;
@@ -136,7 +140,16 @@ PSECURITY_DESCRIPTOR MakePipeSd() {
 // ================= main (elevated) side ==========================================================
 
 // Click gate (hot path): one window hit-test + a single process-name read on the window under the tap.
-bool WindowAtPointIsConsent(int x, int y) { return ConsentRootAt(x, y) != nullptr; }
+// consent.exe runs as System, and OpenProcess on it is denied to the elevated host (an administrator
+// token, not System), so a window whose process cannot be opened counts as "maybe the prompt" and is
+// forwarded. The System injector then decides by process (ConsentRootAt) and drops anything else, so
+// this only costs one ignored pipe message for a tap on some other protected window.
+bool WindowAtPointIsConsent(int x, int y, std::wstring* image) {
+    HWND root = GetAncestor(WindowFromPoint(POINT{x, y}), GA_ROOT);
+    const std::wstring name = WindowImage(root);
+    if (image) *image = name;
+    return root && (_wcsicmp(name.c_str(), L"consent.exe") == 0 || name == kOpenDenied);
+}
 
 // Key gate (hot path, used for the few allowed keys incl. auto-repeat): a cheap top-level class lookup,
 // no per-window process reads. The class can differ between Windows builds, so keys may not reach the
@@ -205,7 +218,15 @@ UacClickClient::~UacClickClient() {
 // a process-name read; nothing is forwarded for ordinary input. Enqueue is the only thing passed to the
 // worker; the slow task/pipe work is all on the worker. Tiny bound, drop oldest (human-paced clicks).
 void UacClickClient::Click(int x, int y) {
-    if (!WindowAtPointIsConsent(x, y)) return;
+    std::wstring img;
+    if (!WindowAtPointIsConsent(x, y, &img)) {
+        // Diagnostic: say why a tap was not forwarded, naming the window actually under it. Rate-limited
+        // so a stream of normal taps cannot flood the log or cost the input thread.
+        static ULONGLONG lastLog = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastLog > 500) { lastLog = now; LOGI("uac-relay: tap at %d,%d not forwarded - window there is %ls", x, y, img.c_str()); }
+        return;
+    }
     {
         std::lock_guard lock(mutex_);
         if (queue_.size() >= 32) queue_.pop_front();

@@ -52,9 +52,11 @@ constexpr wchar_t kUacPipeName[] = L"\\\\.\\pipe\\PadDisplayUacClick";
 bool EnsureUacRelayTask(std::wstring& message);
 void RemoveUacRelayTask(); // for uninstall; whoever registered it
 
-// Consent-prompt tests used by the client gate (and the injector). The elevated host can read the
-// consent process; from a normal-rights process these return false. Cheap enough for a tap/key DOWN.
-bool WindowAtPointIsConsent(int x, int y); // the top-level window under the screen point is consent.exe
+// Consent-prompt tests used by the client gate. The elevated host cannot open the System-owned consent
+// process, so a window whose process cannot be opened also passes; the injector re-checks by process.
+// Cheap enough for a tap/key DOWN.
+// [image], when given, is set to the process basename of the window under the point, for diagnostics.
+bool WindowAtPointIsConsent(int x, int y, std::wstring* image = nullptr); // window under the point may be the consent prompt
 bool ConsentPromptOpen();                  // some top-level consent.exe window exists right now
 
 // Client the session uses while a UAC prompt is up. Click()/Key() are called from the input thread on a

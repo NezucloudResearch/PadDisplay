@@ -67,6 +67,9 @@
     <ClCompile Include="C:\Users\Nezucloud\Projects\PadDisplay\host\src\vcam.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="C:\Users\Nezucloud\Projects\PadDisplay\host\src\uacrelay.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C:\Users\Nezucloud\Projects\PadDisplay\host\CMakeLists.txt" />

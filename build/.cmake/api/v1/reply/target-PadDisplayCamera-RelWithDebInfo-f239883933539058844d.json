@@ -2,13 +2,13 @@
 	"artifacts" : 
 	[
 		{
-			"path" : "Release/PadDisplayCamera.dll"
+			"path" : "RelWithDebInfo/PadDisplayCamera.dll"
 		},
 		{
-			"path" : "Release/PadDisplayCamera.lib"
+			"path" : "RelWithDebInfo/PadDisplayCamera.lib"
 		},
 		{
-			"path" : "Release/PadDisplayCamera.pdb"
+			"path" : "RelWithDebInfo/PadDisplayCamera.pdb"
 		}
 	],
 	"backtrace" : 1,
@@ -33,25 +33,25 @@
 			{
 				"command" : 0,
 				"file" : 0,
-				"line" : 60,
+				"line" : 61,
 				"parent" : 0
 			},
 			{
 				"command" : 1,
 				"file" : 0,
-				"line" : 65,
+				"line" : 66,
 				"parent" : 0
 			},
 			{
 				"command" : 2,
 				"file" : 0,
-				"line" : 62,
+				"line" : 63,
 				"parent" : 0
 			},
 			{
 				"command" : 3,
 				"file" : 0,
-				"line" : 61,
+				"line" : 62,
 				"parent" : 0
 			}
 		]
@@ -62,7 +62,7 @@
 			"compileCommandFragments" : 
 			[
 				{
-					"fragment" : "/DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MT"
+					"fragment" : "/DWIN32 /D_WINDOWS /EHsc /Zi /O2 /Ob1 /DNDEBUG -std:c++20 -MT"
 				},
 				{
 					"backtrace" : 2,
@@ -145,7 +145,7 @@
 		"commandFragments" : 
 		[
 			{
-				"fragment" : "/machine:X86 /INCREMENTAL:NO",
+				"fragment" : "/machine:X86 /debug /INCREMENTAL",
 				"role" : "flags"
 			},
 			{
