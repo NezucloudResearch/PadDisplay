@@ -16,24 +16,27 @@
 namespace pd {
 namespace {
 
-// The consent prompt is drawn by consent.exe. Inject only when it is the foreground window.
-bool ForegroundIsConsent() {
+// The executable basename of the foreground window's process ("?" if it cannot be read). Logged on an
+// ignored command so a window that is not consent.exe (a differently named secure UI) can be spotted.
+std::wstring ForegroundImage() {
     HWND fg = GetForegroundWindow();
-    if (!fg) return false;
+    if (!fg) return L"<none>";
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
-    if (!pid) return false;
+    if (!pid) return L"<no-pid>";
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc) return false;
+    if (!proc) return L"<open-denied>"; // our System token should open consent.exe; if not, that is the clue
     wchar_t path[MAX_PATH] = {};
     DWORD n = MAX_PATH;
     bool ok = QueryFullProcessImageNameW(proc, 0, path, &n) != 0;
     CloseHandle(proc);
-    if (!ok) return false;
+    if (!ok) return L"<query-failed>";
     const wchar_t* slash = wcsrchr(path, L'\\');
-    const wchar_t* name = slash ? slash + 1 : path;
-    return _wcsicmp(name, L"consent.exe") == 0;
+    return slash ? slash + 1 : path;
 }
+
+// The consent prompt is drawn by consent.exe. Inject only when it is the foreground window.
+bool ForegroundIsConsent() { return _wcsicmp(ForegroundImage().c_str(), L"consent.exe") == 0; }
 
 // Only these keys are forwarded to a UAC prompt. Anything else is dropped, so the channel cannot be
 // used to type arbitrary input as System.
@@ -120,7 +123,9 @@ bool EnsureUacRelayTask(std::wstring& message) {
         L"    <Priority>4</Priority>\r\n"
         L"  </Settings>\r\n"
         L"  <Actions Context=\"System\"><Exec>\r\n"
-        L"    <Command>\"" + std::wstring(exe) + L"\"</Command>\r\n"
+        // The Command element is the bare executable path - Task Scheduler must not see surrounding
+        // quotes, or it looks for a file whose name literally contains them and the task fails to start.
+        L"    <Command>" + std::wstring(exe) + L"</Command>\r\n"
         L"    <Arguments>--uac-relay</Arguments>\r\n"
         L"  </Exec></Actions>\r\n"
         L"</Task>\r\n";
@@ -178,6 +183,7 @@ void UacClickClient::Worker() {
             f = queue_.front();
             queue_.pop_front();
         }
+        LOGI("uac-relay: forwarding %s to the injector", f.cmd == uint32_t(UacCmd::Click) ? "a click" : "a key");
         if (!Send(f) && !warned_) {
             warned_ = true;
             if (notice_) notice_("Could not reach the PC helper that clicks UAC prompts. Answer this prompt on the PC. "
@@ -290,14 +296,17 @@ int RunUacInjector() {
             UacFrame f{};
             DWORD got = 0;
             if (!ReadFile(pipe, &f, sizeof(f), &got, nullptr) || got != sizeof(f)) break;
-            if (!ForegroundIsConsent()) { // the authoritative check: never inject into anything else
-                LOGI("uac-inject: ignored a command - the UAC prompt is not in front");
+            std::wstring fg = ForegroundImage(); // read once: for the check and the log
+            if (_wcsicmp(fg.c_str(), L"consent.exe") != 0) { // authoritative: never inject into anything else
+                LOGI("uac-inject: ignored a command - foreground is %ls, not the UAC prompt", fg.c_str());
                 continue;
             }
             if (f.cmd == uint32_t(UacCmd::Click)) {
                 InjectClick(f.a, f.b);
+                LOGI("uac-inject: clicked the UAC prompt at %d,%d", f.a, f.b);
             } else if (f.cmd == uint32_t(UacCmd::Key) && f.a >= 0 && f.a <= 0xFFFF && KeyAllowed(WORD(f.a))) {
                 InjectKey(WORD(f.a));
+                LOGI("uac-inject: sent key 0x%02x to the UAC prompt", unsigned(f.a));
             }
         }
         DisconnectNamedPipe(pipe);
