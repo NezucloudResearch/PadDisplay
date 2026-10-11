@@ -89,6 +89,7 @@ USB = adb reverse tcp:27183 (automatic) · Wi-Fi = UDP discovery on 27184, encry
 - **Extra screen or only screen:** in the tablet app, *Display → Use this tablet as the PC's only screen*.
   - Off: the tablet is an extra monitor next to the PC's own.
   - On: the PC's own screens are switched off while the tablet is connected, and everything moves to the tablet. They come back, arranged as they were, when it disconnects, when PadDisplay exits, and after a restart. A monitor that was dark for a while needs a second or two to wake up.
+- **Switching apps on the tablet:** PadDisplay stays connected while another app is in front or the tablet's screen is off (*Display → Stay connected in the background*, on by default). PC audio, the microphone and the camera keep running, the PC keeps the virtual monitor, and the picture is back as soon as you return. A notification shows meanwhile: tap it to go back, or tap *Disconnect*. While nothing is shown the tablet still receives the picture and throws it away, so disconnect when you are done to save battery. Turn the switch off to disconnect whenever you leave PadDisplay, as before.
 - **Gaming mode:** in the tablet app, *Display → Gaming mode*. Turn it on if the picture stutters while a game uses the whole GPU. With little free video memory it can freeze the NVIDIA encoder, so it's off by default.
 - **Exit** from the tray removes the virtual monitor, leaving only your real screens.
 
@@ -151,7 +152,7 @@ Diagnostics:
 - If PadDisplay is killed while the tablet is the PC's only screen, the PC's own screens stay dark until you start PadDisplay again or restart Windows.
 - A PadDisplay started with administrator rights can't be closed or scripted by a normal program (`WM_CLOSE`, `taskkill`): use its tray menu.
 - **Encryption has limits:** over Wi-Fi the stream is TLS-encrypted, but USB and tablet apps from before TLS are plain, and the very first connection from a tablet trusts the PC it finds. See [SECURITY.md](SECURITY.md).
-- On HarmonyOS, exclude PadDisplay from battery optimisation for long Wi-Fi sessions.
+- On HarmonyOS, exclude PadDisplay from battery optimisation for long Wi-Fi sessions, and to stay connected in the background (some ROMs close background apps even with a notification showing).
 - **Audio delay:**
   - Measured parts: about 10 ms of Windows capture period, 1–5 ms on the network, and a tablet jitter buffer that targets 30 ms. The target grows up to 80 ms by itself on a jittery Wi-Fi link.
   - The tablet's own output delay adds to that, and the total wasn't measured end to end.

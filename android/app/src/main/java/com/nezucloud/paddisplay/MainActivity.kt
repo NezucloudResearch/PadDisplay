@@ -8,6 +8,7 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
@@ -33,6 +34,7 @@ class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private var pendingHost: String? = null
     private var pendingPort = Protocol.TCP_PORT
+    private var pendingPin = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -136,6 +138,9 @@ class MainActivity : Activity() {
         ui.addRow(display, toggle("Gaming mode",
             "The stream gets GPU time ahead of the game. Turn it on if the picture stutters while a game uses the whole GPU. With little free video memory it can freeze the NVIDIA encoder.",
             "gamingMode", false))
+        ui.addRow(display, toggle("Stay connected in the background",
+            "Switching to another app, or turning the screen off, keeps the connection: PC audio, the microphone and the camera go on, and the picture is back the moment you return. A notification shows meanwhile, with Disconnect. Off = leaving PadDisplay disconnects.",
+            "background", true))
         val rates = DisplayModes.rates(this)
         ui.addRow(display, labelled("Refresh rate", choiceList("refreshRate", 0,
             listOf(0 to "Highest (${rates.last()} Hz)") + rates.map { it to "$it Hz" }),
@@ -225,6 +230,15 @@ class MainActivity : Activity() {
     private fun launch(host: String, port: Int, pin: Int) {
         pendingHost = host
         pendingPort = port
+        pendingPin = pin
+        // Asked once, before the first session that would show it. Without it the session still stays connected in the
+        // background, only its notification (and its Disconnect button) is hidden.
+        if (Build.VERSION.SDK_INT >= 33 && prefs.getBoolean("background", true) && !prefs.getBoolean("askedNotifications", false) &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            prefs.edit().putBoolean("askedNotifications", true).apply()
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATIONS_REQUEST)
+            return
+        }
         showStatus("")
         startActivityForResult(Intent(this, DisplayActivity::class.java)
             .putExtra(DisplayActivity.EXTRA_HOST, host)
@@ -284,6 +298,10 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
         })
 
+    private companion object {
+        const val NOTIFICATIONS_REQUEST = 200 // the switches' requests count up from 100
+    }
+
     // A switch for the microphone or camera: turning it on asks Android for the permission first, and it only stays on if the
     // user allows it. The permission request is the system's own dialog, so the user always sees what is being allowed.
     private val permissionSwitches = HashMap<Int, Pair<Switch, String>>()
@@ -309,6 +327,10 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == NOTIFICATIONS_REQUEST) {
+            pendingHost?.let { launch(it, pendingPort, pendingPin) } // connects whatever the answer was
+            return
+        }
         val (switch, key) = permissionSwitches[requestCode] ?: return
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         prefs.edit().putBoolean(key, granted).apply()
