@@ -10,11 +10,32 @@
 #include <algorithm>
 #include <chrono>
 #include <cwchar>
+#include <optional>
 
 namespace pd {
 
-Session::Session(SOCKET sock, const ClientHello& hello, bool usb, const Settings& settings, StatusFn status)
-    : sock_(sock), hello_(hello), usb_(usb), settings_(settings), status_(std::move(status)) {}
+Session::Session(Conn conn, const ClientHello& hello, bool usb, const Settings& settings, StatusFn status)
+    : conn_(std::move(conn)), hello_(hello), usb_(usb), settings_(settings), status_(std::move(status)) {}
+
+WaitingPing::WaitingPing(Conn& conn, std::mutex& sendMutex) {
+    thread_ = std::thread([this, &conn, &sendMutex] {
+        std::unique_lock lock(mutex_);
+        while (!done_.wait_for(lock, std::chrono::milliseconds(500), [this] { return stop_; })) {
+            const uint8_t ping[16] = {}; // host time 0: the answer says nothing about the round trip (see Msg::Pong)
+            std::lock_guard send(sendMutex);
+            if (!SendMsg(conn, Msg::Ping, ping, sizeof(ping))) return; // the tablet left; the session notices by itself
+        }
+    });
+}
+
+WaitingPing::~WaitingPing() {
+    {
+        std::lock_guard lock(mutex_);
+        stop_ = true;
+    }
+    done_.notify_one();
+    thread_.join();
+}
 
 Session::~Session() {
     Stop();
@@ -23,15 +44,15 @@ Session::~Session() {
     if (layoutThread_.joinable()) layoutThread_.join();
     gamepads_.reset(); // its rumble threads send on the socket
     if (qos_) {
-        if (qosFlow_) QOSRemoveSocketFromFlow(qos_, sock_, qosFlow_, 0);
+        if (qosFlow_) QOSRemoveSocketFromFlow(qos_, conn_.s, qosFlow_, 0);
         QOSCloseHandle(qos_);
     }
-    if (sock_ != INVALID_SOCKET) closesocket(sock_);
+    if (conn_.s != INVALID_SOCKET) closesocket(conn_.s);
 }
 
 void Session::Stop() {
     stop_ = true;
-    if (sock_ != INVALID_SOCKET) shutdown(sock_, SD_BOTH); // unblocks send/recv in the session threads
+    if (conn_.s != INVALID_SOCKET) shutdown(conn_.s, SD_BOTH); // unblocks send/recv in the session threads
 }
 
 bool Session::Send(Msg type, const void* payload, uint32_t len) {
@@ -41,9 +62,9 @@ bool Session::Send(Msg type, const void* payload, uint32_t len) {
         if (type == Msg::Frame && len > 9) fwrite(p + 9, 1, len - 9, dump_);
         return true;
     }
-    if (sock_ == INVALID_SOCKET) return false;
+    if (conn_.s == INVALID_SOCKET) return false;
     std::lock_guard lock(sendMutex_);
-    return SendMsg(sock_, type, payload, len);
+    return SendMsg(conn_, type, payload, len);
 }
 
 void Session::SendNotice(const char* text) {
@@ -67,6 +88,8 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     lastRecvUs_ = startUs_;
     deadlineUs_ = dumpSeconds > 0 ? startUs_ + uint64_t(dumpSeconds) * 1000000 : 0;
     CancelScreenRestore(); // this session arranges the screens now; an earlier one's retry must not undo that
+    std::optional<WaitingPing> waiting; // until the receive thread and the stream take over
+    if (conn_.s != INVALID_SOCKET) waiting.emplace(conn_, sendMutex_);
 
     // Auto: H.264 over USB (bandwidth to spare, fastest encode), HEVC over Wi-Fi (better quality per bit).
     bool wantHevc = settings_.codec == L"hevc" || (settings_.codec == L"auto" && !usb_);
@@ -75,13 +98,15 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     maxBitrateKbps_ = (usb_ ? settings_.usbBitrateMbps : settings_.wifiBitrateMbps) * 1000;
     // Wi-Fi capacity is unknown: start at 60% of the cap and let adaptation ramp up.
     bitrateKbps_ = usb_ || !settings_.adaptive ? maxBitrateKbps_ : std::max(settings_.minBitrateMbps * 1000, maxBitrateKbps_ * 6 / 10);
-    flowControl_ = sock_ != INVALID_SOCKET && hello_.version >= 2;
+    flowControl_ = conn_.s != INVALID_SOCKET && hello_.version >= 2;
     // The tablet asks for its panel refresh rate; the virtual monitor switches to the closest mode.
     fps_ = std::clamp(std::min(settings_.maxFps, hello_.maxFps ? int(hello_.maxFps) : 60), 10, 240);
 
     VirtualDisplay vd;
+    bool switchedOn = false;
     if (!FindVirtualDisplay(settings_.displayOverride, vd) && settings_.displayOverride.empty() && QueryVdd() == VddState::Disabled &&
         SetVirtualMonitorEnabled(true, 5000)) {
+        switchedOn = true;
         for (int i = 0; i < 30 && !FindVirtualDisplay(L"", vd); ++i) Sleep(100); // switched off on exit: bring it back
     }
     if (gdiName_.empty() && vd.gdiName.empty()) {
@@ -93,6 +118,10 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         return;
     }
     gdiName_ = vd.gdiName;
+    // With the virtual monitor off the desktop, the real screens are exactly as the user arranged them: remember that
+    // (never while it is attached: Windows shifts things then). Switching it on above has done so already, and the
+    // screens may have moved since.
+    if (!switchedOn && settings_.displayOverride.empty() && !vd.attached) RememberRealScreens();
     DisplayMode want{hello_.screenW ? hello_.screenW : 1920, hello_.screenH ? hello_.screenH : 1080, fps_};
 
     // Add the tablet's exact resolution / refresh rate to the driver if it is missing (no admin needed).
@@ -103,7 +132,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         uint64_t waitStart = NowUs();
         for (int i = 0; i < 80; ++i) {
             Sleep(100);
-            if (i % 5 == 0 && sock_ != INVALID_SOCKET) {
+            if (i % 5 == 0 && conn_.s != INVALID_SOCKET) {
                 uint8_t ping[16] = {};
                 wr64(ping, NowUs());
                 if (!Send(Msg::Ping, ping, sizeof(ping))) return;
@@ -116,10 +145,6 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         LOGI("session: driver reloaded with %dx%d@%d after %llu ms", want.width, want.height, want.hz, (NowUs() - waitStart) / 1000);
         gdiName_ = vd.gdiName;
     }
-    // With the virtual monitor off the desktop, the real screens are exactly as the user arranged
-    // them: record that as the home layout (never while it is attached - Windows shifts things then).
-    VirtualPlacement attachedNow;
-    if (settings_.displayOverride.empty() && !CurrentPlacement(gdiName_, attachedNow)) SaveHomeLayout(SnapshotRealDisplays());
     DisplayMode active{};
     VirtualPlacement saved;
     bool haveSaved = settings_.displayOverride.empty() && LoadVirtualPlacement(want.width, want.height, saved);
@@ -127,7 +152,8 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         SendError(ErrNoDisplay, "Could not attach the virtual display to the desktop.");
         return;
     }
-    onlyScreen_ = (hello_.flags & HelloOnlyScreen) != 0 && sock_ != INVALID_SOCKET && settings_.displayOverride.empty();
+    havePlacement_ = CurrentPlacement(gdiName_, placement_);
+    onlyScreen_ = (hello_.flags & HelloOnlyScreen) != 0 && conn_.s != INVALID_SOCKET && settings_.displayOverride.empty();
     if (onlyScreen_ && !ShowOnlyOn(gdiName_)) {
         onlyScreen_ = false;
         SendNotice("Could not switch the PC's own screens off. The tablet is an extra screen for now. See the PadDisplay log.");
@@ -141,7 +167,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     if (settings_.displayOverride.empty())
         layoutThread_ = std::thread([this] {
             if (!onlyScreen_) {
-                if (RestoreHomeLayout() > 0) layoutChanged_ = true;
+                if (RestoreRealScreens() > 0) layoutChanged_ = true;
                 return;
             }
             for (int i = 0; i < 8 && !stop_; ++i) { // that re-applied layout switches the real screens back on
@@ -156,18 +182,19 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     LOGI("session: %ls %dx%d@%d, codec %s, cap %d kbps (%s)", gdiName_.c_str(), active.width, active.height, active.hz,
          codec_ == CodecHEVC ? "HEVC" : "H.264", maxBitrateKbps_, usb_ ? "USB" : "Wi-Fi");
 
-    if (sock_ != INVALID_SOCKET && !usb_ && settings_.wifiQos) {
+    if (conn_.s != INVALID_SOCKET && !usb_ && settings_.wifiQos) {
         // Mark the stream as audio/video so Wi-Fi (WMM) gives it the video access category. Off by
         // default: on some routers the tagged host->tablet frames were dropped entirely.
         QOS_VERSION ver{1, 0};
         if (!QOSCreateHandle(&ver, &qos_) ||
-            !QOSAddSocketToFlow(qos_, sock_, nullptr, QOSTrafficTypeAudioVideo, QOS_NON_ADAPTIVE_FLOW, reinterpret_cast<PQOS_FLOWID>(&qosFlow_)))
+            !QOSAddSocketToFlow(qos_, conn_.s, nullptr, QOSTrafficTypeAudioVideo, QOS_NON_ADAPTIVE_FLOW, reinterpret_cast<PQOS_FLOWID>(&qosFlow_)))
             LOGI("session: QoS tagging unavailable (%lu)", GetLastError());
     }
-    if (!flowControl_ && sock_ != INVALID_SOCKET)
+    if (!flowControl_ && conn_.s != INVALID_SOCKET)
         LOGI("session: client speaks protocol v%u, no flow control (update the tablet app)", hello_.version);
 
-    if (sock_ != INVALID_SOCKET) {
+    waiting.reset();
+    if (conn_.s != INVALID_SOCKET) {
         input_ = std::make_unique<InputInjector>();
         recvThread_ = std::thread([this] { RecvLoop(); });
         inputThread_ = std::thread([this] { InputLoop(); });
@@ -203,24 +230,35 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     if (layoutThread_.joinable()) layoutThread_.join();
     if (input_) input_->ReleaseAll();
     gamepads_.reset(); // unplugs the virtual controllers
+    const bool ownMonitor = conn_.s != INVALID_SOCKET && settings_.displayOverride.empty();
+    // How the user set the virtual monitor up (they may have moved or re-sized it in Windows' display settings during the
+    // session), for the next connection. Read before the monitor leaves the desktop below.
+    VirtualDisplay current;
+    VirtualPlacement now;
+    bool havePlacement = ownMonitor && FindVirtualDisplay(L"", current) && CurrentPlacement(current.gdiName, now);
+    if (havePlacement) gdiName_ = current.gdiName;
     if (onlyScreen_) {
+        // As the only screen it sits at (0,0), which is not a place the user chose: keep the one it was attached at.
+        havePlacement = havePlacement && havePlacement_;
+        now.x = placement_.x;
+        now.y = placement_.y;
         RestoreSecureDesktop(); // put UAC prompts back on the secure desktop if we moved them off
-        // The PC's own screens come back first, whatever else happens below. If Windows refuses (a UAC
-        // prompt is up), ShowOnAllAgain keeps trying in the background and restores the layout itself.
-        if (ShowOnAllAgain()) RestoreHomeLayout();
+        // The PC's own screens come back first, whatever else happens below: in one step, exactly as they were, when the
+        // virtual monitor is about to be switched off anyway. Otherwise, or if Windows refuses that, back to the setup
+        // Windows stored. If it refuses that too (a UAC prompt is up), ShowOnAllAgain keeps trying in the background.
+        const bool inOneStep = settings_.monitorOnlyWhileConnected && ShowRealScreensOnly();
+        if (!inOneStep && ShowOnAllAgain()) RestoreRealScreens();
     }
-    if (sock_ != INVALID_SOCKET && settings_.displayOverride.empty()) {
-        // Remember how the user set things up (they may have moved or re-sized the virtual monitor
-        // in Windows' display settings during the session) so the next connection restores it.
-        VirtualDisplay current;
-        VirtualPlacement now;
-        if (FindVirtualDisplay(L"", current) && CurrentPlacement(current.gdiName, now)) {
-            SaveVirtualPlacement(hello_.screenW, hello_.screenH, now);
-            gdiName_ = current.gdiName;
-        }
-        if (settings_.detachOnDisconnect) {
-            Detach(gdiName_);
-            RestoreHomeLayout(); // detaching can make Windows shuffle the real screens
+    if (ownMonitor) {
+        if (havePlacement) SaveVirtualPlacement(hello_.screenW, hello_.screenH, now);
+        if (settings_.monitorOnlyWhileConnected) {
+            // Nobody is using it any more: switch the virtual monitor off, so Windows shows only the real screens and the
+            // user's layout is back as they had it (SetVirtualMonitorEnabled restores it). Without the on/off tasks (the
+            // admin setup was never run) the device cannot be switched, so at least take it off the desktop.
+            if (!SetVirtualMonitorEnabled(false, 5000)) {
+                Detach(gdiName_);
+                RestoreRealScreens(); // detaching can make Windows shuffle the real screens
+            }
         }
     }
     LOGI("session: ended");
@@ -229,7 +267,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
 // Keeps the tablet's connection alive (it gives up after a few seconds of silence) and notices when
 // the tablet stopped answering. Also runs while the pipeline cannot be built, e.g. during a UAC prompt.
 bool Session::Heartbeat(uint64_t now) {
-    if (sock_ == INVALID_SOCKET) return true;
+    if (conn_.s == INVALID_SOCKET) return true;
     // Signed: the receive thread may have stamped lastRecvUs_ after `now` was read.
     if (int64_t(now) - int64_t(lastRecvUs_.load()) > 10000000) {
         LOGI("session: client stopped responding");
@@ -432,14 +470,10 @@ void Session::RecvLoop() {
     std::vector<uint8_t> buf;
     Msg type{};
     while (!stop_) {
-        fd_set rs;
-        FD_ZERO(&rs);
-        FD_SET(sock_, &rs);
-        timeval tv{0, 50000};
-        int n = select(0, &rs, nullptr, nullptr, &tv);
+        int n = WaitReadable(conn_, 50000);
         if (n < 0) break;
         if (n > 0) {
-            if (!RecvMsg(sock_, type, buf, kMaxClientPayload)) break;
+            if (!RecvMsg(conn_, type, buf, kMaxClientPayload)) break;
             uint64_t now = NowUs();
             lastRecvUs_ = now;
             const uint8_t* p = buf.data();
@@ -478,7 +512,7 @@ void Session::RecvLoop() {
                 }
                 break;
             case Msg::Pong:
-                if (buf.size() >= 8 && rd64(p) <= now) {
+                if (buf.size() >= 8 && rd64(p) != 0 && rd64(p) <= now) { // 0: the answer to a WaitingPing
                     uint32_t rtt = uint32_t(std::min<uint64_t>(now - rd64(p), UINT32_MAX));
                     lastRttUs_ = rtt;
                     rttSumUs_ += rtt;
@@ -605,7 +639,7 @@ void Session::ReportStatus(uint64_t now) {
              bitrateKbps_ / 1000, lastRttUs_ / 1000.0, lastLatencyUs_ / 1000.0,
              probe_ ? (L"gpu " + std::to_wstring(int(gpuMs * 10) / 10.0).substr(0, 4) + L" ms (copied " +
                        std::to_wstring(int(copiedPct)) + L"%) · ").c_str() : L"", encMs, lastBlockedMs_,
-             sock_ == INVALID_SOCKET ? L"test" : usb_ ? L"USB" : L"Wi-Fi");
+             conn_.s == INVALID_SOCKET ? L"test" : usb_ ? L"USB" : L"Wi-Fi");
     if (status_) status_(s);
     if (++statusCount_ % 10 == 0 || !status_) LOGI("stats: %s", Narrow(s).c_str());
     framesThisSecond_ = 0;
@@ -650,6 +684,10 @@ std::vector<uint8_t> ExtractParameterSets(const std::vector<uint8_t>& au, Codec 
 // ---------------------------------------------------------------------------------------------
 
 bool Server::Start() {
+    // Before listening: it reads (or makes) the key file, which no connection thread should ever wait for.
+    tls_ = TlsIdentity::LoadOrCreate();
+    if (tls_) LOGI("server: TLS ready, fingerprint %s", tls_->Fingerprint().c_str());
+    else LOGI("server: TLS unavailable - Wi-Fi connections cannot be encrypted");
     listen_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listen_ == INVALID_SOCKET) return false;
     NoInherit(listen_);
@@ -678,6 +716,28 @@ void Server::Stop() {
     std::lock_guard lock(sessionMutex_);
     StopSession();
     StopAudio();
+    StopMic();
+    StopCam();
+}
+
+void Server::StopMic() {
+    {
+        std::lock_guard lock(mutex_);
+        if (mic_) mic_->Stop();
+    }
+    if (micThread_.joinable()) micThread_.join();
+    std::lock_guard lock(mutex_);
+    mic_.reset();
+}
+
+void Server::StopCam() {
+    {
+        std::lock_guard lock(mutex_);
+        if (cam_) cam_->Stop();
+    }
+    if (camThread_.joinable()) camThread_.join();
+    std::lock_guard lock(mutex_);
+    cam_.reset();
 }
 
 void Server::StopAudio() {
@@ -693,6 +753,9 @@ void Server::StopAudio() {
 void Server::UpdateSettings(const Settings& s) {
     std::lock_guard lock(mutex_);
     settings_ = s;
+    // Unticking "Accept the tablet's microphone" ends a microphone session that is running now, so the driver is not kept busy.
+    // Stop() only flags it and shuts the socket down (the UI thread calls this); the session closes the driver by itself.
+    if (!s.acceptTabletMic && mic_) mic_->Stop();
 }
 
 void Server::AcceptLoop() {
@@ -757,13 +820,13 @@ void Server::StopSession() {
     session_.reset();
 }
 
-bool Server::CheckPin(SOCKET s, const sockaddr_storage& addr, bool usb, uint32_t pin, const Settings& cfg) {
+bool Server::CheckPin(Conn& conn, const sockaddr_storage& addr, bool usb, uint32_t pin, const Settings& cfg) {
     auto reject = [&](ErrorCode code, const char* text) {
         std::vector<uint8_t> e(1 + strlen(text));
         e[0] = code;
         memcpy(e.data() + 1, text, e.size() - 1);
-        SendMsg(s, Msg::Error, e.data(), uint32_t(e.size()));
-        closesocket(s);
+        SendMsg(conn, Msg::Error, e.data(), uint32_t(e.size()));
+        closesocket(conn.s);
         return false;
     };
     if (!usb || cfg.requireUsbPin) {
@@ -799,22 +862,54 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
 
-    Msg type{};
-    std::vector<uint8_t> p;
-    if (!RecvMsg(s, type, p, 1024)) {
+    Settings cfg;
+    {
+        std::lock_guard lock(mutex_);
+        cfg = settings_;
+    }
+    const bool usb = IsLoopback(addr);
+    Conn conn;
+    conn.s = s;
+    auto reject = [&](ErrorCode code, const char* text) {
+        std::vector<uint8_t> e(1 + strlen(text));
+        e[0] = code;
+        memcpy(e.data() + 1, text, e.size() - 1);
+        SendMsg(conn, Msg::Error, e.data(), uint32_t(e.size()));
+        closesocket(s);
+    };
+
+    // A TLS ClientHello starts with 0x16, a plain hello with 0x81 or 0x89: one peeked byte tells them apart,
+    // so tablet apps from before TLS keep working and the message formats did not have to change.
+    char firstByte = 0;
+    if (recv(s, &firstByte, 1, MSG_PEEK) != 1) {
         closesocket(s);
         return;
     }
-    if (type == Msg::AudioHello && p.size() >= 7) {
-        Settings cfg;
-        {
-            std::lock_guard lock(mutex_);
-            cfg = settings_;
+    std::string tlsInfo;
+    if (firstByte == 0x16) {
+        if (!tls_ || !(conn.tls = tls_->Accept(s, &tlsInfo))) {
+            LOGI("server: TLS handshake with %s failed", AddrToString(addr).c_str());
+            closesocket(s);
+            return;
         }
-        bool usb = IsLoopback(addr);
-        if (!CheckPin(s, addr, usb, rd32(&p[2]), cfg)) return;
+    }
+    const std::string link = std::string(usb ? "USB" : "Wi-Fi") + (conn.tls ? ", " + tlsInfo : ", plain");
+
+    Msg type{};
+    std::vector<uint8_t> p;
+    if (!RecvMsg(conn, type, p, 1024)) {
+        closesocket(s);
+        return;
+    }
+    // Answered only after the hello was read: closing a socket with unread data resets it, and the tablet would never see the error.
+    if (!conn.tls && !usb && cfg.requireEncryption) {
+        LOGI("server: refused a plain connection from %s (requireEncryption)", AddrToString(addr).c_str());
+        return reject(ErrEncryptionRequired, "This PC only accepts encrypted connections. Update the PadDisplay app on the tablet.");
+    }
+    if (type == Msg::AudioHello && p.size() >= 7) {
+        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return;
         bool mutePc = (p[6] & AudioMutePc) != 0;
-        LOGI("server: audio connection from %s%s", usb ? "USB" : AddrToString(addr).c_str(), mutePc ? " (mute PC)" : "");
+        LOGI("server: audio connection from %s (%s)%s", usb ? "USB" : AddrToString(addr).c_str(), link.c_str(), mutePc ? " (mute PC)" : "");
         std::lock_guard replace(sessionMutex_);
         if (stopping_) {
             closesocket(s);
@@ -822,9 +917,42 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
         }
         StopAudio(); // newest wins
         std::lock_guard lock(mutex_);
-        audio_ = std::make_unique<AudioSession>(s, mutePc);
+        audio_ = std::make_unique<AudioSession>(std::move(conn), mutePc);
         AudioSession* audio = audio_.get();
         audioThread_ = std::thread([audio] { audio->Run(); });
+        return;
+    }
+    // The tablet's microphone and camera (v4): each on its own connection, so neither can delay the picture or the input.
+    if (type == Msg::MicHello && p.size() >= 7) {
+        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return;
+        LOGI("server: microphone connection from %s (%s)", usb ? "USB" : AddrToString(addr).c_str(), link.c_str());
+        std::lock_guard replace(sessionMutex_);
+        if (stopping_) {
+            closesocket(s);
+            return;
+        }
+        StopMic(); // newest wins
+        std::lock_guard lock(mutex_);
+        mic_ = std::make_unique<MicSession>(std::move(conn), cfg, status_);
+        MicSession* mic = mic_.get();
+        micThread_ = std::thread([mic] { mic->Run(); });
+        return;
+    }
+    if (type == Msg::CamHello && p.size() >= 12) {
+        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return;
+        const uint16_t w = rd16(&p[7]), h = rd16(&p[9]);
+        const uint8_t fps = p[11];
+        LOGI("server: camera connection from %s (%s) %ux%u@%u", usb ? "USB" : AddrToString(addr).c_str(), link.c_str(), w, h, fps);
+        std::lock_guard replace(sessionMutex_);
+        if (stopping_) {
+            closesocket(s);
+            return;
+        }
+        StopCam();
+        std::lock_guard lock(mutex_);
+        cam_ = std::make_unique<CamSession>(std::move(conn), cfg, w, h, fps, status_);
+        CamSession* cam = cam_.get();
+        camThread_ = std::thread([cam] { cam->Run(); });
         return;
     }
     if (type != Msg::ClientHello || p.size() < 16) {
@@ -844,25 +972,12 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
     if (h.version >= 3 && p.size() > 16) h.flags = p[nameAt++];
     memcpy(h.name, p.data() + nameAt, std::min<size_t>(p.size() - nameAt, sizeof(h.name) - 1));
 
-    Settings cfg;
-    {
-        std::lock_guard lock(mutex_);
-        cfg = settings_;
-    }
-    bool usb = IsLoopback(addr);
-    auto reject = [&](ErrorCode code, const char* text) {
-        std::vector<uint8_t> e(1 + strlen(text));
-        e[0] = code;
-        memcpy(e.data() + 1, text, e.size() - 1);
-        SendMsg(s, Msg::Error, e.data(), uint32_t(e.size()));
-        closesocket(s);
-    };
     if (h.version < kMinProtocolVersion || h.version > kProtocolVersion) return reject(ErrVersion, "App and PC versions do not match. Update both.");
-    if (!CheckPin(s, addr, usb, h.pin, cfg)) return;
+    if (!CheckPin(conn, addr, usb, h.pin, cfg)) return;
     DWORD zero = 0;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&zero), sizeof(zero));
     LOGI("server: client '%s' from %s (%s) screen %ux%u@%u dpi %u codecs %u%s%s", h.name, AddrToString(addr).c_str(),
-         usb ? "USB" : "Wi-Fi", h.screenW, h.screenH, h.maxFps, h.dpi, h.codecMask, h.flags & HelloGamingMode ? ", gaming mode" : "",
+         link.c_str(), h.screenW, h.screenH, h.maxFps, h.dpi, h.codecMask, h.flags & HelloGamingMode ? ", gaming mode" : "",
          h.flags & HelloOnlyScreen ? ", only screen" : "");
 
     std::lock_guard replace(sessionMutex_);
@@ -870,9 +985,13 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
         closesocket(s);
         return;
     }
-    StopSession(); // newest tablet wins
+    {
+        std::mutex sendMutex; // nothing else sends on this connection yet
+        WaitingPing waiting(conn, sendMutex);
+        StopSession(); // newest tablet wins
+    }
     std::lock_guard lock(mutex_);
-    session_ = std::make_unique<Session>(s, h, usb, cfg, status_);
+    session_ = std::make_unique<Session>(std::move(conn), h, usb, cfg, status_);
     Session* session = session_.get();
     sessionThread_ = std::thread([this, session] {
         session->Run();

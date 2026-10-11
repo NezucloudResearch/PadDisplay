@@ -7,9 +7,9 @@
 
 namespace pd {
 
-// v2 adds FrameAck (flow control); v3 adds keyboard, relative mouse and game controllers.
-// Older clients are still accepted.
-constexpr uint16_t kProtocolVersion = 3;
+// v2 adds FrameAck (flow control); v3 adds keyboard, relative mouse and game controllers; v4 adds the tablet's
+// microphone and camera as PC devices (their own connections). Older clients are still accepted.
+constexpr uint16_t kProtocolVersion = 4;
 constexpr uint16_t kMinProtocolVersion = 1;
 constexpr uint16_t kTcpPort = 27183;
 constexpr uint16_t kDiscoveryPort = 27184;
@@ -21,12 +21,15 @@ enum class Msg : uint8_t {
     HostHello = 0x01,   // u16 version, u8 codec, u16 width, u16 height, u8 fps, u32 bitrateKbps
     Config = 0x02,      // Annex-B parameter sets (VPS/SPS/PPS)
     Frame = 0x03,       // u64 ptsUs, u8 flags (bit0 keyframe), Annex-B access unit
-    Ping = 0x04,        // u64 hostTimeUs, u32 lastRttUs, u32 bitrateKbps
+    Ping = 0x04,        // u64 hostTimeUs, u32 lastRttUs, u32 bitrateKbps; all 0 while the host prepares the screens (keep-alive)
     Error = 0x05,       // u8 code, utf-8 message
     AudioFormat = 0x06, // audio connection: u32 sampleRate, u8 channels, u8 bitsPerSample
     AudioData = 0x07,   // audio connection: u64 ptsUs, interleaved s16le PCM
     Rumble = 0x08,      // u8 index, u8 largeMotor, u8 smallMotor (0 = off); from a game on the PC (v3)
     Notice = 0x09,      // utf-8 text for the tablet to show, e.g. the controller driver is missing (v3)
+    CamState = 0x0A,    // camera connection: u8 active. 1 = a PC app has the webcam open, so capture; 0 = nobody does, stop (v4)
+    CamKeyframeReq = 0x0B, // camera connection: empty; the host could not decode, send an IDR (v4)
+    MicState = 0x0C,    // microphone connection: u8 active. 1 = a PC app records from the virtual microphone, so capture; 0 = nobody does, stop (v4)
     // client -> host
     ClientHello = 0x81, // u16 version, u16 screenW, u16 screenH, u16 dpi, u8 codecMask,
                         // u8 maxTouch, u32 pin, u16 maxFps, [v3: u8 flags,] utf-8 device name
@@ -43,6 +46,11 @@ enum class Msg : uint8_t {
                         // the wheel act where the cursor is (v3)
     Gamepad = 0x8C,     // u8 index, u8 flags (bit0 connected), u16 buttons, u8 leftTrigger, u8 rightTrigger,
                         // i16 leftX, i16 leftY, i16 rightX, i16 rightY: the XInput layout (v3)
+    MicHello = 0x8D,    // first message of a microphone connection: u16 version, u32 pin, u8 flags (v4)
+    MicData = 0x8E,     // u64 ptsUs, s16le mono 48 kHz samples (about 10 ms); without samples: a keep-alive while the microphone is off (v4)
+    CamHello = 0x8F,    // first message of a camera connection: u16 version, u32 pin, u8 codec (1 = H.264), u16 width, u16 height, u8 fps (v4)
+    CamConfig = 0x90,   // Annex-B SPS/PPS of the camera stream (v4)
+    CamFrame = 0x91,    // u64 ptsUs, u8 flags (bit0 = keyframe), Annex-B access unit (v4)
 };
 
 enum Codec : uint8_t { CodecH264 = 1, CodecHEVC = 2 };
@@ -50,7 +58,7 @@ enum CodecMask : uint8_t { MaskH264 = 1, MaskHEVC = 2 };
 enum AudioFlags : uint8_t { AudioMutePc = 1 };
 // Choices made in the tablet app (v3). OnlyScreen: the PC's own screens are off while connected.
 enum HelloFlags : uint8_t { HelloGamingMode = 1, HelloOnlyScreen = 2 };
-enum ErrorCode : uint8_t { ErrBadPin = 1, ErrVersion = 2, ErrNoDisplay = 3, ErrEncoder = 4, ErrLockedOut = 6 };
+enum ErrorCode : uint8_t { ErrBadPin = 1, ErrVersion = 2, ErrNoDisplay = 3, ErrEncoder = 4, ErrLockedOut = 6, ErrEncryptionRequired = 7 };
 enum TouchKind : uint8_t { TouchDown = 0, TouchMove = 1, TouchUp = 2, TouchCancel = 3 };
 enum PenKind : uint8_t { PenHover = 0, PenDown = 1, PenMove = 2, PenUp = 3, PenLeave = 4 };
 enum PenButtons : uint8_t { PenBarrel = 1, PenEraser = 2 };

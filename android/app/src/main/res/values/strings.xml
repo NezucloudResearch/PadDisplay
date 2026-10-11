@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="shortcut_service_description">Lets PadDisplay send a keyboard\'s system shortcuts (Alt+Tab, the Windows key, Ctrl+Esc and so on) to the PC instead of acting on them on this tablet. It only sees keys while PadDisplay is open and connected, and it never reads the screen.</string>
+</resources>

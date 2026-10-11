@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PadDisplay" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorAccent">@color/pd_accent</item>
+        <item name="android:colorPrimary">@color/pd_accent</item>
+        <item name="android:colorControlActivated">@color/pd_accent</item>
+        <item name="android:windowBackground">@color/pd_bg</item>
+        <item name="android:statusBarColor">@color/pd_bg</item>
+        <item name="android:navigationBarColor">@color/pd_bg</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:textColorPrimary">@color/pd_text</item>
+        <item name="android:textColorSecondary">@color/pd_text2</item>
+        <item name="android:alertDialogTheme">@style/Theme.PadDisplay.Dialog</item>
+    </style>
+
+    <style name="Theme.PadDisplay.Dialog" parent="android:Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">@color/pd_accent</item>
+        <item name="android:colorBackgroundFloating">@color/pd_surface</item>
+        <item name="android:textColorPrimary">@color/pd_text</item>
+        <item name="android:textColorSecondary">@color/pd_text2</item>
+    </style>
+</resources>

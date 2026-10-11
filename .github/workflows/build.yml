@@ -13,16 +13,28 @@ permissions:
 
 jobs:
   host:
+    # After the app: the Windows package and the installer carry PadDisplay.apk.
+    needs: android
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Build host (VS 2022, CMake, Ninja)
+        with:
+          submodules: recursive # host/third_party/padmic (acxmic): the host needs its header
+      - uses: actions/download-artifact@v4
+        with:
+          name: PadDisplay-android
+          path: android/app/build/outputs/apk/release
+      - name: Build host, installer and portable zip (VS 2022, CMake, Ninja, Inno Setup)
         shell: cmd
-        run: host\build.cmd
+        run: host\installer\build-installer.cmd
       - uses: actions/upload-artifact@v4
         with:
           name: PadDisplay-windows
           path: host/dist/PadDisplay/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PadDisplay-windows-installer
+          path: host/dist/PadDisplay-Setup-*.exe
 
   android:
     runs-on: ubuntu-latest

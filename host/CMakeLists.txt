@@ -14,12 +14,20 @@ add_executable(PadDisplay WIN32
     src/encoder_nvenc.cpp
     src/encoder_mf.cpp
     src/net.cpp
+    src/tls.cpp
     src/input.cpp
     src/gamepad.cpp
     src/session.cpp
     src/vdd.cpp
     src/gpu_profile.cpp
     src/audio.cpp
+    src/micsink.cpp
+    src/micuse.cpp
+    src/cablesink.cpp
+    src/micbackend.cpp
+    src/setup.cpp
+    src/camsink.cpp
+    src/vcam.cpp
     src/app.rc
 )
 
@@ -40,9 +48,22 @@ target_compile_definitions(PadDisplay PRIVATE
 target_compile_options(PadDisplay PRIVATE /W4 /permissive- /utf-8 /wd4100 /wd4201)
 target_link_libraries(PadDisplay PRIVATE
     ViGEmClient d3d11 dxgi d3dcompiler ws2_32 iphlpapi shell32 user32 gdi32 advapi32
-    mfplat mfuuid mf mfreadwrite qwave setupapi newdev cfgmgr32 avrt ole32
+    mfplat mfuuid mf mfreadwrite qwave setupapi newdev cfgmgr32 avrt ole32 secur32 crypt32 ncrypt bcrypt wmcodecdspuuid wintrust taskschd oleaut32
     ${CMAKE_SOURCE_DIR}/third_party/nvapi/amd64/nvapi64.lib)
 
 # The virtual monitor driver package ships next to the exe (driver\vdd).
 add_custom_command(TARGET PadDisplay POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/driver $<TARGET_FILE_DIR:PadDisplay>/driver)
+
+# The virtual camera's media source. The Windows 11 Frame Server (a service) loads it; PadDisplay.exe registers it
+# with MFCreateVirtualCamera. No driver: it is an ordinary COM DLL.
+add_library(PadDisplayCamera SHARED camera/camera.cpp camera/camera.def)
+target_include_directories(PadDisplayCamera PRIVATE src)
+target_compile_definitions(PadDisplayCamera PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+    _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A00000B) # NTDDI_WIN10_CO: the headers hide the virtual camera APIs below Windows 11
+target_compile_options(PadDisplayCamera PRIVATE /W4 /permissive- /utf-8 /wd4100)
+add_custom_command(TARGET PadDisplayCamera POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:PadDisplay>/driver/camera
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:PadDisplayCamera> $<TARGET_FILE_DIR:PadDisplay>/driver/camera/)
+add_dependencies(PadDisplay PadDisplayCamera)

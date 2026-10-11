@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include "audio.h"
+#include "camsink.h"
 #include "capture.h"
+#include "display.h"
 #include "encoder.h"
 #include "gamepad.h"
 #include "input.h"
+#include "micsink.h"
 #include "net.h"
 #include "settings.h"
+#include "tls.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -26,11 +30,26 @@ namespace pd {
 
 using StatusFn = std::function<void(const std::wstring&)>;
 
+// Pings the tablet twice a second, from its own thread, while a session thread is busy with slow blocking work that sends
+// nothing: ending the previous session, switching the virtual monitor on. The tablet gives up after 10 s of silence, and
+// together those steps can take that long (a tablet that reconnects right after leaving). It lives for those seconds only.
+class WaitingPing {
+public:
+    WaitingPing(Conn& conn, std::mutex& sendMutex);
+    ~WaitingPing();
+
+private:
+    std::mutex mutex_;
+    std::condition_variable done_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+
 // One connected tablet: captures the virtual display, encodes, streams, and injects its input.
-// With sock == INVALID_SOCKET and a dump file it runs the capture/encode pipeline only (test mode).
+// With conn.s == INVALID_SOCKET and a dump file it runs the capture/encode pipeline only (test mode).
 class Session {
 public:
-    Session(SOCKET sock, const ClientHello& hello, bool usb, const Settings& settings, StatusFn status);
+    Session(Conn conn, const ClientHello& hello, bool usb, const Settings& settings, StatusFn status);
     ~Session();
     void Run(FILE* dump = nullptr, int dumpSeconds = 0);
     void Stop();
@@ -47,7 +66,7 @@ private:
     void AdaptBitrate();
     void ReportStatus(uint64_t now);
 
-    SOCKET sock_;
+    Conn conn_;
     ClientHello hello_;
     bool usb_;
     Settings settings_;
@@ -90,6 +109,8 @@ private:
 
     std::thread layoutThread_;               // puts the real screens back while the stream starts
     bool onlyScreen_ = false;                // the tablet asked to be the PC's only screen: the real ones are off
+    VirtualPlacement placement_;             // where the virtual monitor was attached, before only-screen mode moved it to (0,0)
+    bool havePlacement_ = false;
     std::atomic<bool> layoutChanged_{false}; // it moved one: the capture target must be re-read
 
     std::wstring gdiName_;
@@ -130,14 +151,18 @@ public:
     bool Start();
     void Stop();
     void UpdateSettings(const Settings& s);
+    // SHA-256 of the certificate tablets pin, "AB:CD:..."; empty when TLS is unavailable.
+    std::string TlsFingerprint() const { return tls_ ? tls_->Fingerprint() : std::string(); }
 
 private:
     void AcceptLoop();
     void Handle(SOCKET s, const sockaddr_storage& addr);
     void StopSession();
     void StopAudio();
+    void StopMic();
+    void StopCam();
     // PIN check shared by video and audio connections; sends the error itself. true = allowed.
-    bool CheckPin(SOCKET s, const sockaddr_storage& addr, bool usb, uint32_t pin, const Settings& cfg);
+    bool CheckPin(Conn& conn, const sockaddr_storage& addr, bool usb, uint32_t pin, const Settings& cfg);
 
     // Wrong-PIN rate limiting. Buckets: one per source address, one shared by all network
     // addresses ("*"), and USB ("usb") on its own so Wi-Fi attempts cannot lock out the USB tablet.
@@ -156,11 +181,16 @@ private:
     Settings settings_;
     StatusFn status_;
     SOCKET listen_ = INVALID_SOCKET;
+    std::unique_ptr<TlsIdentity> tls_; // made in Start(), before any connection can arrive; null = no encryption
     std::thread acceptThread_;
     std::unique_ptr<Session> session_;
     std::thread sessionThread_;
     std::unique_ptr<AudioSession> audio_;
     std::thread audioThread_;
+    std::unique_ptr<MicSession> mic_;  // the tablet's microphone, into the PadDisplay Microphone driver (own connection, own thread)
+    std::thread micThread_;
+    std::unique_ptr<CamSession> cam_;  // the tablet's camera, as the PC webcam
+    std::thread camThread_;
     std::atomic<bool> stopping_{false};
 };
 

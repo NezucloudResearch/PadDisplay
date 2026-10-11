@@ -7,7 +7,7 @@ import java.nio.ByteOrder
 
 /** Wire protocol shared with the Windows host (see docs/PROTOCOL.md). Little-endian. */
 object Protocol {
-    const val VERSION = 3 // v2: client acks every frame (host flow control); v3: keyboard, relative mouse, game controllers
+    const val VERSION = 4 // v2: client acks every frame (host flow control); v3: keyboard, relative mouse, game controllers; v4: microphone and camera to the PC
     const val TCP_PORT = 27183
     const val DISCOVERY_PORT = 27184
     const val HEADER_SIZE = 5
@@ -22,6 +22,9 @@ object Protocol {
     const val AUDIO_DATA = 0x07
     const val RUMBLE = 0x08
     const val NOTICE = 0x09
+    const val CAM_STATE = 0x0A         // camera connection: u8 active (a PC app has the webcam open)
+    const val CAM_KEYFRAME_REQ = 0x0B  // camera connection: the host needs an IDR
+    const val MIC_STATE = 0x0C         // microphone connection: u8 active (a PC app records from the virtual microphone)
 
     // client -> host
     const val CLIENT_HELLO = 0x81
@@ -36,6 +39,11 @@ object Protocol {
     const val KEY = 0x8A
     const val MOUSE_REL = 0x8B
     const val GAMEPAD = 0x8C
+    const val MIC_HELLO = 0x8D
+    const val MIC_DATA = 0x8E
+    const val CAM_HELLO = 0x8F
+    const val CAM_CONFIG = 0x90
+    const val CAM_FRAME = 0x91
     const val AUDIO_MUTE_PC = 1
     const val HELLO_GAMING_MODE = 1
     const val HELLO_ONLY_SCREEN = 2
@@ -46,6 +54,7 @@ object Protocol {
     const val MASK_HEVC = 2
 
     const val ERR_BAD_PIN = 1
+    const val ERR_ENCRYPTION_REQUIRED = 7 // sent to a plain connection when the PC's requireEncryption is on; this app is always TLS over Wi-Fi
 
     const val TOUCH_DOWN = 0
     const val TOUCH_MOVE = 1

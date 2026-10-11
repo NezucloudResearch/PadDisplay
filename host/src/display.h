@@ -42,31 +42,38 @@ bool EnsureAttached(const std::wstring& gdiName, DisplayMode want, bool matchRes
 
 void Detach(const std::wstring& gdiName);
 
-// Where the real (non-virtual) displays are. When the virtual monitor appears or disappears,
-// Windows re-applies a stored layout for the new set of monitors, which can switch a real screen
-// off or move it; RestoreRealDisplays puts them back and saves that as the layout for this set.
+// Where the real (non-virtual) displays are.
 struct DisplayPlacement {
     std::wstring gdiName;
     int x = 0, y = 0, width = 0, height = 0, hz = 0;
 };
 std::vector<DisplayPlacement> SnapshotRealDisplays();
-int RestoreRealDisplays(const std::vector<DisplayPlacement>& saved); // returns how many were fixed
 
-// "Home layout": the user's arrangement of real screens. Recorded only while the virtual monitor is
-// not on the desktop (at start-up, before a session attaches it), because Windows shifts real
-// screens when the virtual one is added or removed.
-void SaveHomeLayout(const std::vector<DisplayPlacement>& layout);
-std::vector<DisplayPlacement> LoadHomeLayout();
-// Puts the real screens back to the home layout (waits briefly for Windows to settle first).
-int RestoreHomeLayout();
+// The PC's own screens as the user arranged them. When the virtual monitor appears or disappears, Windows
+// re-applies a layout it stored for the new set of monitors, which can move a real screen or switch it off.
+// So PadDisplay remembers the real screens while the virtual monitor is not on the desktop (right before it
+// switches it on), and puts them back afterwards.
+// - For this run it is Windows' own description of the screens (position, main display, resolution, refresh
+//   rate, rotation), put back with one SetDisplayConfig: exact, and one mode switch instead of one per screen.
+// - For the next start it is home-layout.txt (position and mode per \\.\DISPLAYn). A file can be out of date
+//   (screens re-arranged or re-numbered since), so it is used only to bring back a screen that is off, or when
+//   Windows no longer accepts what this run remembered.
+void RememberRealScreens();
+std::vector<DisplayPlacement> LoadHomeLayout(); // what the file holds; empty = nothing remembered yet
+// Puts the real screens back as remembered and leaves the virtual monitor where it is. It watches for 1.5 s,
+// because Windows applies its own layout a moment after a monitor came or went. Returns how often it had to.
+int RestoreRealScreens();
+// The end of only-screen mode: the real screens on as remembered and the virtual monitor off the desktop, in
+// one step. false = nothing is remembered from this run or Windows refused (then use ShowOnAllAgain).
+bool ShowRealScreensOnly();
 
 // "Only screen" mode: the virtual monitor becomes the PC's only active display, so the real screens
 // go dark. It is applied without saving it in Windows' display database: after a crash or a
 // restart, Windows returns to the stored setup (the real screens) by itself.
 bool ShowOnlyOn(const std::wstring& gdiName);
-// Back to the stored setup. true = the real screens are on (then restore the home layout). false = none
+// Back to the stored setup. true = the real screens are on (then RestoreRealScreens). false = none
 // came back, usually because a security prompt (UAC) is up: it keeps trying in the background and
-// restores the home layout itself once they are on.
+// puts the real screens back itself once they are on.
 bool ShowOnAllAgain();
 // A new session wants the screens its own way: stop that background attempt.
 void CancelScreenRestore();

@@ -6,15 +6,22 @@
 //   PadDisplay.exe --list          print displays/adapters and exit
 //   PadDisplay.exe --install-driver
 //                                  (elevated) install or enable the bundled virtual monitor driver
+//   PadDisplay.exe --install-vdd | --install-vigem | --install-camera | --install-cable | --trust-publishers |
+//                  --install-autostart | --uninstall-setup   [--append-log]
+//                                  (elevated) one step each, for the installer and the uninstaller: see kSetupCommands
 //   PadDisplay.exe --dump out.h265 [--seconds 10] [--codec h264|hevc] [--size 2560x1600]
 //                                  capture+encode the virtual display to a raw stream file (no tablet needed)
+#include "cablesink.h"
 #include "capture.h"
 #include "display.h"
 #include "log.h"
+#include "micbackend.h"
 #include "net.h"
 #include "session.h"
 #include "settings.h"
+#include "setup.h"
 #include "gpu_profile.h"
+#include "vcam.h"
 #include "vdd.h"
 
 #include <windows.h>
@@ -39,10 +46,9 @@ namespace {
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_STATUS = WM_APP + 2;
 constexpr UINT WM_DRIVER_DONE = WM_APP + 3; // wParam = success
+constexpr UINT WM_MIC_SETUP = WM_APP + 4;   // wParam 1 = ask now (the user ticked the option), 0 = the tablet asked: a balloon first
 
-enum MenuIdDriver : UINT { ID_DRIVER = 50, ID_GET_VIGEM, ID_ENABLE_VIGEM };
-
-constexpr wchar_t kVigemDownloadUrl[] = L"https://github.com/nefarius/ViGEmBus/releases/latest";
+enum MenuIdDriver : UINT { ID_DRIVER = 50, ID_GET_VIGEM, ID_ENABLE_VIGEM, ID_SETUP_CAMERA, ID_ACCEPT_MIC, ID_ACCEPT_CAM, ID_SETUP_MIC, ID_REMOVE_MIC, ID_SETUP_CABLE, ID_ABOUT_CABLE };
 
 enum MenuId : UINT {
     ID_EXIT = 100, ID_OPEN_LOG, ID_OPEN_FOLDER, ID_ADAPTIVE, ID_CURSOR, ID_MATCH_RES, ID_DETACH, ID_AUTOSTART, ID_ADMIN, ID_UAC_CLICK,
@@ -59,6 +65,10 @@ HWND g_hwnd = nullptr;
 NOTIFYICONDATAW g_nid{};
 bool g_installing = false;
 bool g_installForGamepad = false; // the admin run was started to switch the game controller driver on
+bool g_installForMic = false;     // ... to install or remove the PadDisplay Microphone driver
+bool g_removingMic = false;
+bool g_installForCable = false;  // ... or VB-CABLE, the microphone where PadDisplay's own driver cannot load
+bool g_balloonAboutMic = false;  // the balloon on screen offers to set up the tablet's microphone
 bool g_balloonAboutGamepad = false;
 bool g_restartAfterInstall = false;
 bool g_monitorRemoved = false;
@@ -76,8 +86,71 @@ void RemoveVirtualMonitor() {
     if (FindVirtualDisplay(L"", vd) && vd.attached) Detach(vd.gdiName);
 }
 
+// The PadDisplay Microphone driver is loaded only while PadDisplay runs with "Accept the tablet's microphone" ticked: the
+// device is enabled then and disabled otherwise (it is a kernel driver that adds a recording device, so it is not left on).
+// Worker threads only: switching waits for a scheduled task.
+void SetStatus(const std::wstring& s);
+std::mutex g_micMutex;
+std::atomic<unsigned> g_micRequest{0}; // a newer request ends an older one that is still waiting for an app to stop recording
+std::atomic<bool> g_micNeedsRepair{false}; // switching the device on failed: the tray offers the repair
+
+// Switching the device off while an app records from it makes Windows' audio engine refuse; the device is then stuck "pending
+// restart" and comes back broken after it (tested). So the driver is switched off once nobody records from it: this waits, and
+// the wait ends when the user ticks the option again or PadDisplay exits. false = gave up (exiting, or a newer request).
+bool WaitForMicRecordersToStop(unsigned request, unsigned maxWaitMs) {
+    const ULONGLONG start = GetTickCount64();
+    bool told = false;
+    int unknown = 0;
+    for (;;) {
+        const int n = MicRecorders();
+        if (n == 0) return true;
+        if (n < 0 && ++unknown > 10) return true; // held by something that is not recording (our own session closing, or a stuck program)
+        if (g_micRequest != request || GetTickCount64() - start >= maxWaitMs) return false;
+        if (n > 0 && !told) {
+            told = true;
+            LOGI("mic driver: an app is recording from the microphone; switching the driver off when it stops");
+        }
+        Sleep(500); // nothing signals "the last recording stopped"; this only runs while the driver waits to be switched off
+    }
+}
+
+// userAction: the user just ticked or unticked the option (not the start-up pass), so a missing microphone may be offered.
+void ApplyMicDriverState(bool userAction = false) {
+    const unsigned request = ++g_micRequest;
+    std::lock_guard lock(g_micMutex);
+    if (g_settings.acceptTabletMic && ChooseMicBackend(g_settings).backend == MicBackend::None) {
+        if (userAction && g_hwnd) PostMessageW(g_hwnd, WM_MIC_SETUP, 1, 0); // ask whether to install VB-CABLE
+        return;
+    }
+    const VddState installed = QueryMic();
+    if (installed == VddState::NotInstalled || installed == VddState::Problem) return; // PadDisplay's driver is not what carries the mic here
+    if (!g_settings.acceptTabletMic && !WaitForMicRecordersToStop(request, INFINITE)) return;
+    if (SetMicDriverEnabled(g_settings.acceptTabletMic, 8000)) {
+        g_micNeedsRepair = false;
+        return;
+    }
+    if (g_settings.acceptTabletMic) { // e.g. a device left half-removed by an earlier restart: only the repair brings it back
+        g_micNeedsRepair = true;
+        SetStatus(L"Error: The microphone driver could not be switched on. In this menu choose \"Repair microphone driver (admin)\".");
+    }
+    else if (MicRestartPending())
+        SetStatus(L"Error: Windows could not switch the microphone driver off. Restart Windows to finish it.");
+}
+
+void DisableMicDriverOnExit() {
+    ++g_micRequest; // ends a wait for a recording app to stop
+    std::lock_guard lock(g_micMutex);
+    if (QueryMic() != VddState::Ready) return;
+    if (MicRecorders() > 0) { // never hold up Exit by waiting; the next start switches it off
+        LOGI("mic driver: left loaded, an app is still recording from it");
+        return;
+    }
+    SetMicDriverEnabled(false, 4000);
+}
+
 void Balloon(const std::wstring& title, const std::wstring& text, DWORD icon = NIIF_INFO) {
     g_balloonAboutGamepad = text.find(L"ViGEmBus") != std::wstring::npos; // decides what a click on it does
+    g_balloonAboutMic = text.find(L"set up the tablet's microphone") != std::wstring::npos;
     NOTIFYICONDATAW n = g_nid;
     n.uFlags = NIF_INFO;
     n.dwInfoFlags = icon;
@@ -94,18 +167,21 @@ std::wstring ExeDir() {
 }
 
 // Runs "PadDisplay.exe --install-driver" elevated (one UAC prompt) on a worker thread.
-void StartDriverInstall(bool forGamepad = false) {
+void StartDriverInstall(bool forGamepad = false, const wchar_t* args = L"--install-driver") {
     if (g_installing) return;
     g_installing = true;
     g_installForGamepad = forGamepad;
-    std::thread([] {
+    g_removingMic = wcscmp(args, L"--remove-mic") == 0;
+    g_installForMic = g_removingMic || wcscmp(args, L"--install-mic") == 0;
+    g_installForCable = wcscmp(args, L"--install-cable") == 0;
+    std::thread([args] {
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         SHELLEXECUTEINFOW sei{sizeof(sei)};
         sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
         sei.lpVerb = L"runas";
         sei.lpFile = exe;
-        sei.lpParameters = L"--install-driver";
+        sei.lpParameters = args;
         sei.nShow = SW_HIDE;
         DWORD code = 1;
         if (ShellExecuteExW(&sei) && sei.hProcess) {
@@ -119,21 +195,25 @@ void StartDriverInstall(bool forGamepad = false) {
     }).detach();
 }
 
-int RunInstallDriver() {
-    std::wstring message;
-    bool ok = InstallVdd(ExeDir() + L"\\driver\\vdd", message);
-    LOGI("install-driver: %s", Narrow(message).c_str());
-    std::wstring gpu;
-    ConfigureNvidiaProfile(g_settings.gpuMaxPerformance, gpu); // not fatal: streaming still works without it
-    std::wstring vigem;
-    SetupVigem(vigem); // not fatal either: only game controllers need it
-    LOGI("install-driver: %s", Narrow(vigem).c_str());
-    return ok ? 0 : 1;
+// Asks before installing VB-CABLE, a third-party driver (UI thread). Nothing is installed without this yes.
+void PromptInstallCable() {
+    if (g_installing) return;
+    const int answer = MessageBoxW(
+        g_hwnd,
+        L"The tablet's microphone needs a virtual microphone on this PC. PadDisplay's own microphone driver cannot be loaded here: "
+        L"Windows loads kernel drivers only if Microsoft signed them.\n\n"
+        L"PadDisplay comes with VB-CABLE instead, a free virtual audio cable by VB-Audio (donationware, vb-cable.com). "
+        L"Afterwards choose \"CABLE Output\" as the microphone in your apps "
+        L"(it also adds a playback device called \"CABLE Input\" that you can ignore).\n\nInstall VB-CABLE now?",
+        L"PadDisplay – the tablet's microphone", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND);
+    if (answer == IDYES) StartDriverInstall(false, L"--install-cable");
 }
 
-// Setup steps that need the one-time admin run: on/off tasks, NVIDIA performance profile.
+// Setup steps that need the one-time admin run: on/off tasks, NVIDIA performance profile, the bundled game controller
+// driver and (Windows 11) the virtual camera.
 bool SetupIncomplete() {
     if (!ToggleTasksExist()) return true;
+    if (QueryVigem() == VddState::NotInstalled || QueryCamera() == CamState::NotInstalled) return true;
     return g_settings.gpuMaxPerformance && QueryNvidiaProfile() == GpuProfileState::NotSet;
 }
 
@@ -170,6 +250,7 @@ HICON MakeIcon() {
 }
 
 bool EnsureGpuPreference(const std::wstring& gdiName);
+bool GpuPreferenceStored();
 
 void SetStatus(const std::wstring& s) {
     {
@@ -249,10 +330,16 @@ std::wstring CurrentUserSid() {
 
 // A Run-key program starts without administrator rights, and an elevated one would need a UAC prompt at
 // every sign-in. A scheduled task that runs with the highest rights starts it elevated, silently.
-// Needs this process to be elevated.
+// Needs this process to be elevated. Refused where a normal program could replace the exe (a portable copy in the user's
+// folders): the task would hand that program administrator rights at the next sign-in. Program Files is safe.
 bool CreateAutostartTask() {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (!OnlyAdminsCanChange(exe)) {
+        LOGI("autostart: no administrator start at sign-in from %ls, because programs without administrator rights can change it. "
+             "Install PadDisplay with its installer (into Program Files) to get it.", exe);
+        return false;
+    }
     std::wstring sid = CurrentUserSid();
     if (sid.empty()) return false;
     std::wstring xml =
@@ -376,21 +463,55 @@ void ShowMenu(HWND hwnd) {
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"PadDisplay " PD_VERSION_W L" by Nezucloud");
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, status.c_str());
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, (L"PIN: " + std::to_wstring(g_settings.pin)).c_str());
+    // The tablet remembers this the first time it connects over Wi-Fi and refuses the PC if it ever changes.
+    std::string fingerprint = g_server ? g_server->TlsFingerprint() : std::string();
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0,
+                fingerprint.empty() ? L"Wi-Fi encryption unavailable (see log)"
+                                    : (L"Wi-Fi encrypted (TLS), fingerprint " + Widen(fingerprint.substr(0, 23)) + L"…").c_str());
     VddState vdd = QueryVdd();
     if (g_installing) {
         AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Installing virtual monitor driver…");
     } else if (vdd == VddState::Ready && g_setupIncomplete == 1) {
         AppendMenuW(m, MF_STRING, ID_DRIVER, L"Finish PadDisplay setup (admin)… (monitor off on exit, full GPU speed)");
+    } else if (vdd == VddState::Disabled && g_settings.monitorOnlyWhileConnected && g_setupIncomplete == 0) {
+        // Off because no tablet is connected: PadDisplay switches it on when one does. Nothing to fix.
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Virtual monitor: off until a tablet connects");
     } else if (vdd != VddState::Ready) {
         AppendMenuW(m, MF_STRING | MF_DEFAULT, ID_DRIVER,
                     vdd == VddState::NotInstalled ? L"Install virtual monitor driver (admin)…"
                     : vdd == VddState::Disabled   ? L"Enable virtual monitor driver (admin)…"
                                                   : L"Repair virtual monitor driver (admin)…");
     }
-    // Game controllers connected to the tablet need ViGEmBus, which is not bundled.
+    // Game controllers connected to the tablet need ViGEmBus, which ships with PadDisplay and is installed by the admin setup.
     VddState vigem = QueryVigem();
-    if (vigem == VddState::NotInstalled) AppendMenuW(m, MF_STRING, ID_GET_VIGEM, L"Get game controller driver (ViGEmBus)…");
-    else if (vigem != VddState::Ready && !g_installing) AppendMenuW(m, MF_STRING, ID_ENABLE_VIGEM, L"Enable game controller driver (admin)…");
+    if (vigem == VddState::NotInstalled && !g_installing) AppendMenuW(m, MF_STRING, ID_GET_VIGEM, L"Install game controller driver (admin)…");
+    else if (vigem != VddState::Ready && vigem != VddState::NotInstalled && !g_installing) AppendMenuW(m, MF_STRING, ID_ENABLE_VIGEM, L"Enable game controller driver (admin)…");
+
+    // The tablet's microphone and camera, as a PC microphone (the PadDisplay Microphone driver) and a PC webcam (Windows 11).
+    CamState cam = QueryCamera();
+    if (cam == CamState::NotInstalled && !g_installing) AppendMenuW(m, MF_STRING, ID_SETUP_CAMERA, L"Set up the tablet's camera as a webcam (admin)…");
+    else if (cam == CamState::Unsupported) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Tablet camera as webcam: needs Windows 11");
+    else if (cam == CamState::Ready)
+        AppendMenuW(m, MF_STRING | (g_settings.acceptTabletCamera ? MF_CHECKED : 0), ID_ACCEPT_CAM, L"Accept the tablet's camera as a webcam");
+    // Kernel driver, so it is installed on request only (it adds a recording device to Windows), and loaded only while the
+    // option below is ticked: ticking it enables the driver, unticking it (and exiting PadDisplay) disables it.
+    // Which virtual microphone carries it: PadDisplay's driver where Windows loads it, otherwise VB-CABLE (see micbackend.h).
+    const MicChoice micChoice = ChooseMicBackend(g_settings);
+    const VddState mic = QueryMic();
+    if (micChoice.backend == MicBackend::Driver && mic == VddState::NotInstalled) {
+        if (!g_installing) AppendMenuW(m, MF_STRING, ID_SETUP_MIC, L"Install microphone driver for the tablet's microphone (admin)…");
+    } else if (micChoice.backend == MicBackend::None) {
+        if (!g_installing) AppendMenuW(m, MF_STRING, ID_SETUP_CABLE, L"Set up the tablet's microphone (installs VB-CABLE, admin)…");
+    } else {
+        AppendMenuW(m, MF_STRING | (g_settings.acceptTabletMic ? MF_CHECKED : 0), ID_ACCEPT_MIC,
+                    micChoice.backend == MicBackend::Driver ? L"Accept the tablet's microphone (loads the microphone driver)"
+                                                            : L"Accept the tablet's microphone (VB-CABLE: apps choose \"CABLE Output\")");
+        if (micChoice.backend == MicBackend::Cable) AppendMenuW(m, MF_STRING, ID_ABOUT_CABLE, L"VB-CABLE is donationware by VB-Audio (vb-cable.com)…");
+    }
+    if (mic != VddState::NotInstalled && !g_installing) {
+        if (mic == VddState::Problem || g_micNeedsRepair) AppendMenuW(m, MF_STRING, ID_SETUP_MIC, L"Repair microphone driver (admin)…");
+        AppendMenuW(m, MF_STRING, ID_REMOVE_MIC, L"Remove microphone driver (admin)…");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 
     auto rateMenu = [](UINT base, int current, std::initializer_list<int> rates) {
@@ -409,7 +530,7 @@ void ShowMenu(HWND hwnd) {
     AppendMenuW(m, MF_STRING | (g_settings.adaptive ? MF_CHECKED : 0), ID_ADAPTIVE, L"Adaptive bitrate");
     AppendMenuW(m, MF_STRING | (g_settings.drawCursor ? MF_CHECKED : 0), ID_CURSOR, L"Show mouse cursor on tablet");
     AppendMenuW(m, MF_STRING | (g_settings.matchClientResolution ? MF_CHECKED : 0), ID_MATCH_RES, L"Match tablet resolution");
-    AppendMenuW(m, MF_STRING | (g_settings.detachOnDisconnect ? MF_CHECKED : 0), ID_DETACH, L"Remove virtual monitor when tablet disconnects");
+    AppendMenuW(m, MF_STRING | (g_settings.monitorOnlyWhileConnected ? MF_CHECKED : 0), ID_DETACH, L"Virtual monitor only while a tablet is connected");
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(changes apply on next connection)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
@@ -439,10 +560,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP) ShowMenu(hwnd);
         else if (LOWORD(lp) == NIN_BALLOONUSERCLICK) {
+            if (g_balloonAboutMic) {
+                PromptInstallCable();
+                return 0;
+            }
             VddState vigem = g_balloonAboutGamepad ? QueryVigem() : VddState::Ready;
             if (QueryVdd() != VddState::Ready) StartDriverInstall();
-            else if (vigem == VddState::NotInstalled) ShellExecuteW(nullptr, L"open", kVigemDownloadUrl, nullptr, nullptr, SW_SHOW);
-            else if (vigem != VddState::Ready) StartDriverInstall(true);
+            else if (vigem != VddState::Ready) StartDriverInstall(true); // installs the bundled one when it is missing
+        }
+        return 0;
+    case WM_MIC_SETUP:
+        if (wp) PromptInstallCable();
+        else {
+            static ULONGLONG last = 0; // the tablet asks on every connection: do not nag
+            if (last == 0 || GetTickCount64() - last > 60000) {
+                last = GetTickCount64();
+                Balloon(L"The tablet's microphone", L"The tablet wants to use its microphone, and this PC has no virtual microphone yet. Click here to set up the tablet's microphone.");
+            }
         }
         return 0;
     case WM_DRIVER_DONE: {
@@ -450,6 +584,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_setupIncomplete = SetupIncomplete() ? 1 : 0;
         VddState s = QueryVdd();
         LOGI("driver install finished: %s, driver %ls", wp ? "ok" : "failed", VddStateText(s));
+        if (g_installForCable) {
+            if (CableInstalled(g_settings.micDevice)) {
+                g_settings.acceptTabletMic = true; // installing it means wanting it
+                ApplySettings();
+                Balloon(L"VB-CABLE ready", L"In your apps choose \"CABLE Output\" as the microphone. VB-CABLE is donationware by VB-Audio: vb-cable.com");
+            } else {
+                Balloon(L"VB-CABLE not ready", L"VB-CABLE was not installed, or Windows needs a restart to finish it. See the log (tray menu → Open log).", NIIF_WARNING);
+            }
+            return 0;
+        }
+        if (g_installForMic) {
+            VddState mic = QueryMic();
+            if (mic == VddState::Ready) g_micNeedsRepair = false;
+            if (g_removingMic) Balloon(L"Microphone driver removed", L"The tablet's microphone is no longer offered to PC apps.");
+            else if (mic == VddState::Ready) {
+                // Installing it means wanting it: the driver is loaded while this option is on.
+                g_settings.acceptTabletMic = true;
+                ApplySettings();
+                Balloon(L"Microphone driver ready", L"Choose \"PadDisplay Virtual Microphone\" as the microphone in your PC apps. Untick \"Accept the tablet's microphone\" in this menu to unload the driver.");
+            }
+            else Balloon(L"Microphone driver not enabled", std::wstring(L"The driver is ") + VddStateText(mic) + L". See the log (tray menu → Open log).", NIIF_WARNING);
+            return 0;
+        }
         if (g_installForGamepad) {
             VddState vigem = QueryVigem();
             if (vigem == VddState::Ready) Balloon(L"Game controller driver ready", L"Controllers connected to the tablet now work on the PC.");
@@ -464,7 +621,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             VirtualDisplay vd;
             if (FindVirtualDisplay(g_settings.displayOverride, vd) && vd.attached && EnsureGpuPreference(vd.gdiName)) {
                 g_restartAfterInstall = true;
-                DestroyWindow(hwnd);
+                DestroyWindow(hwnd); // the new instance switches the monitor off at its start
+            } else if (g_settings.monitorOnlyWhileConnected && g_settings.displayOverride.empty()) {
+                // The install left it on. Off again until a tablet connects (a few seconds: not on this thread).
+                std::thread([] { SetVirtualMonitorEnabled(false, 5000); }).detach();
             }
         } else {
             Balloon(L"Virtual monitor driver not installed",
@@ -505,20 +665,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         else if (id == ID_DRIVER) StartDriverInstall();
-        else if (id == ID_ENABLE_VIGEM) StartDriverInstall(true);
-        else if (id == ID_GET_VIGEM) ShellExecuteW(nullptr, L"open", kVigemDownloadUrl, nullptr, nullptr, SW_SHOW);
+        else if (id == ID_ENABLE_VIGEM || id == ID_GET_VIGEM) StartDriverInstall(true);
+        else if (id == ID_SETUP_CAMERA) StartDriverInstall();
+        else if (id == ID_SETUP_MIC) StartDriverInstall(false, L"--install-mic");
+        else if (id == ID_SETUP_CABLE) PromptInstallCable();
+        else if (id == ID_ABOUT_CABLE) ShellExecuteW(nullptr, L"open", L"https://vb-audio.com/Cable/", nullptr, nullptr, SW_SHOWNORMAL);
+        else if (id == ID_REMOVE_MIC) StartDriverInstall(false, L"--remove-mic");
         else {
-            if (id == ID_ADAPTIVE) g_settings.adaptive = !g_settings.adaptive;
+            if (id == ID_ACCEPT_MIC) g_settings.acceptTabletMic = !g_settings.acceptTabletMic;
+            else if (id == ID_ACCEPT_CAM) g_settings.acceptTabletCamera = !g_settings.acceptTabletCamera;
+            else if (id == ID_ADAPTIVE) g_settings.adaptive = !g_settings.adaptive;
             else if (id == ID_UAC_CLICK) g_settings.uacClickableOnTablet = !g_settings.uacClickableOnTablet;
             else if (id == ID_CURSOR) g_settings.drawCursor = !g_settings.drawCursor;
             else if (id == ID_MATCH_RES) g_settings.matchClientResolution = !g_settings.matchClientResolution;
-            else if (id == ID_DETACH) g_settings.detachOnDisconnect = !g_settings.detachOnDisconnect;
+            else if (id == ID_DETACH) g_settings.monitorOnlyWhileConnected = !g_settings.monitorOnlyWhileConnected;
             else if (id == ID_CODEC_AUTO) g_settings.codec = L"auto";
             else if (id == ID_CODEC_HEVC) g_settings.codec = L"hevc";
             else if (id == ID_CODEC_H264) g_settings.codec = L"h264";
             else if (id > ID_WIFI_RATE && id < ID_WIFI_RATE + 100) g_settings.wifiBitrateMbps = int(id - ID_WIFI_RATE);
             else if (id > ID_USB_RATE && id < ID_USB_RATE + 100) g_settings.usbBitrateMbps = int(id - ID_USB_RATE);
             ApplySettings();
+            if (id == ID_ACCEPT_MIC) std::thread(ApplyMicDriverState, true).detach(); // loads or unloads the driver
         }
         return 0;
     }
@@ -528,6 +695,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp) { // Windows is signing out or shutting down: this process is about to be terminated.
             g_server.reset();
             RemoveVirtualMonitor();
+            DisableMicDriverOnExit();
         }
         return 0;
     case WM_DESTROY:
@@ -563,6 +731,17 @@ bool EnsureGpuPreference(const std::wstring& gdiName) {
     return !same;
 }
 
+// Has the GPU preference for this exe been written before? It only changes if the virtual monitor moves to another GPU (a
+// different "gpu" in vdd_settings.xml), so the monitor does not have to be on at every start just to find out. To have it
+// detected again after such a change, delete this exe's value under HKCU\Software\Microsoft\DirectX\UserGpuPreferences.
+bool GpuPreferenceStored() {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    wchar_t cur[64] = {};
+    DWORD size = sizeof(cur);
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\DirectX\\UserGpuPreferences", exe, RRF_RT_REG_SZ, nullptr, cur, &size) == ERROR_SUCCESS;
+}
+
 bool HasArg(int argc, wchar_t** argv, const wchar_t* name) {
     for (int i = 1; i < argc; ++i)
         if (_wcsicmp(argv[i], name) == 0) return true;
@@ -572,6 +751,157 @@ bool HasArg(int argc, wchar_t** argv, const wchar_t* name) {
 const wchar_t* ArgValue(int argc, wchar_t** argv, const wchar_t* name) {
     for (int i = 1; i + 1 < argc; ++i)
         if (_wcsicmp(argv[i], name) == 0) return argv[i + 1];
+    return nullptr;
+}
+
+// --- setup commands ------------------------------------------------------------------------------
+// The tray (one administrator prompt) and the installer start PadDisplay.exe with one of these flags. Each needs administrator
+// rights, does one thing, writes what happened to install-driver.log and exits with 0 when it worked.
+
+int Done(const char* command, bool ok, const std::wstring& message) {
+    LOGI("%s: %s", command, Narrow(message).c_str());
+    return ok ? 0 : 1;
+}
+
+int RunInstallMonitor() {
+    std::wstring message, gpu;
+    const bool ok = InstallVdd(ExeDir() + L"\\driver\\vdd", message);
+    ConfigureNvidiaProfile(g_settings.gpuMaxPerformance, gpu); // not fatal: streaming still works without it
+    return Done("install-vdd", ok, message);
+}
+
+int RunInstallGamepad() {
+    std::wstring message;
+    if (QueryVigem() == VddState::NotInstalled) {
+        InstallVigemBus(ExeDir() + L"\\driver\\vigem", message);
+        LOGI("install-vigem: %s", Narrow(message).c_str());
+    }
+    const bool ok = SetupVigem(message); // switches the bus on if it is off and registers the task that does so later
+    return Done("install-vigem", ok, message);
+}
+
+int RunInstallCamera() {
+    std::wstring message;
+    const bool ok = InstallCamera(ExeDir() + L"\\driver\\camera", message);
+    return Done("install-camera", ok, message);
+}
+
+int RunRemoveCamera() {
+    std::wstring message;
+    const bool ok = RemoveCamera(message);
+    return Done("remove-camera", ok, message);
+}
+
+// The tray's "Finish PadDisplay setup": everything the tablet needs except a microphone.
+int RunInstallDriver() {
+    const int monitor = RunInstallMonitor();
+    // Not fatal: only game controllers need ViGEmBus, and only the tablet's webcam needs the virtual camera.
+    RunInstallGamepad();
+    if (QueryCamera() == CamState::NotInstalled) RunInstallCamera();
+    return monitor;
+}
+
+int RunInstallMic() {
+    std::wstring message;
+    const bool ok = InstallMicDriver(ExeDir() + L"\\driver\\mic", message);
+    return Done("install-mic", ok, message);
+}
+
+int RunRemoveMic() {
+    std::wstring message;
+    const bool ok = RemoveMicDriver(message);
+    return Done("remove-mic", ok, message);
+}
+
+int RunInstallCable() {
+    std::wstring message;
+    const bool ok = InstallCable(ExeDir() + L"\\driver\\vbcable", message);
+    return Done("install-cable", ok, message);
+}
+
+int RunTrustPublishers() {
+    std::wstring message;
+    const bool ok = TrustDriverPublishers(ExeDir() + L"\\driver", message);
+    return Done("trust-publishers", ok, message);
+}
+
+int RunUntrustPublishers() {
+    std::wstring message;
+    const bool ok = UntrustDriverPublishers(message);
+    return Done("untrust-publishers", ok, message);
+}
+
+// The installer's "start with administrator rights when I sign in": the tray's Run as administrator plus Start with Windows.
+int RunInstallAutostart() {
+    if (!CreateAutostartTask()) return Done("install-autostart", false, L"The sign-in task could not be registered.");
+    g_settings.runAsAdmin = true;
+    g_settings.autostartTask = true;
+    g_settings.Save();
+    SetRunKey(false);
+    return Done("install-autostart", true, L"PadDisplay starts with administrator rights at sign-in, without a prompt.");
+}
+
+int RunRemoveAutostart() {
+    SetAutostart(false);
+    return Done("remove-autostart", !g_settings.autostartTask, g_settings.autostartTask ? L"The sign-in task could not be deleted." : L"PadDisplay no longer starts at sign-in.");
+}
+
+// The uninstaller: takes away what PadDisplay added to this PC. Drivers that were on the PC before PadDisplay stay.
+// A step that fails does not stop the others.
+int RunUninstallSetup() {
+    bool ok = true;
+    std::wstring message;
+    const auto step = [&](const char* what, bool done) {
+        LOGI("uninstall-setup: %s: %s", what, Narrow(message).c_str());
+        message.clear();
+        ok = ok && done;
+    };
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    DeleteAutostartTask();
+    SetRunKey(false);
+    if (g_settings.autostartTask) { // the user may keep the settings: they must not claim a task that is gone
+        g_settings.autostartTask = false;
+        g_settings.Save();
+    }
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\DirectX\\UserGpuPreferences", exe);
+    RestoreSecureDesktop();
+    if (QueryCamera() == CamState::Ready) step("virtual camera", RemoveCamera(message));
+    if (QueryMic() != VddState::NotInstalled) step("microphone driver", RemoveMicDriver(message));
+    if (AddedByPadDisplay(kAddedMonitor)) step("virtual monitor", RemoveVdd(message));
+    if (AddedByPadDisplay(kAddedVigem)) step("game controller driver", RemoveVigem(message));
+    if (AddedByPadDisplay(kAddedCable)) step("VB-CABLE", RemoveCable(ExeDir() + L"\\driver\\vbcable", message));
+    RemoveToggleTasks();
+    DeleteTaskFolder();
+    step("driver publishers", UntrustDriverPublishers(message));
+    if (QueryNvidiaProfile() == GpuProfileState::Set) step("NVIDIA profile", ConfigureNvidiaProfile(false, message));
+    ForgetSetupRecords();
+    return ok ? 0 : 1;
+}
+
+struct SetupCommand {
+    const wchar_t* flag;
+    int (*run)();
+};
+const SetupCommand kSetupCommands[] = {
+    {L"--install-driver", RunInstallDriver},
+    {L"--install-vdd", RunInstallMonitor},
+    {L"--install-vigem", RunInstallGamepad},
+    {L"--install-camera", RunInstallCamera},
+    {L"--remove-camera", RunRemoveCamera},
+    {L"--install-mic", RunInstallMic},
+    {L"--remove-mic", RunRemoveMic},
+    {L"--install-cable", RunInstallCable},
+    {L"--trust-publishers", RunTrustPublishers},
+    {L"--untrust-publishers", RunUntrustPublishers},
+    {L"--install-autostart", RunInstallAutostart},
+    {L"--remove-autostart", RunRemoveAutostart},
+    {L"--uninstall-setup", RunUninstallSetup},
+};
+
+const SetupCommand* FindSetupCommand(int argc, wchar_t** argv) {
+    for (const SetupCommand& command : kSetupCommands)
+        if (HasArg(argc, argv, command.flag)) return &command;
     return nullptr;
 }
 
@@ -595,7 +925,7 @@ int RunDump(const wchar_t* path, int argc, wchar_t** argv) {
         LOGI("cannot open %ls", path);
         return 1;
     }
-    Session session(INVALID_SOCKET, h, true, s, [](const std::wstring& st) { LOGI("%s", Narrow(st).c_str()); });
+    Session session(Conn{}, h, true, s, [](const std::wstring& st) { LOGI("%s", Narrow(st).c_str()); });
     session.Run(f, seconds);
     long size = ftell(f);
     fclose(f);
@@ -612,12 +942,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     const wchar_t* dumpPath = ArgValue(argc, argv, L"--dump");
     bool list = HasArg(argc, argv, L"--list");
-    bool installDriver = HasArg(argc, argv, L"--install-driver");
+    const SetupCommand* setup = FindSetupCommand(argc, argv);
     bool console = HasArg(argc, argv, L"--console") || list || dumpPath;
 
     // Before LogInit, which truncates host.log: a second copy must not wipe the running one's log.
     HANDLE single = nullptr;
-    if (!dumpPath && !list && !installDriver) {
+    if (!dumpPath && !list && !setup) {
         bool running = false;
         single = AcquireSingleInstance(running);
         if (running) {
@@ -626,9 +956,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
     }
 
-    LogInit(AppDataDir() + (installDriver ? L"\\install-driver.log" : dumpPath || list ? L"\\host-cli.log" : L"\\host.log"), console);
+    LogInit(AppDataDir() + (setup ? L"\\install-driver.log" : dumpPath || list ? L"\\host-cli.log" : L"\\host.log"), console,
+            setup && HasArg(argc, argv, L"--append-log"));
     g_settings.Load();
-    if (installDriver) return RunInstallDriver();
+    if (setup) return setup->run();
     if (single && g_settings.runAsAdmin && !IsElevated()) {
         // "Run as administrator" is on: start again with the rights (one UAC prompt, none when the sign-in task did it).
         LOGI("administrator mode is on: restarting with administrator rights");
@@ -658,12 +989,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // A crash while a tablet was the PC's only screen leaves the real screens off: bring them back.
     if (SnapshotRealDisplays().empty() && !LoadHomeLayout().empty()) {
         LOGI("no real screen is on: restoring the stored display setup");
-        if (ShowOnAllAgain()) RestoreHomeLayout();
+        if (ShowOnAllAgain()) RestoreRealScreens();
     }
     RestoreSecureDesktop(); // a crash in only-screen UAC mode could have left the secure desktop disabled
-    if (QueryVdd() != VddState::Ready && LoadHomeLayout().empty()) SaveHomeLayout(SnapshotRealDisplays());
-    // The virtual monitor is switched off while PadDisplay is not running; switch it back on.
-    if (g_settings.displayOverride.empty() && QueryVdd() == VddState::Disabled && SetVirtualMonitorEnabled(true, 5000)) {
+    // No virtual monitor: the screens are as the user has them now. Remembered at every start, because they may have been
+    // re-arranged since the last run, and a layout from back then must never be forced onto them.
+    if (QueryVdd() != VddState::Ready) RememberRealScreens();
+    // The virtual monitor stays off while no tablet is connected (it is switched on for a session and off again after it).
+    // A monitor that is on now was left by a crash, an older version or the instance that handed over to this one: switch it
+    // off, which also puts the screens back as the user had them. The one thing that needs it on is the first start: which
+    // GPU renders it decides this program's GPU preference, which Windows reads at process start (see EnsureGpuPreference).
+    const bool idleOff = g_settings.monitorOnlyWhileConnected && g_settings.displayOverride.empty();
+    if (g_settings.displayOverride.empty() && (!idleOff || !GpuPreferenceStored()) && QueryVdd() == VddState::Disabled && SetVirtualMonitorEnabled(true, 5000)) {
         VirtualDisplay tmp;
         for (int i = 0; i < 30 && !FindVirtualDisplay(L"", tmp); ++i) Sleep(100);
     }
@@ -682,8 +1019,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             return 0;
         }
     }
+    if (idleOff && QueryVdd() == VddState::Ready) {
+        const bool off = SetVirtualMonitorEnabled(false, 5000);
+        LOGI("virtual monitor: switched off until a tablet connects -> %s", off ? "ok" : "not possible (no on/off tasks: run the admin setup)");
+        if (off) RememberRealScreens();
+    }
     VddState vddState = QueryVdd();
-    if (!haveVd) LOGI("warning: no virtual display found (driver %ls)", VddStateText(vddState));
+    if (!haveVd && !(idleOff && vddState == VddState::Disabled)) LOGI("warning: no virtual display found (driver %ls)", VddStateText(vddState));
 
     if (dumpPath) {
         return RunDump(dumpPath, argc, argv);
@@ -718,6 +1060,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     LOGI("PadDisplay %s by Nezucloud started. PIN %u", PD_VERSION_STR, g_settings.pin);
     LOGI("game controller driver (ViGEmBus): %ls", VddStateText(QueryVigem()));
     LOGI("running %s administrator rights", IsElevated() ? "with" : "without");
+    std::thread([] { ApplyMicDriverState(); }).detach();
     std::thread([] {
         // Now elevated: "Start with Windows" can start it elevated without a prompt (a task, not the Run key).
         if (IsElevated() && g_settings.runAsAdmin && RunKeyPresent()) SetAutostart(true);
@@ -756,6 +1099,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         CloseHandle(single);
     }
     if (!g_restartAfterInstall && !g_handedOver) RemoveVirtualMonitor();
+    if (!g_restartAfterInstall && !g_handedOver) DisableMicDriverOnExit(); // not loaded while PadDisplay is not running
     MFShutdown();
     if (g_restartAfterInstall) {
         ReleaseMutex(single);
@@ -769,4 +1113,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
     }
     return 0;
+}
+
+// The tablet wants its microphone and there is no virtual microphone to carry it (called from any thread; see micbackend.h).
+void pd::OnMicSetupNeeded() {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_MIC_SETUP, 0, 0);
 }

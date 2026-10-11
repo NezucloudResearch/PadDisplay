@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\Nezucloud\Projects\PadDisplay\host\third_party\ViGEmClient\src\ViGEmClient.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Nezucloud\Projects\PadDisplay\host\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{14DA03D9-1C45-3707-A5FF-747EE307F2EE}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

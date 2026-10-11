@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "net.h"
 #include "log.h"
+#include "tls.h"
 
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -18,7 +19,7 @@ bool NetStartup() {
     return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
 }
 
-bool SendAll(SOCKET s, const void* data, size_t len) {
+static bool PlainSendAll(SOCKET s, const void* data, size_t len) {
     auto* p = static_cast<const char*>(data);
     while (len > 0) {
         int n = send(s, p, int(std::min<size_t>(len, 1 << 20)), 0);
@@ -29,7 +30,7 @@ bool SendAll(SOCKET s, const void* data, size_t len) {
     return true;
 }
 
-bool RecvAll(SOCKET s, void* data, size_t len) {
+static bool PlainRecvAll(SOCKET s, void* data, size_t len) {
     auto* p = static_cast<char*>(data);
     while (len > 0) {
         int n = recv(s, p, int(len), 0);
@@ -40,11 +41,22 @@ bool RecvAll(SOCKET s, void* data, size_t len) {
     return true;
 }
 
-bool SendMsg(SOCKET s, Msg type, const void* payload, uint32_t len) {
+bool SendAll(Conn& c, const void* data, size_t len) {
+    return c.tls ? c.tls->Send(data, len, nullptr, 0) : PlainSendAll(c.s, data, len);
+}
+
+bool RecvAll(Conn& c, void* data, size_t len) {
+    return c.tls ? c.tls->RecvAll(data, len) : PlainRecvAll(c.s, data, len);
+}
+
+bool SendMsg(Conn& c, Msg type, const void* payload, uint32_t len) {
     uint8_t hdr[kHeaderSize];
     hdr[0] = uint8_t(type);
     wr32(hdr + 1, len);
-    if (len == 0) return SendAll(s, hdr, kHeaderSize);
+    // TLS: Schannel encrypts in place, so header and payload are copied into its record buffer anyway and go out in one send.
+    if (c.tls) return c.tls->Send(hdr, kHeaderSize, payload, len);
+    SOCKET s = c.s;
+    if (len == 0) return PlainSendAll(s, hdr, kHeaderSize);
     WSABUF bufs[2] = {{kHeaderSize, reinterpret_cast<char*>(hdr)},
                       {len, static_cast<char*>(const_cast<void*>(payload))}};
     DWORD sent = 0;
@@ -52,20 +64,40 @@ bool SendMsg(SOCKET s, Msg type, const void* payload, uint32_t len) {
     if (sent == kHeaderSize + len) return true;
     // Partial send: finish the remainder the slow way.
     if (sent < kHeaderSize) {
-        if (!SendAll(s, hdr + sent, kHeaderSize - sent)) return false;
+        if (!PlainSendAll(s, hdr + sent, kHeaderSize - sent)) return false;
         sent = kHeaderSize;
     }
-    return SendAll(s, static_cast<const uint8_t*>(payload) + (sent - kHeaderSize), len - (sent - kHeaderSize));
+    return PlainSendAll(s, static_cast<const uint8_t*>(payload) + (sent - kHeaderSize), len - (sent - kHeaderSize));
 }
 
-bool RecvMsg(SOCKET s, Msg& type, std::vector<uint8_t>& payload, uint32_t maxLen) {
+bool RecvMsg(Conn& c, Msg& type, std::vector<uint8_t>& payload, uint32_t maxLen) {
     uint8_t hdr[kHeaderSize];
-    if (!RecvAll(s, hdr, kHeaderSize)) return false;
+    if (!RecvAll(c, hdr, kHeaderSize)) return false;
     uint32_t len = rd32(hdr + 1);
     if (len > maxLen) return false;
     type = Msg(hdr[0]);
     payload.resize(len);
-    return len == 0 || RecvAll(s, payload.data(), len);
+    return len == 0 || RecvAll(c, payload.data(), len);
+}
+
+void FinishConnection(SOCKET s, DWORD drainMs) {
+    if (s == INVALID_SOCKET) return;
+    shutdown(s, SD_SEND);
+    DWORD timeout = drainMs;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
+    char buf[2048];
+    const ULONGLONG end = GetTickCount64() + drainMs;
+    while (GetTickCount64() < end && recv(s, buf, sizeof(buf), 0) > 0) {
+    }
+}
+
+int WaitReadable(Conn& c, long timeoutUs) {
+    if (c.tls && c.tls->HasBuffered()) return 1;
+    fd_set rs;
+    FD_ZERO(&rs);
+    FD_SET(c.s, &rs);
+    timeval tv{0, timeoutUs};
+    return select(0, &rs, nullptr, nullptr, &tv);
 }
 
 void NoInherit(SOCKET s) { SetHandleInformation(reinterpret_cast<HANDLE>(s), HANDLE_FLAG_INHERIT, 0); }
