@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(PadDisplayHost VERSION 0.3.0 LANGUAGES CXX RC)
+project(PadDisplayHost VERSION 0.4.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,7 @@ add_executable(PadDisplay WIN32
     src/setup.cpp
     src/camsink.cpp
     src/vcam.cpp
+    src/uacrelay.cpp
     src/app.rc
 )
 
@@ -48,7 +49,7 @@ target_compile_definitions(PadDisplay PRIVATE
 target_compile_options(PadDisplay PRIVATE /W4 /permissive- /utf-8 /wd4100 /wd4201)
 target_link_libraries(PadDisplay PRIVATE
     ViGEmClient d3d11 dxgi d3dcompiler ws2_32 iphlpapi shell32 user32 gdi32 advapi32
-    mfplat mfuuid mf mfreadwrite qwave setupapi newdev cfgmgr32 avrt ole32 secur32 crypt32 ncrypt bcrypt wmcodecdspuuid wintrust taskschd oleaut32
+    mfplat mfuuid mf mfreadwrite qwave setupapi newdev cfgmgr32 avrt ole32 secur32 crypt32 ncrypt bcrypt wmcodecdspuuid wintrust taskschd oleaut32 wtsapi32 userenv
     ${CMAKE_SOURCE_DIR}/third_party/nvapi/amd64/nvapi64.lib)
 
 # The virtual monitor driver package ships next to the exe (driver\vdd).

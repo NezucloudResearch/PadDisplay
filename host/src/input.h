@@ -8,16 +8,26 @@
 #include <array>
 #include <bitset>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 
 namespace pd {
 
 class InputInjector {
 public:
-    InputInjector();
+    // [elevated]: this process has administrator rights, so Windows (UIPI) lets its input reach
+    // elevated windows. When it does not, [notice] is called once with a message for the tablet
+    // the first time an injection is blocked, so the user learns why nothing is reaching the app.
+    InputInjector(bool elevated, std::function<void(const char*)> notice);
     ~InputInjector();
 
     void SetTarget(const RECT& desktopRect);
+    // While set, every left-button / touch DOWN and every allowed key DOWN is offered here, with
+    // screen-pixel coordinates for a click or a virtual-key code for a key. The session points this at
+    // the System-level UAC click path (see uacrelay.*), which ignores anything not on a UAC prompt.
+    // Windows does not refuse injection into a UAC prompt, so this cannot key off the inject result.
+    // Null = no forwarding. Set only in only-screen UAC mode.
+    void SetUacForward(std::function<void(bool click, int x, int y, WORD vk)> forward);
     void OnTouch(const uint8_t* p, size_t n);
     void OnPen(const uint8_t* p, size_t n);
     void OnMouse(const uint8_t* p, size_t n);
@@ -40,7 +50,15 @@ private:
     void SendMouse(DWORD flags, POINT pt, DWORD data = 0);
     void SendMouseRel(DWORD flags, LONG dx = 0, LONG dy = 0, DWORD data = 0); // no jump to a position
     void SendKey(uint16_t code, bool down);
+    // UIPI blocks input to a higher-integrity (elevated) window from a normal process; the call then
+    // fails with ERROR_ACCESS_DENIED. [ok] is the SendInput / InjectSyntheticPointerInput result and
+    // [err] the GetLastError captured right after it (before any other call could overwrite it).
+    void NoteInjectResult(bool ok, DWORD err);
 
+    bool elevated_;
+    std::function<void(const char*)> notice_;
+    std::function<void(bool click, int x, int y, WORD vk)> uacForward_; // set only in only-screen UAC mode
+    bool toldElevation_ = false; // the elevation notice was sent; cleared by the next injection that lands
     std::mutex mutex_;
     RECT rect_{0, 0, 1, 1};
     HSYNTHETICPOINTERDEVICE touchDev_ = nullptr;

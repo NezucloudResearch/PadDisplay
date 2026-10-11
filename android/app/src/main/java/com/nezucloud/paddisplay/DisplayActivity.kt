@@ -56,7 +56,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private val pressed = BooleanArray(0x200) // PC scancodes sent as down and not yet up, lifted if focus is lost mid-chord
     private var repeatCode = 0
     private var hostReady = false     // the PC has sent its hello: the connection is live
-    private var decoder: VideoDecoder? = null
+    @Volatile private var decoder: VideoDecoder? = null // null while another app is in front: frames are acked and dropped
     private var connection: Connection? = null
     private var audio: AudioStream? = null
     private var mic: MicStream? = null
@@ -69,6 +69,14 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private var showStats = false
     private var wifiLock: WifiManager.WifiLock? = null
     private var refreshHz = 60
+    private var keepInBackground = true // the session outlives the picture while another app is in front (SessionService)
+    private var serviceStarted = false
+    // What the decoder was started with, to start a new one on the new surface when the picture comes back. The PC sends
+    // its parameter sets once per stream, not with every keyframe. Taken only on hello, parameter sets and surface changes.
+    private val streamLock = Any()
+    private var streamCodec = 0
+    private var streamFps = 0
+    private var streamConfig: ByteArray? = null
 
     @Volatile private var videoW = 0
     @Volatile private var videoH = 0
@@ -93,6 +101,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             if (mode != null) preferredDisplayModeId = mode.modeId
         }
         showStats = prefs.getBoolean("stats", false)
+        keepInBackground = prefs.getBoolean("background", true)
 
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this)
@@ -263,6 +272,14 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     // ---- surface lifecycle drives the connection ------------------------------------------
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        setFrameRate(holder)
+        root.removeCallbacks(statsTick)
+        root.post(statsTick)
+        if (connection != null) {
+            // Back from the background: the session kept running without a picture, so only the decoder is new.
+            attachDecoder(holder.surface)
+            return
+        }
         decoder = VideoDecoder(holder.surface)
         val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
         val port = intent.getIntExtra(EXTRA_PORT, Protocol.TCP_PORT)
@@ -276,13 +293,6 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_H264))) mask = mask or Protocol.MASK_H264
         if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_HEVC))) mask = mask or Protocol.MASK_HEVC
         if (mask == 0) mask = Protocol.MASK_H264
-        if (Build.VERSION.SDK_INT >= 30) {
-            try {
-                holder.surface.setFrameRate(refreshHz.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
-            } catch (e: Exception) {
-                Log.w("PadDisplay", "setFrameRate: $e")
-            }
-        }
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         var flags = 0
         if (prefs.getBoolean("gamingMode", false)) flags = flags or Protocol.HELLO_GAMING_MODE
@@ -298,7 +308,55 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         if (prefs.getBoolean("audio", false)) {
             audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true), trust).also { it.start() }
         }
-        root.post(statsTick)
+        if (keepInBackground) {
+            val granted = { permission: String -> checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED }
+            SessionService.onDisconnect = { finish() }
+            serviceStarted = true
+            SessionService.start(this, host, prefs.getBoolean("micToPc", false) && granted(Manifest.permission.RECORD_AUDIO),
+                prefs.getBoolean("camToPc", false) && granted(Manifest.permission.CAMERA))
+        }
+    }
+
+    private fun setFrameRate(holder: SurfaceHolder) {
+        if (Build.VERSION.SDK_INT < 30) return
+        try {
+            holder.surface.setFrameRate(refreshHz.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        } catch (e: Exception) {
+            Log.w("PadDisplay", "setFrameRate: $e")
+        }
+    }
+
+    /**
+     * A new decoder on the new surface, set up as the last one was. Frames up to the next keyframe cannot be decoded
+     * (the PC never sends one by itself), so one is asked for right away. Runs on the UI thread once per return
+     * from the background; the reader thread keeps acking frames meanwhile and only waits if a hello comes in now.
+     */
+    private fun attachDecoder(surface: Surface) {
+        val d = VideoDecoder(surface)
+        try {
+            synchronized(streamLock) {
+                if (streamCodec != 0) {
+                    d.configure(streamCodec, videoW, videoH, streamFps)
+                    streamConfig?.let { d.queueConfig(it, it.size) }
+                }
+                decoder = d
+            }
+        } catch (e: Exception) {
+            d.release()
+            fail("Decoder error: ${e.message}")
+            return
+        }
+        lastKeyframeReq = 0L
+        requestKeyframe()
+    }
+
+    /** The surface is going away: the codec must let go of it before surfaceDestroyed returns. */
+    private fun detachDecoder() {
+        synchronized(streamLock) {
+            val d = decoder
+            decoder = null // the reader thread now acks and drops frames
+            d?.release()
+        }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
@@ -324,12 +382,28 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        root.removeCallbacks(statsTick)
+        if (keepInBackground && !isFinishing && connection != null) {
+            // Another app is in front, or the screen went off: only the picture stops. Audio, microphone, camera
+            // and the PC's virtual monitor stay as they are.
+            input.releaseMouseButtons()
+            detachDecoder()
+            return
+        }
+        closeSession()
+    }
+
+    private fun closeSession() {
         hostReady = false
         KeyRouter.detach()
         releaseAllKeys()
         wifiLock?.release()
         wifiLock = null
-        root.removeCallbacks(statsTick)
+        if (serviceStarted) {
+            serviceStarted = false
+            SessionService.onDisconnect = null
+            SessionService.stop(this)
+        }
         // The picture's connection first: the PC puts its own screens back when that one ends. Each on its own, because
         // one that throws must not leave the others open: the microphone and the camera would go on sending.
         val closing = listOf<() -> Unit>({ connection?.close() }, { audio?.close() }, { mic?.close() }, { cam?.close() }, { decoder?.release() })
@@ -344,6 +418,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     }
 
     override fun onDestroy() {
+        closeSession() // ended while in the background, where the surface was already gone
         KeyRouter.detach()
         input.release()
         gamepads.release()
@@ -392,6 +467,8 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         val parts = listOfNotNull(if (micOn) "Microphone on" else null, if (camOn) "Camera on" else null)
         mediaBadge.text = "● " + parts.joinToString("  ·  ")
         mediaBadge.visibility = if (parts.isEmpty()) View.GONE else View.VISIBLE
+        // The label can't be seen from another app; the notification says it there.
+        if (keepInBackground && connection != null) SessionService.update(this, intent.getStringExtra(EXTRA_HOST) ?: "", micOn, camOn)
     }
 
     override fun onHostHello(codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int) {
@@ -407,14 +484,21 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             if (deviceInput) gamepads.announce()
         }
         try {
-            decoder?.configure(codec, width, height, fps)
+            synchronized(streamLock) {
+                streamCodec = codec
+                streamFps = fps
+                decoder?.configure(codec, width, height, fps)
+            }
         } catch (e: Exception) {
             fail("Decoder error: ${e.message}")
         }
     }
 
     override fun onConfig(data: ByteArray, length: Int) {
-        decoder?.queueConfig(data, length)
+        synchronized(streamLock) {
+            streamConfig = data.copyOf(length) // once per stream, not per frame
+            decoder?.queueConfig(data, length)
+        }
     }
 
     override fun onFrame(ptsUs: Long, keyframe: Boolean, data: ByteArray, offset: Int, length: Int) {

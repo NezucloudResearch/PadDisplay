@@ -14,11 +14,13 @@
 #include <dxgi.h>
 #include <newdev.h>
 #include <setupapi.h>
+#include <sddl.h>
 #include <softpub.h>
 #include <wintrust.h>
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <cwctype>
 #include <fstream>
 #include <regex>
@@ -269,19 +271,95 @@ bool InstallDriver(const std::wstring& driverDir, std::wstring& message);
 
 } // namespace
 
+namespace {
+// A new folder in C:\Windows\Temp that only administrators and System can open, for what an elevated step is about to
+// read or run. A file in a place normal programs can write (%TEMP%, a portable copy of PadDisplay) can be swapped by any
+// program of the same user between "checked" and "used". Nobody can create this folder first (the name is random), and
+// normal programs cannot rename or replace it. It is deleted with its files when the object goes away.
+class PrivateFolder {
+public:
+    PrivateFolder() {
+        wchar_t windows[MAX_PATH];
+        unsigned char random[16];
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!GetWindowsDirectoryW(windows, MAX_PATH) || BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0 ||
+            !ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SDDL_REVISION_1, &descriptor, nullptr))
+            return;
+        std::wstring path = std::wstring(windows) + L"\\Temp\\paddisplay-";
+        for (unsigned char b : random) {
+            wchar_t hex[3];
+            swprintf_s(hex, L"%02x", b);
+            path += hex;
+        }
+        SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
+        if (CreateDirectoryW(path.c_str(), &attributes)) path_ = path;
+        else LOGI("vdd: could not create the private folder %ls (error %lu)", path.c_str(), GetLastError());
+        LocalFree(descriptor);
+    }
+    ~PrivateFolder() {
+        if (path_.empty()) return;
+        WIN32_FIND_DATAW fd;
+        HANDLE find = FindFirstFileW((path_ + L"\\*").c_str(), &fd); // also what a started installer left in here
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                const std::wstring file = path_ + L"\\" + fd.cFileName;
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_NORMAL); // a copy keeps the source's read-only flag
+                    DeleteFileW(file.c_str());
+                }
+            } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+        if (!RemoveDirectoryW(path_.c_str())) LOGI("vdd: left %ls behind (error %lu)", path_.c_str(), GetLastError());
+    }
+    PrivateFolder(const PrivateFolder&) = delete;
+    PrivateFolder& operator=(const PrivateFolder&) = delete;
+
+    explicit operator bool() const { return !path_.empty(); }
+    const std::wstring& Path() const { return path_; }
+    std::wstring File(const wchar_t* name) const { return path_ + L"\\" + name; }
+    // On failure GetLastError() is the copy's error (ERROR_FILE_NOT_FOUND when the source is missing).
+    bool Copy(const std::wstring& from, const wchar_t* name) const {
+        return !path_.empty() && CopyFileW(from.c_str(), File(name).c_str(), TRUE);
+    }
+
+private:
+    std::wstring path_;
+};
+} // namespace
+
+std::wstring XmlEscape(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) {
+        if (c == L'&') o += L"&amp;";
+        else if (c == L'<') o += L"&lt;";
+        else if (c == L'>') o += L"&gt;";
+        else o += c;
+    }
+    return o;
+}
+
 bool CreateTaskFromXml(const wchar_t* name, const std::wstring& xml, std::wstring& message) {
-    wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring path = std::wstring(tmp) + L"paddisplay-task.xml";
+    // schtasks runs elevated and registers whatever the file says (often as System), so the file must not sit in %TEMP%,
+    // where a normal program could rewrite it between the write and the read.
+    PrivateFolder folder;
+    if (!folder) {
+        message = L"Could not create a protected folder for the task file of " + std::wstring(name) + L".";
+        return false;
+    }
+    const std::wstring path = folder.File(L"task.xml");
     {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
         const unsigned char bom[2] = {0xFF, 0xFE};
         f.write(reinterpret_cast<const char*>(bom), 2);
         f.write(reinterpret_cast<const char*>(xml.data()), std::streamsize(xml.size() * sizeof(wchar_t)));
+        if (!f) {
+            message = L"Could not write the task file of " + std::wstring(name) + L".";
+            return false;
+        }
     }
     DWORD code = 1;
     std::string out = RunCapture(L"schtasks.exe /create /f /tn \"" + std::wstring(name) + L"\" /xml \"" + path + L"\"", 15000, &code);
-    DeleteFileW(path.c_str());
     if (code != 0) {
         message = L"Could not register task " + std::wstring(name) + L": " + Widen(out);
         LOGI("vdd: %s", Narrow(message).c_str());
@@ -296,6 +374,13 @@ bool ToggleTasksExist() {
     RunCapture(L"schtasks.exe /query /tn \"" + std::wstring(kTaskOff) + L"\"", 10000, &b);
     return a == 0 && b == 0;
 }
+
+namespace {
+std::atomic<bool> vddFailed{false};
+}
+
+void SetVddFailed(bool failed) { vddFailed = failed; }
+bool VddFailed() { return vddFailed; }
 
 bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs) {
     VddState want = on ? VddState::Ready : VddState::Disabled;
@@ -498,13 +583,22 @@ bool InstallVigemBus(const std::wstring& driverDir, std::wstring& message) {
         message = L"ViGEmBus (game controller driver) is already installed.";
         return true;
     }
-    const std::wstring path = driverDir + L"\\" + kVigemInstaller;
+    // Hash and run a copy in a folder only administrators can change: from the shipped folder (a portable copy lives in the
+    // user's own folders) another program could swap the file between the check and CreateProcess and get it run elevated.
+    PrivateFolder stage;
+    if (!stage.Copy(driverDir + L"\\" + kVigemInstaller, kVigemInstaller)) {
+        const DWORD error = GetLastError();
+        message = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? L"The ViGEmBus installer is missing: " + driverDir + L"\\" + kVigemInstaller
+                                                                                  : L"Could not prepare the ViGEmBus installer: " + LastErrorText(error);
+        return false;
+    }
+    const std::wstring path = stage.File(kVigemInstaller);
     if (!VerifyVigemInstaller(path, message)) return false;
     // bInheritHandles = FALSE: the installer must not inherit any handle of this process (see CLAUDE.md).
     std::wstring cmd = L"\"" + path + L"\" /exenoui /qn /norestart";
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, driverDir.c_str(), &si, &pi)) {
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, stage.Path().c_str(), &si, &pi)) {
         message = L"Could not start the ViGEmBus installer: " + LastErrorText(GetLastError());
         return false;
     }
@@ -580,20 +674,29 @@ bool EnableVigem() {
 
 namespace {
 // The files the 64-bit Windows 10/11 install uses must be exactly the shipped ones before VB-Audio's installer runs.
+const struct { const wchar_t* file; const char* sha256; bool signedFile; } kCableFiles[] = {
+    {L"VBCABLE_Setup_x64.exe", "734c35dfa6d98f48782a451633ceb471166ec70d60482fd89a1123d0ee3c4f41", true},
+    {L"vbaudio_cable64_win10.sys", "f01344602472f1b527de5ee98f18987c03db48fea444e457d061e937f1d531d5", false},
+    {L"vbaudio_cable64_win10.cat", "0a921ebadbe39cf3fa7c14ff37d1ca22565a9651244bd3ac177dc810bc99072e", false},
+    {L"vbMmeCable64_win10.inf", "61c857be74831cc299d9be62f8d49d137f14063454fc54f859d5bc9b4b813daf", false},
+};
+
+// Copies the package into a folder only administrators can change, so the hashes checked next are the files that then run.
+bool StageCablePackage(const PrivateFolder& stage, const std::wstring& driverDir, std::wstring& message) {
+    for (const auto& f : kCableFiles) {
+        if (stage.Copy(driverDir + L"\\" + f.file, f.file)) continue;
+        const DWORD error = GetLastError();
+        message = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? L"VB-CABLE is missing from this PadDisplay: " + driverDir + L"\\" + f.file
+                                                                                  : L"Could not prepare VB-CABLE: " + LastErrorText(error);
+        return false;
+    }
+    return true;
+}
+
 bool VerifyCablePackage(const std::wstring& driverDir, std::wstring& message) {
-    static const struct { const wchar_t* file; const char* sha256; bool signedFile; } kFiles[] = {
-        {L"VBCABLE_Setup_x64.exe", "734c35dfa6d98f48782a451633ceb471166ec70d60482fd89a1123d0ee3c4f41", true},
-        {L"vbaudio_cable64_win10.sys", "f01344602472f1b527de5ee98f18987c03db48fea444e457d061e937f1d531d5", false},
-        {L"vbaudio_cable64_win10.cat", "0a921ebadbe39cf3fa7c14ff37d1ca22565a9651244bd3ac177dc810bc99072e", false},
-        {L"vbMmeCable64_win10.inf", "61c857be74831cc299d9be62f8d49d137f14063454fc54f859d5bc9b4b813daf", false},
-    };
-    for (const auto& f : kFiles) {
+    for (const auto& f : kCableFiles) {
         const std::wstring path = driverDir + L"\\" + f.file;
         std::string hex;
-        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            message = L"VB-CABLE is missing from this PadDisplay: " + path;
-            return false;
-        }
         if (!Sha256Hex(path, hex) || hex != f.sha256) {
             message = std::wstring(L"The VB-CABLE file ") + f.file + L" is not the one PadDisplay shipped, so the installer was not run.";
             LOGI("cable: hash mismatch for %ls (%s)", f.file, hex.c_str());
@@ -636,7 +739,10 @@ bool InstallCable(const std::wstring& driverDir, std::wstring& message) {
         message = L"VB-CABLE is already installed (" + name + L").";
         return true;
     }
-    if (!VerifyCablePackage(driverDir, message) || !RunCableSetup(driverDir, L"-i -h", message)) return false;
+    PrivateFolder stage;
+    if (!stage || !StageCablePackage(stage, driverDir, message) || !VerifyCablePackage(stage.Path(), message) ||
+        !RunCableSetup(stage.Path(), L"-i -h", message))
+        return false;
     MarkAddedByPadDisplay(kAddedCable, true); // it was not on this PC before: the uninstaller may take it away again
     for (int i = 0; i < 150 && !CableInstalled(L"", &name); ++i) Sleep(200); // the device appears a moment after the installer ends
     const bool present = CableInstalled(L"", &name);
@@ -652,7 +758,10 @@ bool RemoveCable(const std::wstring& driverDir, std::wstring& message) {
         MarkAddedByPadDisplay(kAddedCable, false);
         return true;
     }
-    if (!VerifyCablePackage(driverDir, message) || !RunCableSetup(driverDir, L"-u -h", message)) return false;
+    PrivateFolder stage;
+    if (!stage || !StageCablePackage(stage, driverDir, message) || !VerifyCablePackage(stage.Path(), message) ||
+        !RunCableSetup(stage.Path(), L"-u -h", message))
+        return false;
     for (int i = 0; i < 100 && CableInstalled(L""); ++i) Sleep(200); // the device goes a moment after the installer ends
     const bool gone = !CableInstalled(L"");
     message = gone ? L"VB-CABLE removed." : L"VB-CABLE was uninstalled, but its device is still there. Restart Windows to finish.";

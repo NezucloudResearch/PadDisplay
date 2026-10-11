@@ -1,5 +1,0 @@
-C:/Users/Nezucloud/Projects/PadDisplay/build/CMakeFiles/PadDisplay.dir
-C:/Users/Nezucloud/Projects/PadDisplay/build/CMakeFiles/ViGEmClient.dir
-C:/Users/Nezucloud/Projects/PadDisplay/build/CMakeFiles/PadDisplayCamera.dir
-C:/Users/Nezucloud/Projects/PadDisplay/build/CMakeFiles/ALL_BUILD.dir
-C:/Users/Nezucloud/Projects/PadDisplay/build/CMakeFiles/ZERO_CHECK.dir

@@ -10,6 +10,12 @@
     <!-- Only asked for when the user turns on "use this tablet's microphone / camera as a PC microphone / webcam". -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Staying connected while another app is in front (SessionService), on unless switched off in the app. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -39,6 +45,13 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density"
             android:resizeableActivity="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <!-- Keeps the process alive while the session runs behind another app. The microphone and camera types are only
+             claimed when those switches are on (see SessionService.start). -->
+        <service
+            android:name=".SessionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|microphone|camera" />
 
         <!-- Optional, switched on by the user: lets a connected keyboard's system shortcuts go to the PC. -->
         <service

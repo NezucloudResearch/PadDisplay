@@ -103,20 +103,28 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     fps_ = std::clamp(std::min(settings_.maxFps, hello_.maxFps ? int(hello_.maxFps) : 60), 10, 240);
 
     VirtualDisplay vd;
-    bool switchedOn = false;
-    if (!FindVirtualDisplay(settings_.displayOverride, vd) && settings_.displayOverride.empty() && QueryVdd() == VddState::Disabled &&
-        SetVirtualMonitorEnabled(true, 5000)) {
-        switchedOn = true;
-        for (int i = 0; i < 30 && !FindVirtualDisplay(L"", vd); ++i) Sleep(100); // switched off on exit: bring it back
+    bool switchedOn = false, switchOnFailed = false;
+    if (!FindVirtualDisplay(settings_.displayOverride, vd) && settings_.displayOverride.empty() && QueryVdd() == VddState::Disabled) {
+        // Switched off on exit or while no tablet was connected: bring it back. The scheduled task, pnputil and the driver's
+        // monitor arrival can take several seconds together (more right after boot); a shorter wait ended the session while
+        // the monitor was still coming. The pings above keep the tablet waiting, and both waits end as soon as it is there.
+        switchedOn = SetVirtualMonitorEnabled(true, 15000);
+        switchOnFailed = !switchedOn;
+        for (int i = 0; switchedOn && i < 100 && !FindVirtualDisplay(L"", vd); ++i) Sleep(100);
     }
     if (gdiName_.empty() && vd.gdiName.empty()) {
         VddState state = settings_.displayOverride.empty() ? QueryVdd() : VddState::Ready;
+        // Each text names the item the tray shows for that state; SetVddFailed makes sure it is shown.
+        SetVddFailed(true);
         SendError(ErrNoDisplay,
                   state == VddState::NotInstalled ? "The virtual monitor driver is not installed on the PC. Right-click the PadDisplay tray icon and choose 'Install virtual monitor driver'."
-                  : state == VddState::Disabled   ? "The virtual monitor driver is disabled on the PC. Right-click the PadDisplay tray icon and choose 'Enable virtual monitor driver'."
-                                                  : "Virtual monitor not found on the PC. Right-click the PadDisplay tray icon and choose 'Repair virtual monitor driver'.");
+                  : state == VddState::Disabled && switchOnFailed
+                      ? "PadDisplay could not switch the virtual monitor on. Right-click the PadDisplay tray icon on the PC and choose 'Enable virtual monitor driver'."
+                  : state == VddState::Disabled ? "The virtual monitor driver is disabled on the PC. Right-click the PadDisplay tray icon and choose 'Enable virtual monitor driver'."
+                                                : "Virtual monitor not found on the PC. Right-click the PadDisplay tray icon and choose 'Repair virtual monitor driver'.");
         return;
     }
+    SetVddFailed(false);
     gdiName_ = vd.gdiName;
     // With the virtual monitor off the desktop, the real screens are exactly as the user arranged them: remember that
     // (never while it is attached: Windows shifts things then). Switching it on above has done so already, and the
@@ -160,8 +168,20 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     }
     // In only-screen mode a UAC prompt on the secure desktop would be invisible and unanswerable. If the
     // user opted in (and the host is elevated), move prompts to the normal desktop so the tablet can
-    // click them. Restored on teardown and at start-up; a no-op otherwise.
-    if (onlyScreen_ && settings_.uacClickableOnTablet) AllowUacClicksOnTablet();
+    // see them. Restored on teardown and at start-up; a no-op otherwise.
+    if (onlyScreen_ && settings_.uacClickableOnTablet) {
+        AllowUacClicksOnTablet();
+        // Seeing the prompt is not clicking it: the prompt runs above administrator level, so the click
+        // has to go through a System-level helper. Register its task now (needs the admin rights we have).
+        // Only forward clicks (uacClickable_) if the task is in place and we are elevated.
+        if (HostIsElevated()) {
+            std::wstring msg;
+            uacClickable_ = EnsureUacRelayTask(msg);
+            if (!uacClickable_) LOGI("session: UAC-click helper not available: %s", Narrow(msg).c_str());
+        } else {
+            LOGI("session: tablet cannot click UAC prompts (PadDisplay is not elevated); it can only show them");
+        }
+    }
     // Attaching/reloading may have moved real screens. Windows re-applies its own layout for a
     // moment afterwards, so watching for that takes 1.5 s: do it while the stream starts.
     if (settings_.displayOverride.empty())
@@ -195,7 +215,16 @@ void Session::Run(FILE* dump, int dumpSeconds) {
 
     waiting.reset();
     if (conn_.s != INVALID_SOCKET) {
-        input_ = std::make_unique<InputInjector>();
+        input_ = std::make_unique<InputInjector>(HostIsElevated(), [this](const char* text) { SendNotice(text); });
+        if (uacClickable_) {
+            uacClick_ = std::make_unique<UacClickClient>([this](const char* text) { SendNotice(text); });
+            // Called on the input thread for every tap / allowed key while the feature is on. The client
+            // tests cheaply whether it lands on a UAC prompt and ignores it otherwise; only a real hit is
+            // enqueued, and the client's worker thread does the slow task/pipe work.
+            input_->SetUacForward([this](bool click, int x, int y, WORD vk) {
+                if (click) uacClick_->Click(x, y); else uacClick_->Key(vk);
+            });
+        }
         recvThread_ = std::thread([this] { RecvLoop(); });
         inputThread_ = std::thread([this] { InputLoop(); });
     }

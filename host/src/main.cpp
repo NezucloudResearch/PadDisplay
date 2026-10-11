@@ -21,6 +21,7 @@
 #include "settings.h"
 #include "setup.h"
 #include "gpu_profile.h"
+#include "uacrelay.h"
 #include "vcam.h"
 #include "vdd.h"
 
@@ -299,17 +300,6 @@ void SetRunKey(bool on) {
     RegCloseKey(key);
 }
 
-std::wstring XmlEscape(const std::wstring& s) {
-    std::wstring o;
-    for (wchar_t c : s) {
-        if (c == L'&') o += L"&amp;";
-        else if (c == L'<') o += L"&lt;";
-        else if (c == L'>') o += L"&gt;";
-        else o += c;
-    }
-    return o;
-}
-
 std::wstring CurrentUserSid() {
     HANDLE token = nullptr;
     std::wstring sid;
@@ -469,14 +459,16 @@ void ShowMenu(HWND hwnd) {
                 fingerprint.empty() ? L"Wi-Fi encryption unavailable (see log)"
                                     : (L"Wi-Fi encrypted (TLS), fingerprint " + Widen(fingerprint.substr(0, 23)) + L"…").c_str());
     VddState vdd = QueryVdd();
+    // A tablet was told to choose one of the items below: it must be there, whatever would normally hide it.
+    const bool vddFailed = VddFailed();
     if (g_installing) {
         AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Installing virtual monitor driver…");
-    } else if (vdd == VddState::Ready && g_setupIncomplete == 1) {
+    } else if (vdd == VddState::Ready && g_setupIncomplete == 1 && !vddFailed) {
         AppendMenuW(m, MF_STRING, ID_DRIVER, L"Finish PadDisplay setup (admin)… (monitor off on exit, full GPU speed)");
-    } else if (vdd == VddState::Disabled && g_settings.monitorOnlyWhileConnected && g_setupIncomplete == 0) {
+    } else if (vdd == VddState::Disabled && g_settings.monitorOnlyWhileConnected && g_setupIncomplete == 0 && !vddFailed) {
         // Off because no tablet is connected: PadDisplay switches it on when one does. Nothing to fix.
         AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Virtual monitor: off until a tablet connects");
-    } else if (vdd != VddState::Ready) {
+    } else if (vdd != VddState::Ready || vddFailed) {
         AppendMenuW(m, MF_STRING | MF_DEFAULT, ID_DRIVER,
                     vdd == VddState::NotInstalled ? L"Install virtual monitor driver (admin)…"
                     : vdd == VddState::Disabled   ? L"Enable virtual monitor driver (admin)…"
@@ -615,6 +607,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp && s == VddState::Ready) {
+            SetVddFailed(false); // fixed: the tray goes back to its usual items
             Balloon(L"Virtual monitor ready", L"Connect the tablet to start using it as a second screen.");
             // Hybrid laptops: Desktop Duplication needs this process on the GPU that renders the new
             // monitor, and that preference only applies at start-up.
@@ -872,6 +865,7 @@ int RunUninstallSetup() {
     if (AddedByPadDisplay(kAddedVigem)) step("game controller driver", RemoveVigem(message));
     if (AddedByPadDisplay(kAddedCable)) step("VB-CABLE", RemoveCable(ExeDir() + L"\\driver\\vbcable", message));
     RemoveToggleTasks();
+    RemoveUacRelayTask();
     DeleteTaskFolder();
     step("driver publishers", UntrustDriverPublishers(message));
     if (QueryNvidiaProfile() == GpuProfileState::Set) step("NVIDIA profile", ConfigureNvidiaProfile(false, message));
@@ -940,6 +934,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     DisableProcessPowerThrottling();
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    // The UAC-click helper: these run as SYSTEM, started by the scheduled task (see uacrelay.*), never
+    // by the user. They do their one job and exit, well before any of the normal start-up below.
+    if (HasArg(argc, argv, L"--uac-relay")) return RunUacRelayBootstrap();
+    if (HasArg(argc, argv, L"--uac-inject")) return RunUacInjector();
     const wchar_t* dumpPath = ArgValue(argc, argv, L"--dump");
     bool list = HasArg(argc, argv, L"--list");
     const SetupCommand* setup = FindSetupCommand(argc, argv);
