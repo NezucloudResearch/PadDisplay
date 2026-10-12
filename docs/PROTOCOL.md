@@ -1,18 +1,26 @@
 # PadDisplay wire protocol (version 3)
 
-There is one TCP connection per tablet. The tablet is the client and the host listens on **27183**, dual-stack. Over USB the tablet connects to `127.0.0.1:27183`, which `adb reverse` tunnels to the PC. The PIN is checked on every connection, USB included, unless the host sets `requireUsbPin=0`: the tunnel is reachable by any app on the tablet. All integers are **little-endian**.
+There is one TCP connection per tablet (encrypted with TLS over Wi-Fi: see *Transport security*). The tablet is the client and the host listens on **27183**, dual-stack. Over USB the tablet connects to `127.0.0.1:27183`, which `adb reverse` tunnels to the PC. The PIN is checked on every connection, USB included, unless the host sets `requireUsbPin=0`: the tunnel is reachable by any app on the tablet. All integers are **little-endian**.
 
 Every message is framed as `u8 type | u32 payloadLength | payload`.
+
+## Transport security
+Over Wi-Fi the connection is TLS 1.2, and everything in this document, `ClientHello` included, travels inside it. Message formats and the protocol version did not change.
+- **The host tells TLS from plain by the first byte** of the connection: 0x16 is a TLS handshake, while the plain protocol starts with 0x81 (`ClientHello`) or 0x89 (`AudioHello`). A host accepts both from any address, so clients from before TLS keep working.
+- **The tablet uses TLS for every host except `127.0.0.1`** (USB through `adb reverse`, which never touches the network), and for both the video and the audio connection. It never falls back to plain over Wi-Fi.
+- **Suites:** TLS 1.2 only, no renegotiation. The host's certificate is a self-signed ECDSA P-256 one, so the suites are ECDHE-ECDSA with AES-GCM. The tablet offers only `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`.
+- **Identity:** the tablet pins the SHA-256 of the host certificate (DER) per host address, the first time it connects, and only after the host answered the PIN with something other than `Error`. It refuses a different certificate later. The video and audio connections must present the same one.
+- **`requireEncryption=1`** (host setting) makes the host answer a plain connection from a non-loopback address with `Error` code 7 and close it.
 
 ## Discovery
 The host broadcasts the UDP datagram `PADDISPLAY <version> <tcpPort> <hostname>` once a second to port **27184**. It sends to 255.255.255.255 and to every interface's directed broadcast address.
 
 ## Handshake
-1. The client sends `ClientHello`.
+1. The client sends `ClientHello` (after the TLS handshake, over Wi-Fi).
 2. The host validates the version and the PIN. On failure it sends `Error` and closes the connection.
    - Wrong PINs are rate-limited: at most 5 per minute per source, and 20 per minute across all network sources. USB has its own limit.
    - While a source is locked out, it gets error code 6.
-3. The host sends `HostHello`, then `Config`, then a stream of `Frame`s. The first frame is an IDR.
+3. The host sends `HostHello`, then `Config`, then a stream of `Frame`s. The first frame is an IDR. Preparing the screens can take several seconds (ending the previous session, switching the virtual monitor on); until `HostHello` the host sends a `Ping` twice a second, so a client's read timeout does not run out.
 
 The host may send another `HostHello`, followed by a new `Config`, at any time, for example after a resolution change. The client then reconfigures its decoder.
 
@@ -22,8 +30,8 @@ The host may send another `HostHello`, followed by a new `Config`, at any time, 
 | 0x01 | HostHello | u16 version, u8 codec (1 = H.264, 2 = HEVC), u16 width, u16 height, u8 fps, u32 bitrateKbps |
 | 0x02 | Config | Annex-B parameter sets (VPS/SPS/PPS); queue with `BUFFER_FLAG_CODEC_CONFIG` |
 | 0x03 | Frame | u64 ptsUs, u8 flags (bit0 = keyframe), Annex-B access unit |
-| 0x04 | Ping | u64 hostTimeUs, u32 lastRttUs, u32 currentBitrateKbps. The client must answer with `Pong` |
-| 0x05 | Error | u8 code (1 bad PIN, 2 version, 3 no display, 4 encoder, 6 locked out after too many wrong PINs), UTF-8 text |
+| 0x04 | Ping | u64 hostTimeUs, u32 lastRttUs, u32 currentBitrateKbps. The client must answer with `Pong`. hostTimeUs is 0 in the pings before `HostHello`: those only keep the connection alive |
+| 0x05 | Error | u8 code (1 bad PIN, 2 version, 3 no display, 4 encoder, 6 locked out after too many wrong PINs, 7 the PC only accepts encrypted connections), UTF-8 text |
 | 0x08 | Rumble | u8 controller index, u8 largeMotor, u8 smallMotor (0–255, 0 = off). The level holds until the next `Rumble` for that controller (v3) |
 | 0x09 | Notice | UTF-8 text for the tablet to show. The session goes on. Used when a game controller cannot be created on the PC (v3) |
 
@@ -83,6 +91,41 @@ To receive PC audio, the tablet opens a **second** TCP connection to the same po
   - While the queue is above target, silent packets are skipped.
   - Packets are only dropped above 200 ms.
 
+## Microphone connection (optional, v4)
+To use the tablet's microphone as a PC microphone, the tablet opens another connection to the same port (TLS over Wi-Fi like the others) and sends `MicHello` first. The host checks the PIN exactly as for video, with the same rate limits. A newer microphone connection replaces an older one. Nothing is captured on the tablet until the user switches it on there, and then only while an app on the PC records from the virtual microphone.
+
+| dir | type | name | payload |
+|---|---|---|---|
+| client → host | 0x8D | MicHello | u16 version, u32 pin, u8 flags (0) |
+| client → host | 0x8E | MicData | u64 ptsUs, then s16le mono 48 kHz samples (10 ms per packet, 480 samples). Without samples it is a keep-alive |
+| host → client | 0x0C | MicState | u8 active: 1 = an app on the PC records from the virtual microphone, so capture; 0 = nobody does, stop |
+
+- **Only while it is used:** the host sends `MicState` as soon as the virtual microphone is open (within milliseconds of `MicHello`) and on every change. The tablet opens its microphone on 1 and closes it on 0, so Android shows the microphone in use only while a PC app listens. A start is passed on at once; a stop after the recording device was idle for 2 s, because apps close and reopen a microphone while they look at the devices. While the microphone is off the tablet sends a `MicData` without samples every 2 s: the host treats 10 s without a message as a lost tablet.
+  - The host learns it from Windows' audio sessions on the recording device ("CABLE Output", or the PadDisplay microphone), by notification, without polling. If it cannot watch them it sends 1 once and the microphone runs for the whole connection.
+  - A host from before `MicState` never sends it and expects audio all the time. A client that has not received a `MicState` 3 s after `MicHello` therefore captures anyway. A client from before `MicState` ignores the message and sends all the time; the host accepts that.
+
+- **No codec:** raw PCM costs no encode delay and about 0.77 Mbps.
+- **PC side:** Windows only offers microphones that a driver provides, so PadDisplay uses one of two: its own PadDisplay Microphone driver where Windows loads it, otherwise the free VB-CABLE that ships with it (the host chooses; see below). The driver ([acxmic](https://github.com/NezucloudResearch/acxmic), the submodule `host/third_party/padmic`). The host writes each packet's samples, as they are, to the driver's control device (`\\.\PadDisplayMic`, interface in `host/third_party/padmic/include/padmic_public.h`); apps choose "PadDisplay Virtual Microphone" (Windows shows it as "Microphone (PadDisplay Virtual Microphone)") as their microphone. The only buffer is the driver's: an app starts getting audio once 20 ms are waiting (silence before that, and again after the audio ran dry), and audio beyond 100 ms is dropped from the old end, so the delay is bounded. The host does no buffering or resampling of its own on this path. With VB-CABLE the host plays the packets into the cable's playback device ("CABLE Input") through WASAPI shared mode, with a small jitter buffer (20 ms to start, at most 120 ms, growing after underruns) and a resampler if the cable's rate is not 48 kHz; apps choose "CABLE Output". That path adds about 90-110 ms in all (the cable and Windows' audio engine alone take 93-106 ms), the driver path about 15 ms.
+- **Refusals:** if the PC has no virtual microphone (neither PadDisplay's driver nor VB-CABLE; the PC then asks its user whether to install VB-CABLE), the control device is already open (another PadDisplay), or the PC has switched the microphone off (`acceptTabletMic`), it sends one `Notice` and ends the connection. The tablet shows the text and stops. Notice texts a tablet may see: "The PC has no virtual microphone yet. PadDisplay on the PC is asking to install one: accept it there, then switch the microphone off and on here.", "The virtual audio cable (VB-CABLE) could not be opened for playback. See the PC's log.", "The PadDisplay microphone driver is not installed on the PC…", "The PadDisplay microphone is already in use by another PadDisplay on the PC.", "The microphone is switched off in PadDisplay on the PC…", "The PadDisplay microphone driver stopped…".
+
+## Camera connection (optional, v4, Windows 11 PC)
+To use the tablet's camera as a PC webcam, the tablet opens a connection and sends `CamHello` first (same PIN check and TLS). The PC registers a virtual camera once (a setup step); apps then see "PadDisplay Camera".
+
+| dir | type | name | payload |
+|---|---|---|---|
+| client → host | 0x8F | CamHello | u16 version, u32 pin, u8 codec (1 = H.264), u16 width, u16 height, u8 fps |
+| client → host | 0x90 | CamConfig | Annex-B SPS/PPS |
+| client → host | 0x91 | CamFrame | u64 ptsUs, u8 flags (bit0 = keyframe), Annex-B access unit |
+| host → client | 0x0A | CamState | u8 active: 1 = an app on the PC has the webcam open, 0 = nobody does |
+| host → client | 0x0B | CamKeyframeReq | empty: the host could not decode, send an IDR |
+
+- **The camera runs only while someone uses the webcam.** After `CamHello` the host sends `CamState` 0. The tablet turns its camera and encoder on when it receives 1 and off (camera light off) when it receives 0. The host decides by watching whether the virtual camera's reader is asking for frames, about every 250 ms. Frames that arrive while the state is 0 are dropped.
+- **Encoding:** hardware H.264 from the camera's surface, no B-frames, an IDR only on request, CBR (about 4 Mbps at 720p30, 8 Mbps at 1080p30). Sizes up to 1920×1080.
+- **PC side:** the host decodes with the Media Foundation H.264 decoder in low-latency mode and writes the newest frame into a shared-memory slot that the virtual camera's media source (loaded by Windows' Frame Server) reads at 30 fps. There is no queue: a late frame is simply replaced. With no frame for 1 s, apps see a dark "no signal" picture.
+- **Refusals:** before Windows 11, before the one-time setup, or with `acceptTabletCamera` off, the host sends one `Notice` and ends the connection.
+
+`Notice` on these connections is not tied to `Gamepad`: they belong to the microphone or camera connection only.
+
 ## Flow control (v2)
 The client acknowledges **every** `Frame`. The host stops encoding while `maxFramesInFlight` frames (default 3) are unacknowledged. Desktop updates made meanwhile are not lost; Desktop Duplication coalesces them into the next frame. This bounds queueing in the network to a few frames: over a slow link the frame rate drops instead of the delay growing. Adaptive bitrate uses the time spent waiting for acks and each frame's send-to-ack time.
 
@@ -92,6 +135,7 @@ v1 clients (no acks) are still accepted, but they only get RTT-based bitrate ada
 - **v1:** video, touch, pen, mouse gestures.
 - **v2:** `FrameAck` (flow control).
 - **v3:** `Key`, `MouseRel`, `Gamepad`, more `Mouse` buttons, `Rumble`, `Notice`, and the flags byte in `ClientHello`.
+- **v4:** the microphone and camera connections: `MicHello`, `MicData`, `CamHello`, `CamConfig`, `CamFrame`, `CamState`, `CamKeyframeReq`. Nothing in the screen stream changed. A tablet app that sends version 4 needs a host of version 4 or later.
 
 A host accepts every client version up to its own, and rejects a newer one with error code 2. It only sends `Rumble` or `Notice` to a client that has sent `Gamepad`.
 

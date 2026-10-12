@@ -1,4 +1,5 @@
 # Build outputs
+/build/
 host/build/
 host/dist/
 android/build/

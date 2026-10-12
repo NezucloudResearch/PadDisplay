@@ -33,7 +33,13 @@ import kotlin.math.sign
  *   the start of a sound doesn't crackle. Hard drops only happen beyond [hardCapMs] (e.g. the
  *   tablet's audio system stalling).
  */
-class AudioStream(private val host: String, private val port: Int, private val pin: Int, private val mutePc: Boolean) {
+class AudioStream(
+    private val host: String,
+    private val port: Int,
+    private val pin: Int,
+    private val mutePc: Boolean,
+    private val trust: HostTrust?, // null over USB; otherwise the same pinned TLS as the video connection
+) {
 
     companion object {
         private const val TAG = "PadAudio"
@@ -50,6 +56,7 @@ class AudioStream(private val host: String, private val port: Int, private val p
 
     @Volatile private var closed = false
     @Volatile private var socket: Socket? = null
+    @Volatile private var rawSocket: Socket? = null // the TCP socket under the TLS one
     private var thread: Thread? = null
 
     // Stats for the overlay.
@@ -73,17 +80,19 @@ class AudioStream(private val host: String, private val port: Int, private val p
 
     fun close() {
         closed = true
-        try { socket?.close() } catch (_: IOException) {}
+        Tls.hangUp(rawSocket)
     }
 
     private fun run() {
         var track: AudioTrack? = null
         try {
-            val s = Socket()
-            socket = s
-            s.tcpNoDelay = true
-            s.receiveBufferSize = 64 shl 10
-            s.connect(InetSocketAddress(host, port), 3000)
+            val raw = Socket()
+            rawSocket = raw
+            socket = raw
+            raw.tcpNoDelay = true
+            raw.receiveBufferSize = 64 shl 10
+            raw.connect(InetSocketAddress(host, port), 3000)
+            val s: Socket = if (trust != null) Tls.wrap(raw, host, port, trust).also { socket = it } else raw
             s.getOutputStream().apply {
                 write(Protocol.message(Protocol.AUDIO_HELLO, 7) {
                     it.putShort(Protocol.VERSION.toShort())
@@ -199,6 +208,7 @@ class AudioStream(private val host: String, private val port: Int, private val p
                 try { it.stop() } catch (_: IllegalStateException) {}
                 it.release()
             }
+            try { rawSocket?.close() } catch (_: IOException) {}
             try { socket?.close() } catch (_: IOException) {}
         }
     }

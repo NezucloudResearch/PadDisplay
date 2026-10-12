@@ -6,7 +6,8 @@
 
 namespace pd {
 
-void LogInit(const std::wstring& path, bool console);
+// append: keep what is in the file (the installer runs several setup commands in a row into one log).
+void LogInit(const std::wstring& path, bool console, bool append = false);
 void Log(const char* fmt, ...);
 std::wstring LogPath();
 

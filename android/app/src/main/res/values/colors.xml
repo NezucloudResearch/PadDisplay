@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="pd_bg">#F3F5F9</color>
+    <color name="pd_surface">#FFFFFF</color>
+    <color name="pd_outline">#DCE1EA</color>
+    <color name="pd_text">#12161C</color>
+    <color name="pd_text2">#586273</color>
+    <color name="pd_accent">#1769D1</color>
+    <color name="pd_accent_soft">#E2EDFC</color>
+    <color name="pd_on_accent">#FFFFFF</color>
+    <color name="pd_danger">#B3261E</color>
+    <color name="pd_danger_soft">#FCE9E7</color>
+    <color name="pd_ok">#1B7F4B</color>
+    <color name="pd_ripple">#220F5BD8</color>
+</resources>

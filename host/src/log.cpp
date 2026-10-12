@@ -16,7 +16,7 @@ static FILE* g_file = nullptr;
 static bool g_console = false;
 static std::wstring g_path;
 
-void LogInit(const std::wstring& path, bool console) {
+void LogInit(const std::wstring& path, bool console, bool append) {
     g_path = path;
     g_console = console;
     // Reuse the launching terminal if there is one, otherwise open a console window.
@@ -25,7 +25,7 @@ void LogInit(const std::wstring& path, bool console) {
         freopen_s(&f, "CONOUT$", "w", stdout);
         SetConsoleOutputCP(CP_UTF8);
     }
-    g_file = _wfsopen(path.c_str(), L"w", _SH_DENYNO); // readable while running
+    g_file = _wfsopen(path.c_str(), append ? L"a" : L"w", _SH_DENYNO); // readable while running
 }
 
 std::wstring LogPath() { return g_path; }
@@ -72,6 +72,17 @@ void DisableProcessPowerThrottling() {
     if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s, sizeof(s)))
         Log("power throttling opt-out failed (%lu)", GetLastError());
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+
+    // A process that Task Scheduler starts (the sign-in task that starts PadDisplay elevated) gets low I/O priority and
+    // memory priority 2 of 5, and keeps them (measured): its memory is trimmed first and its disk reads wait behind
+    // everything else. Put both back to what a program started from the Start menu has.
+    MEMORY_PRIORITY_INFORMATION memory{MEMORY_PRIORITY_NORMAL};
+    SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &memory, sizeof(memory));
+    using SetInformation = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+    const auto setInformation = reinterpret_cast<SetInformation>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess"));
+    constexpr ULONG kProcessIoPriority = 33; // PROCESSINFOCLASS, no documented Win32 call sets it for a whole process
+    ULONG normalIo = 2;                      // IoPriorityNormal
+    if (setInformation) setInformation(GetCurrentProcess(), kProcessIoPriority, &normalIo, sizeof(normalIo));
 }
 
 void MakeRealtimeThread(const wchar_t* mmcssTask) {

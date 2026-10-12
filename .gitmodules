@@ -1,0 +1,3 @@
+[submodule "host/third_party/padmic"]
+	path = host/third_party/padmic
+	url = https://github.com/NezucloudResearch/acxmic.git

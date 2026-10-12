@@ -1,16 +1,26 @@
 // PadDisplay by Nezucloud. Copyright (c) 2026 Nezucloud.
 // SPDX-License-Identifier: MIT
 #include "vdd.h"
+#include "cablesink.h"
 #include "display.h"
 #include "log.h"
 #include "net.h"
+#include "setup.h"
+
+#include "../third_party/padmic/include/padmic_public.h"
 
 #include <windows.h>
 #include <cfgmgr32.h>
 #include <dxgi.h>
 #include <newdev.h>
 #include <setupapi.h>
+#include <sddl.h>
+#include <softpub.h>
+#include <wintrust.h>
+#include <wincrypt.h>
+#include <bcrypt.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <cwctype>
 #include <fstream>
 #include <regex>
@@ -30,6 +40,11 @@ const wchar_t kTaskOff[] = L"\\PadDisplay\\VirtualMonitorOff";
 const GUID kSystemClass = {0x4d36e97d, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
 const wchar_t kVigemHardwareId[] = L"Nefarius\\ViGEmBus\\Gen1";
 const wchar_t kTaskGamepadOn[] = L"\\PadDisplay\\GameControllerOn";
+// {4d36e96c-e325-11ce-bfc1-08002be10318}: MEDIA, where audio devices live. The PadDisplay Microphone is a root device.
+const GUID kMediaClass = {0x4d36e96c, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+const wchar_t kMicHardwareId[] = L"Root\\PadDisplayMic";
+const wchar_t kTaskMicOn[] = L"\\PadDisplay\\MicrophoneOn";
+const wchar_t kTaskMicOff[] = L"\\PadDisplay\\MicrophoneOff";
 
 // Common tablet / monitor resolutions, landscape. The tablet's own mode is added on connect.
 const int kDefaultModes[][2] = {
@@ -114,13 +129,21 @@ bool WriteFileAtomic(const std::wstring& path, const std::string& data) {
     return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
 }
 
-bool EnsureSettingsFile() {
+// wrote (optional) reports whether the file was written now, as opposed to having been there.
+bool EnsureSettingsFile(bool* wrote = nullptr) {
     std::wstring path = VddSettingsPath();
+    if (wrote) *wrote = false;
     if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
     CreateDirectoryW(kSettingsDir, nullptr);
     bool ok = WriteFileAtomic(path, DefaultSettingsXml());
     LOGI("vdd: %s default %ls", ok ? "wrote" : "FAILED to write", path.c_str());
+    if (wrote) *wrote = ok;
     return ok;
+}
+
+void DeleteSettingsFile() {
+    DeleteFileW(VddSettingsPath().c_str());
+    RemoveDirectoryW(kSettingsDir); // fails, as it should, if something else keeps files there
 }
 
 // Tells the running driver to re-read vdd_settings.xml. The pipe is open to normal users.
@@ -164,6 +187,13 @@ std::wstring LastErrorText(DWORD err) {
     return s + L" (" + std::to_wstring(err) + L")";
 }
 
+// SetupAPI's own error codes have no message text in Windows: say what the one a user can cause means.
+std::wstring InstallErrorText(DWORD err) {
+    if (err == ERROR_AUTHENTICODE_PUBLISHER_NOT_TRUSTED || err == ERROR_AUTHENTICODE_TRUST_NOT_ESTABLISHED)
+        return L"Windows asked whether to install software from the driver's publisher, and the answer was no (" + std::to_wstring(err) + L")";
+    return LastErrorText(err);
+}
+
 // Registers a hidden task that runs "pnputil /<verb>-device /deviceid <hardwareId>" as SYSTEM (no
 // window). The security descriptor lets interactive users start it; it can only toggle this device.
 bool CreateToggleTask(const wchar_t* name, const wchar_t* verb, const wchar_t* what, const wchar_t* hardwareId, std::wstring& message) {
@@ -200,23 +230,136 @@ bool InstallToggleTasks(std::wstring& message) {
     return ok;
 }
 
+// Removes the device node with this hardware ID. false = there was none, or Windows refused.
+bool RemoveDevice(const GUID& deviceClass, const wchar_t* hardwareId) {
+    bool removed = false;
+    HDEVINFO set = SetupDiGetClassDevsW(&deviceClass, nullptr, nullptr, 0);
+    SP_DEVINFO_DATA d{sizeof(d)};
+    if (set != INVALID_HANDLE_VALUE && FindDevice(set, d, hardwareId)) removed = SetupDiCallClassInstaller(DIF_REMOVE, set, &d) != FALSE;
+    if (set != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(set);
+    return removed;
+}
+
+void DeleteTask(const wchar_t* name) {
+    DWORD ignored = 0;
+    RunCapture(L"schtasks.exe /delete /f /tn \"" + std::wstring(name) + L"\"", 10000, &ignored);
+}
+
+// A driver package stays in the driver store until it is deleted: finds the oemNN.inf files by the hardware ID they install
+// (given in lower case) and deletes them. Returns how many.
+int DeleteDriverPackages(const char* hardwareIdLower) {
+    int packages = 0;
+    wchar_t windir[MAX_PATH];
+    GetWindowsDirectoryW(windir, MAX_PATH);
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW((std::wstring(windir) + L"\\INF\\oem*.inf").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    do {
+        std::string text;
+        if (!ReadFile(std::wstring(windir) + L"\\INF\\" + fd.cFileName, text)) continue;
+        // An INF is ANSI or UTF-16 (the virtual monitor's is UTF-16, and Windows stores it as it came).
+        if (text.size() >= 2 && static_cast<unsigned char>(text[0]) == 0xFF && static_cast<unsigned char>(text[1]) == 0xFE)
+            text = Narrow(std::wstring(reinterpret_cast<const wchar_t*>(text.data() + 2), (text.size() - 2) / sizeof(wchar_t)));
+        for (auto& c : text) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (text.find(hardwareIdLower) != std::string::npos && SetupUninstallOEMInfW(fd.cFileName, SUOI_FORCEDELETE, nullptr)) ++packages;
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return packages;
+}
+
 bool InstallDriver(const std::wstring& driverDir, std::wstring& message);
 
 } // namespace
 
+namespace {
+// A new folder in C:\Windows\Temp that only administrators and System can open, for what an elevated step is about to
+// read or run. A file in a place normal programs can write (%TEMP%, a portable copy of PadDisplay) can be swapped by any
+// program of the same user between "checked" and "used". Nobody can create this folder first (the name is random), and
+// normal programs cannot rename or replace it. It is deleted with its files when the object goes away.
+class PrivateFolder {
+public:
+    PrivateFolder() {
+        wchar_t windows[MAX_PATH];
+        unsigned char random[16];
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!GetWindowsDirectoryW(windows, MAX_PATH) || BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0 ||
+            !ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SDDL_REVISION_1, &descriptor, nullptr))
+            return;
+        std::wstring path = std::wstring(windows) + L"\\Temp\\paddisplay-";
+        for (unsigned char b : random) {
+            wchar_t hex[3];
+            swprintf_s(hex, L"%02x", b);
+            path += hex;
+        }
+        SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
+        if (CreateDirectoryW(path.c_str(), &attributes)) path_ = path;
+        else LOGI("vdd: could not create the private folder %ls (error %lu)", path.c_str(), GetLastError());
+        LocalFree(descriptor);
+    }
+    ~PrivateFolder() {
+        if (path_.empty()) return;
+        WIN32_FIND_DATAW fd;
+        HANDLE find = FindFirstFileW((path_ + L"\\*").c_str(), &fd); // also what a started installer left in here
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                const std::wstring file = path_ + L"\\" + fd.cFileName;
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_NORMAL); // a copy keeps the source's read-only flag
+                    DeleteFileW(file.c_str());
+                }
+            } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+        if (!RemoveDirectoryW(path_.c_str())) LOGI("vdd: left %ls behind (error %lu)", path_.c_str(), GetLastError());
+    }
+    PrivateFolder(const PrivateFolder&) = delete;
+    PrivateFolder& operator=(const PrivateFolder&) = delete;
+
+    explicit operator bool() const { return !path_.empty(); }
+    const std::wstring& Path() const { return path_; }
+    std::wstring File(const wchar_t* name) const { return path_ + L"\\" + name; }
+    // On failure GetLastError() is the copy's error (ERROR_FILE_NOT_FOUND when the source is missing).
+    bool Copy(const std::wstring& from, const wchar_t* name) const {
+        return !path_.empty() && CopyFileW(from.c_str(), File(name).c_str(), TRUE);
+    }
+
+private:
+    std::wstring path_;
+};
+} // namespace
+
+std::wstring XmlEscape(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) {
+        if (c == L'&') o += L"&amp;";
+        else if (c == L'<') o += L"&lt;";
+        else if (c == L'>') o += L"&gt;";
+        else o += c;
+    }
+    return o;
+}
+
 bool CreateTaskFromXml(const wchar_t* name, const std::wstring& xml, std::wstring& message) {
-    wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring path = std::wstring(tmp) + L"paddisplay-task.xml";
+    // schtasks runs elevated and registers whatever the file says (often as System), so the file must not sit in %TEMP%,
+    // where a normal program could rewrite it between the write and the read.
+    PrivateFolder folder;
+    if (!folder) {
+        message = L"Could not create a protected folder for the task file of " + std::wstring(name) + L".";
+        return false;
+    }
+    const std::wstring path = folder.File(L"task.xml");
     {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
         const unsigned char bom[2] = {0xFF, 0xFE};
         f.write(reinterpret_cast<const char*>(bom), 2);
         f.write(reinterpret_cast<const char*>(xml.data()), std::streamsize(xml.size() * sizeof(wchar_t)));
+        if (!f) {
+            message = L"Could not write the task file of " + std::wstring(name) + L".";
+            return false;
+        }
     }
     DWORD code = 1;
     std::string out = RunCapture(L"schtasks.exe /create /f /tn \"" + std::wstring(name) + L"\" /xml \"" + path + L"\"", 15000, &code);
-    DeleteFileW(path.c_str());
     if (code != 0) {
         message = L"Could not register task " + std::wstring(name) + L": " + Widen(out);
         LOGI("vdd: %s", Narrow(message).c_str());
@@ -232,11 +375,18 @@ bool ToggleTasksExist() {
     return a == 0 && b == 0;
 }
 
+namespace {
+std::atomic<bool> vddFailed{false};
+}
+
+void SetVddFailed(bool failed) { vddFailed = failed; }
+bool VddFailed() { return vddFailed; }
+
 bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs) {
     VddState want = on ? VddState::Ready : VddState::Disabled;
     if (QueryVdd() == want) return true;
     // While the virtual monitor is off, the current arrangement is the user's own: remember it.
-    if (on) SaveHomeLayout(SnapshotRealDisplays());
+    if (on) RememberRealScreens();
     DWORD code = 1;
     RunCapture(L"schtasks.exe /run /tn \"" + std::wstring(on ? kTaskOn : kTaskOff) + L"\"", 10000, &code);
     if (code != 0) {
@@ -249,7 +399,7 @@ bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs) {
             LOGI("vdd: virtual monitor %s", on ? "enabled" : "removed");
             // Windows re-applies its stored layout for the new monitor set a moment later; if that
             // switched off or moved a real screen, put it back where the user had it.
-            RestoreHomeLayout();
+            RestoreRealScreens();
             return true;
         }
         Sleep(100);
@@ -269,7 +419,7 @@ const wchar_t* VddStateText(VddState s) {
     }
 }
 
-static VddState QueryDevice(const GUID& deviceClass, const wchar_t* hardwareId, std::wstring* detail) {
+static VddState QueryDevice(const GUID& deviceClass, const wchar_t* hardwareId, std::wstring* detail, ULONG* problemOut = nullptr) {
     HDEVINFO set = SetupDiGetClassDevsW(&deviceClass, nullptr, nullptr, 0); // include non-present devices
     if (set == INVALID_HANDLE_VALUE) return VddState::NotInstalled;
     VddState state = VddState::NotInstalled;
@@ -282,6 +432,7 @@ static VddState QueryDevice(const GUID& deviceClass, const wchar_t* hardwareId, 
         else if ((status & DN_HAS_PROBLEM) || !(status & DN_STARTED)) state = VddState::Problem;
         else state = VddState::Ready;
         if (detail) *detail = L"status 0x" + std::to_wstring(status) + L", problem " + std::to_wstring(problem);
+        if (problemOut) *problemOut = problem;
     }
     SetupDiDestroyDeviceInfoList(set);
     return state;
@@ -290,6 +441,8 @@ static VddState QueryDevice(const GUID& deviceClass, const wchar_t* hardwareId, 
 VddState QueryVdd(std::wstring* detail) { return QueryDevice(kDisplayClass, kHardwareId, detail); }
 
 VddState QueryVigem() { return QueryDevice(kSystemClass, kVigemHardwareId, nullptr); }
+
+VddState QueryMic(std::wstring* detail) { return QueryDevice(kMediaClass, kMicHardwareId, detail); }
 
 bool SetupVigem(std::wstring& message) {
     HDEVINFO set = SetupDiGetClassDevsW(&kSystemClass, nullptr, nullptr, 0);
@@ -315,11 +468,439 @@ bool SetupVigem(std::wstring& message) {
     return task && s == VddState::Ready;
 }
 
+namespace {
+
+// ViGEmBus 1.22.0, the project's final release (the repository was archived on 2023-11-02), signed by Nefarius Software Solutions.
+const wchar_t kVigemInstaller[] = L"ViGEmBus_1.22.0_x64_x86_arm64.exe";
+const char kVigemSha256[] = "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a";
+
+} // namespace
+
+bool Sha256Hex(const std::wstring& path, std::string& hex) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    bool ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 && BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0;
+    std::vector<BYTE> buf(1 << 20);
+    DWORD got = 0;
+    while (ok && ::ReadFile(f, buf.data(), DWORD(buf.size()), &got, nullptr) && got > 0) ok = BCryptHashData(h, buf.data(), got, 0) == 0;
+    BYTE digest[32] = {};
+    ok = ok && BCryptFinishHash(h, digest, sizeof(digest), 0) == 0;
+    if (h) BCryptDestroyHash(h);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(f);
+    if (!ok) return false;
+    static const char kDigits[] = "0123456789abcdef";
+    hex.clear();
+    for (BYTE b : digest) {
+        hex += kDigits[b >> 4];
+        hex += kDigits[b & 15];
+    }
+    return true;
+}
+
+bool HasValidSignature(const std::wstring& path) {
+    WINTRUST_FILE_INFO file{sizeof(file)};
+    file.pcwszFilePath = path.c_str();
+    WINTRUST_DATA data{sizeof(data)};
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE; // no network from an administrator process; the pinned hash is the real check
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &file;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const LONG r = WinVerifyTrust(HWND(INVALID_HANDLE_VALUE), &action, &data);
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(HWND(INVALID_HANDLE_VALUE), &action, &data);
+    return r == 0;
+}
+
+bool SignerCertificate(const std::wstring& signedPath, std::vector<unsigned char>& der, std::wstring& name) {
+    // A catalog is a PKCS#7 message and a signed program carries one: read its signer.
+    HCERTSTORE store = nullptr;
+    HCRYPTMSG msg = nullptr;
+    DWORD encoding = 0, content = 0, format = 0;
+    if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, signedPath.c_str(), CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                          CERT_QUERY_FORMAT_FLAG_BINARY, 0, &encoding, &content, &format, &store, &msg, nullptr))
+        return false;
+    bool found = false;
+    DWORD size = 0;
+    if (CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, nullptr, &size) && size) {
+        std::vector<BYTE> info(size);
+        if (CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, info.data(), &size)) {
+            PCCERT_CONTEXT cert = CertGetSubjectCertificateFromStore(store, encoding, reinterpret_cast<PCERT_INFO>(info.data()));
+            if (cert) {
+                wchar_t text[256] = {};
+                CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, text, 256);
+                name = text;
+                der.assign(cert->pbCertEncoded, cert->pbCertEncoded + cert->cbCertEncoded);
+                found = true;
+                CertFreeCertificateContext(cert);
+            }
+        }
+    }
+    if (store) CertCloseStore(store, 0);
+    if (msg) CryptMsgClose(msg);
+    return found;
+}
+
+bool SignedByMicrosoftHardware(const std::wstring& catalogPath) {
+    std::vector<unsigned char> der;
+    std::wstring name;
+    return HasValidSignature(catalogPath) && SignerCertificate(catalogPath, der, name) &&
+           name.find(L"Microsoft Windows Hardware Compatibility Publisher") != std::wstring::npos;
+}
+
+bool TestSigningOn() {
+    using Query = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+    const auto query = reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    struct { ULONG length; ULONG options; } info{sizeof(info), 0}; // SYSTEM_CODEINTEGRITY_INFORMATION
+    constexpr ULONG kSystemCodeIntegrityInformation = 103, kTestSign = 0x2; // CODEINTEGRITY_OPTION_TESTSIGN
+    return query && query(kSystemCodeIntegrityInformation, &info, sizeof(info), nullptr) >= 0 && (info.options & kTestSign) != 0;
+}
+
+bool VerifyVigemInstaller(const std::wstring& path, std::wstring& message) {
+    std::string hex;
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        message = L"The ViGEmBus installer is missing: " + path;
+        return false;
+    }
+    if (!Sha256Hex(path, hex) || hex != kVigemSha256) {
+        message = L"The ViGEmBus installer is not the file PadDisplay shipped, so it was not run.";
+        LOGI("vigem: installer hash mismatch (%s)", hex.c_str());
+        return false;
+    }
+    if (!HasValidSignature(path)) {
+        message = L"The ViGEmBus installer's signature is not valid, so it was not run.";
+        return false;
+    }
+    return true;
+}
+
+bool InstallVigemBus(const std::wstring& driverDir, std::wstring& message) {
+    if (QueryVigem() != VddState::NotInstalled) {
+        message = L"ViGEmBus (game controller driver) is already installed.";
+        return true;
+    }
+    // Hash and run a copy in a folder only administrators can change: from the shipped folder (a portable copy lives in the
+    // user's own folders) another program could swap the file between the check and CreateProcess and get it run elevated.
+    PrivateFolder stage;
+    if (!stage.Copy(driverDir + L"\\" + kVigemInstaller, kVigemInstaller)) {
+        const DWORD error = GetLastError();
+        message = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? L"The ViGEmBus installer is missing: " + driverDir + L"\\" + kVigemInstaller
+                                                                                  : L"Could not prepare the ViGEmBus installer: " + LastErrorText(error);
+        return false;
+    }
+    const std::wstring path = stage.File(kVigemInstaller);
+    if (!VerifyVigemInstaller(path, message)) return false;
+    // bInheritHandles = FALSE: the installer must not inherit any handle of this process (see CLAUDE.md).
+    std::wstring cmd = L"\"" + path + L"\" /exenoui /qn /norestart";
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, stage.Path().c_str(), &si, &pi)) {
+        message = L"Could not start the ViGEmBus installer: " + LastErrorText(GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    DWORD wait = WaitForSingleObject(pi.hProcess, 180000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    if (wait != WAIT_OBJECT_0) {
+        message = L"The ViGEmBus installer did not finish in time.";
+        return false;
+    }
+    if (code != 0 && code != 3010) { // 3010: installed, a restart is needed
+        message = L"The ViGEmBus installer failed (exit code " + std::to_wstring(code) + L").";
+        return false;
+    }
+    MarkAddedByPadDisplay(kAddedVigem, true); // it was not on this PC before: the uninstaller may take it away again
+    for (int i = 0; i < 50 && QueryVigem() != VddState::Ready; ++i) Sleep(200);
+    VddState s = QueryVigem();
+    message = s == VddState::Ready ? (code == 3010 ? L"Game controller driver installed. Restart Windows to finish."
+                                                   : L"Game controller driver installed.")
+                                   : std::wstring(L"ViGEmBus was installed, but is ") + VddStateText(s) + L".";
+    LOGI("vigem: %s", Narrow(message).c_str());
+    return s == VddState::Ready;
+}
+
+namespace {
+// ViGEmBus registers as a Windows Installer product. Returns its product code ("{...}"), or nothing if it is not installed that way.
+std::wstring VigemProductCode() {
+    for (REGSAM view : {KEY_WOW64_64KEY, KEY_WOW64_32KEY}) {
+        HKEY products = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", 0, KEY_READ | view, &products) != ERROR_SUCCESS) continue;
+        std::wstring code;
+        wchar_t product[256];
+        for (DWORD i = 0, length = 256; code.empty() && RegEnumKeyExW(products, i, product, &length, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+             ++i, length = 256) {
+            wchar_t name[256] = {};
+            DWORD size = sizeof(name);
+            if (product[0] == L'{' && RegGetValueW(products, product, L"DisplayName", RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS &&
+                wcscmp(name, L"ViGEm Bus Driver") == 0)
+                code = product;
+        }
+        RegCloseKey(products);
+        if (!code.empty()) return code;
+    }
+    return {};
+}
+} // namespace
+
+bool RemoveVigem(std::wstring& message) {
+    const std::wstring product = VigemProductCode();
+    if (product.empty()) {
+        message = L"ViGEmBus is not installed as a program, so there was nothing to remove.";
+        MarkAddedByPadDisplay(kAddedVigem, false);
+        return true;
+    }
+    DWORD code = 1;
+    RunCapture(L"\"" + SystemProgram(L"msiexec.exe") + L"\" /x " + product + L" /qn /norestart", 180000, &code);
+    const bool removed = code == 0 || code == 3010; // 3010: removed, a restart finishes it
+    message = !removed ? L"Windows Installer could not remove ViGEmBus (exit code " + std::to_wstring(code) + L")."
+                       : code == 3010 ? L"Game controller driver removed. Restart Windows to finish." : L"Game controller driver removed.";
+    LOGI("vigem: %s", Narrow(message).c_str());
+    if (removed) MarkAddedByPadDisplay(kAddedVigem, false);
+    return removed;
+}
+
 bool EnableVigem() {
     DWORD code = 1;
     RunCapture(L"schtasks.exe /run /tn \"" + std::wstring(kTaskGamepadOn) + L"\"", 10000, &code);
     LOGI("vigem: switch-on task %s", code == 0 ? "started" : "is not registered (run the admin setup from the tray)");
     return code == 0;
+}
+
+namespace {
+// The files the 64-bit Windows 10/11 install uses must be exactly the shipped ones before VB-Audio's installer runs.
+const struct { const wchar_t* file; const char* sha256; bool signedFile; } kCableFiles[] = {
+    {L"VBCABLE_Setup_x64.exe", "734c35dfa6d98f48782a451633ceb471166ec70d60482fd89a1123d0ee3c4f41", true},
+    {L"vbaudio_cable64_win10.sys", "f01344602472f1b527de5ee98f18987c03db48fea444e457d061e937f1d531d5", false},
+    {L"vbaudio_cable64_win10.cat", "0a921ebadbe39cf3fa7c14ff37d1ca22565a9651244bd3ac177dc810bc99072e", false},
+    {L"vbMmeCable64_win10.inf", "61c857be74831cc299d9be62f8d49d137f14063454fc54f859d5bc9b4b813daf", false},
+};
+
+// Copies the package into a folder only administrators can change, so the hashes checked next are the files that then run.
+bool StageCablePackage(const PrivateFolder& stage, const std::wstring& driverDir, std::wstring& message) {
+    for (const auto& f : kCableFiles) {
+        if (stage.Copy(driverDir + L"\\" + f.file, f.file)) continue;
+        const DWORD error = GetLastError();
+        message = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? L"VB-CABLE is missing from this PadDisplay: " + driverDir + L"\\" + f.file
+                                                                                  : L"Could not prepare VB-CABLE: " + LastErrorText(error);
+        return false;
+    }
+    return true;
+}
+
+bool VerifyCablePackage(const std::wstring& driverDir, std::wstring& message) {
+    for (const auto& f : kCableFiles) {
+        const std::wstring path = driverDir + L"\\" + f.file;
+        std::string hex;
+        if (!Sha256Hex(path, hex) || hex != f.sha256) {
+            message = std::wstring(L"The VB-CABLE file ") + f.file + L" is not the one PadDisplay shipped, so the installer was not run.";
+            LOGI("cable: hash mismatch for %ls (%s)", f.file, hex.c_str());
+            return false;
+        }
+        if (f.signedFile && !HasValidSignature(path)) {
+            message = std::wstring(L"The signature of ") + f.file + L" is not valid, so the installer was not run.";
+            return false;
+        }
+    }
+    return true;
+}
+
+// Runs VB-Audio's installer with its switches for unattended use: -i installs, -u uninstalls, -h hides its window.
+// bInheritHandles = FALSE: the installer must not inherit any handle of this process (see CLAUDE.md).
+bool RunCableSetup(const std::wstring& driverDir, const wchar_t* switches, std::wstring& message) {
+    std::wstring cmd = L"\"" + driverDir + L"\\VBCABLE_Setup_x64.exe\" " + switches;
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, driverDir.c_str(), &si, &pi)) {
+        message = L"Could not start the VB-CABLE installer: " + LastErrorText(GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    const DWORD wait = WaitForSingleObject(pi.hProcess, 180000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    LOGI("cable: installer %ls finished (wait %lu, exit code %lu)", switches, wait, code);
+    if (wait != WAIT_OBJECT_0) message = L"The VB-CABLE installer did not finish in time.";
+    return wait == WAIT_OBJECT_0;
+}
+} // namespace
+
+// VB-CABLE Pack45 (VB-Audio Software, donationware), unmodified. Its driver is signed by Microsoft's hardware publisher (WHQL),
+// so Windows installs it without asking about the publisher.
+bool InstallCable(const std::wstring& driverDir, std::wstring& message) {
+    std::wstring name;
+    if (CableInstalled(L"", &name)) {
+        message = L"VB-CABLE is already installed (" + name + L").";
+        return true;
+    }
+    PrivateFolder stage;
+    if (!stage || !StageCablePackage(stage, driverDir, message) || !VerifyCablePackage(stage.Path(), message) ||
+        !RunCableSetup(stage.Path(), L"-i -h", message))
+        return false;
+    MarkAddedByPadDisplay(kAddedCable, true); // it was not on this PC before: the uninstaller may take it away again
+    for (int i = 0; i < 150 && !CableInstalled(L"", &name); ++i) Sleep(200); // the device appears a moment after the installer ends
+    const bool present = CableInstalled(L"", &name);
+    message = present ? L"VB-CABLE installed. In your apps choose \"CABLE Output\" as the microphone."
+                      : L"VB-CABLE was installed, but its device has not appeared yet. Restart Windows to finish (VB-Audio's note).";
+    LOGI("cable: %s", Narrow(message).c_str());
+    return present;
+}
+
+bool RemoveCable(const std::wstring& driverDir, std::wstring& message) {
+    if (!CableInstalled(L"")) {
+        message = L"VB-CABLE is not installed.";
+        MarkAddedByPadDisplay(kAddedCable, false);
+        return true;
+    }
+    PrivateFolder stage;
+    if (!stage || !StageCablePackage(stage, driverDir, message) || !VerifyCablePackage(stage.Path(), message) ||
+        !RunCableSetup(stage.Path(), L"-u -h", message))
+        return false;
+    for (int i = 0; i < 100 && CableInstalled(L""); ++i) Sleep(200); // the device goes a moment after the installer ends
+    const bool gone = !CableInstalled(L"");
+    message = gone ? L"VB-CABLE removed." : L"VB-CABLE was uninstalled, but its device is still there. Restart Windows to finish.";
+    LOGI("cable: %s", Narrow(message).c_str());
+    MarkAddedByPadDisplay(kAddedCable, false);
+    return gone;
+}
+
+bool InstallMicDriver(const std::wstring& driverDir, std::wstring& message) {
+    const std::wstring inf = driverDir + L"\\padmic.inf";
+    if (GetFileAttributesW(inf.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        message = L"Microphone driver package not found: " + inf;
+        return false;
+    }
+    bool created = false;
+    HDEVINFO set = SetupDiGetClassDevsW(&kMediaClass, nullptr, nullptr, 0); // includes devices that are not present
+    SP_DEVINFO_DATA d{sizeof(d)};
+    if (set != INVALID_HANDLE_VALUE && FindDevice(set, d, kMicHardwareId)) {
+        ULONG status = 0, problem = 0;
+        if (CM_Get_DevNode_Status(&status, &problem, d.DevInst, 0) == CR_SUCCESS && problem == CM_PROB_DISABLED)
+            (void)(ChangeState(set, d, DICS_ENABLE, DICS_FLAG_GLOBAL) || ChangeState(set, d, DICS_ENABLE, DICS_FLAG_CONFIGSPECIFIC));
+        SetupDiDestroyDeviceInfoList(set);
+    } else {
+        if (set != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(set);
+        // Create the root-enumerated device (like "devcon install"), then bind the driver to it.
+        set = SetupDiCreateDeviceInfoList(&kMediaClass, nullptr);
+        if (set == INVALID_HANDLE_VALUE) {
+            message = L"SetupDiCreateDeviceInfoList: " + LastErrorText(GetLastError());
+            return false;
+        }
+        d = {sizeof(d)};
+        const wchar_t hwid[] = L"Root\\PadDisplayMic\0"; // REG_MULTI_SZ: the literal's own NUL plus this one
+        created = SetupDiCreateDeviceInfoW(set, L"MEDIA", &kMediaClass, L"PadDisplay Virtual Microphone", nullptr, DICD_GENERATE_ID, &d) &&
+                  SetupDiSetDeviceRegistryPropertyW(set, &d, SPDRP_HARDWAREID, reinterpret_cast<const BYTE*>(hwid), sizeof(hwid)) &&
+                  SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, &d);
+        if (!created) {
+            message = L"Could not create the microphone device: " + LastErrorText(GetLastError());
+            SetupDiDestroyDeviceInfoList(set);
+            return false;
+        }
+    }
+    BOOL reboot = FALSE;
+    if (!UpdateDriverForPlugAndPlayDevicesW(nullptr, kMicHardwareId, inf.c_str(), INSTALLFLAG_FORCE, &reboot)) {
+        const DWORD err = GetLastError();
+        if (created) SetupDiCallClassInstaller(DIF_REMOVE, set, &d); // leave no half-installed device behind
+        if (set != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(set);
+        message = L"Microphone driver install failed: " + LastErrorText(err) +
+                  L". A kernel driver must be signed by Microsoft when Secure Boot is on; if this build is not, Windows refuses it.";
+        LOGI("mic driver: %s", Narrow(message).c_str());
+        return false;
+    }
+    if (set != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(set);
+    VddState s = VddState::NotInstalled;
+    ULONG problem = 0;
+    std::wstring detail;
+    for (int i = 0; i < 30; ++i) {
+        s = QueryDevice(kMediaClass, kMicHardwareId, &detail, &problem);
+        if (s == VddState::Ready) break;
+        Sleep(200);
+    }
+    if (s == VddState::Ready) {
+        message = reboot ? L"Microphone driver installed. Restart Windows to finish." : L"Microphone driver installed.";
+        // The driver is only loaded while the tray's microphone option is on: these tasks let PadDisplay switch the device on
+        // and off without another administrator prompt (they can do nothing else, see CreateToggleTask).
+        std::wstring taskMessage;
+        if (!CreateToggleTask(kTaskMicOff, L"disable", L"PadDisplay microphone", kMicHardwareId, taskMessage) ||
+            !CreateToggleTask(kTaskMicOn, L"enable", L"PadDisplay microphone", kMicHardwareId, taskMessage))
+            message += L" (Switching it on and off from the tray will not work: " + taskMessage + L")";
+    }
+    else if (problem == CM_PROB_UNSIGNED_DRIVER)
+        message = L"Windows will not load the microphone driver: it is not signed by Microsoft (problem " + std::to_wstring(problem) + L").";
+    else message = std::wstring(L"The microphone driver was installed, but is ") + VddStateText(s) + L" (" + detail + L").";
+    LOGI("mic driver: %s", Narrow(message).c_str());
+    return s == VddState::Ready;
+}
+
+int MicRecorders() {
+    HANDLE dev = CreateFileW(PADMIC_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (dev == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        return (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) ? 0 : -1;
+    }
+    PADMIC_STATUS st{};
+    DWORD got = 0;
+    const bool ok = DeviceIoControl(dev, IOCTL_PADMIC_GET_STATUS, nullptr, 0, &st, sizeof(st), &got, nullptr) && got >= PADMIC_STATUS_V1_SIZE;
+    CloseHandle(dev);
+    return ok ? int(st.StreamsRunning) : -1;
+}
+
+bool MicRestartPending() {
+    HDEVINFO set = SetupDiGetClassDevsW(&kMediaClass, nullptr, nullptr, 0);
+    if (set == INVALID_HANDLE_VALUE) return false;
+    SP_DEVINFO_DATA d{sizeof(d)};
+    bool pending = false;
+    if (FindDevice(set, d, kMicHardwareId)) {
+        ULONG status = 0, problem = 0;
+        pending = CM_Get_DevNode_Status(&status, &problem, d.DevInst, 0) == CR_SUCCESS && (status & DN_NEED_RESTART) != 0;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return pending;
+}
+
+bool SetMicDriverEnabled(bool on, unsigned timeoutMs) {
+    const VddState want = on ? VddState::Ready : VddState::Disabled;
+    const VddState now = QueryMic();
+    if (now == want) return true;
+    if (now == VddState::NotInstalled) return false;
+    DWORD code = 1;
+    RunCapture(L"schtasks.exe /run /tn \"" + std::wstring(on ? kTaskMicOn : kTaskMicOff) + L"\"", 10000, &code);
+    if (code != 0) {
+        LOGI("mic driver: cannot start the %s task (%lu): run the repair from the tray", on ? "on" : "off", code);
+        return false;
+    }
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    while (GetTickCount64() < deadline) {
+        if (QueryMic() == want) {
+            LOGI("mic driver: %s", on ? "enabled (loaded)" : "disabled (not loaded)");
+            return true;
+        }
+        Sleep(100);
+    }
+    LOGI("mic driver: did not %s in time%s", on ? "come up" : "go away",
+         MicRestartPending() ? " (Windows is waiting for a restart to finish an earlier change to this device)" : "");
+    return false;
+}
+
+bool RemoveMicDriver(std::wstring& message) {
+    if (MicRecorders() > 0) { // see MicRecorders: removing the device under a recording leaves it stuck until a restart
+        message = L"An app is recording from the PadDisplay microphone right now. Close it (or switch its microphone to another device) and try again.";
+        LOGI("mic driver: %s", Narrow(message).c_str());
+        return false;
+    }
+    const bool removedDevice = RemoveDevice(kMediaClass, kMicHardwareId);
+    DeleteTask(kTaskMicOn);
+    DeleteTask(kTaskMicOff);
+    const int packages = DeleteDriverPackages("root\\paddisplaymic");
+    message = removedDevice || packages ? L"Microphone driver removed." : L"The microphone driver was not installed.";
+    LOGI("mic driver: %s (device %s, %d package(s))", Narrow(message).c_str(), removedDevice ? "removed" : "none", packages);
+    return true;
 }
 
 bool InstallVdd(const std::wstring& driverDir, std::wstring& message) {
@@ -329,6 +910,22 @@ bool InstallVdd(const std::wstring& driverDir, std::wstring& message) {
     return true;
 }
 
+void RemoveToggleTasks() {
+    for (const wchar_t* task : {kTaskOn, kTaskOff, kTaskGamepadOn, kTaskMicOn, kTaskMicOff}) DeleteTask(task);
+}
+
+bool RemoveVdd(std::wstring& message) {
+    const bool removedDevice = RemoveDevice(kDisplayClass, kHardwareId);
+    const int packages = DeleteDriverPackages("root\\mttvdd");
+    DeleteSettingsFile();
+    const bool gone = QueryVdd() == VddState::NotInstalled;
+    message = !gone ? L"The virtual monitor driver could not be removed." : removedDevice || packages ? L"Virtual monitor driver removed."
+                                                                                                    : L"The virtual monitor driver was not installed.";
+    LOGI("vdd: %s (device %s, %d package(s))", Narrow(message).c_str(), removedDevice ? "removed" : "none", packages);
+    if (gone) MarkAddedByPadDisplay(kAddedMonitor, false);
+    return gone;
+}
+
 namespace {
 bool InstallDriver(const std::wstring& driverDir, std::wstring& message) {
     std::wstring inf = driverDir + L"\\MttVDD.inf";
@@ -336,7 +933,8 @@ bool InstallDriver(const std::wstring& driverDir, std::wstring& message) {
         message = L"Driver package not found: " + inf;
         return false;
     }
-    if (!EnsureSettingsFile()) {
+    bool wroteSettings = false;
+    if (!EnsureSettingsFile(&wroteSettings)) {
         message = L"Could not write " + VddSettingsPath();
         return false;
     }
@@ -378,6 +976,7 @@ bool InstallDriver(const std::wstring& driverDir, std::wstring& message) {
     if (!ok) {
         message = L"Could not create the device: " + LastErrorText(GetLastError());
         SetupDiDestroyDeviceInfoList(set);
+        if (wroteSettings) DeleteSettingsFile();
         return false;
     }
     BOOL reboot = FALSE;
@@ -385,8 +984,9 @@ bool InstallDriver(const std::wstring& driverDir, std::wstring& message) {
         DWORD err = GetLastError();
         SetupDiCallClassInstaller(DIF_REMOVE, set, &d);
         SetupDiDestroyDeviceInfoList(set);
-        message = L"Driver install failed: " + LastErrorText(err);
+        message = L"Driver install failed: " + InstallErrorText(err);
         LOGI("vdd: %s", Narrow(message).c_str());
+        if (wroteSettings) DeleteSettingsFile(); // nothing of a failed install stays behind
         return false;
     }
     SetupDiDestroyDeviceInfoList(set);
@@ -396,6 +996,7 @@ bool InstallDriver(const std::wstring& driverDir, std::wstring& message) {
                                              : L"Virtual monitor driver installed.")
                                    : std::wstring(L"Installed, but the driver is ") + VddStateText(s);
     LOGI("vdd: %s", Narrow(message).c_str());
+    MarkAddedByPadDisplay(kAddedMonitor, true); // the device did not exist before: the uninstaller may take it away again
     return s == VddState::Ready;
 }
 } // namespace

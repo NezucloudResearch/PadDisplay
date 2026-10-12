@@ -52,16 +52,16 @@ int16_t ToS16(float v) { return int16_t(std::clamp(v, -1.f, 1.f) * 32767.f); }
 
 } // namespace
 
-AudioSession::AudioSession(SOCKET sock, bool mutePc) : sock_(sock), mutePc_(mutePc) {}
+AudioSession::AudioSession(Conn conn, bool mutePc) : conn_(std::move(conn)), mutePc_(mutePc) {}
 
 AudioSession::~AudioSession() {
     Stop();
-    closesocket(sock_);
+    closesocket(conn_.s);
 }
 
 void AudioSession::Stop() {
     stop_ = true;
-    shutdown(sock_, SD_BOTH);
+    shutdown(conn_.s, SD_BOTH);
 }
 
 void AudioSession::Run() {
@@ -69,9 +69,9 @@ void AudioSession::Run() {
     MakeRealtimeThread(L"Audio");
     // Small send buffer: if the network backs up we drop audio instead of queueing it (latency cap).
     int sndbuf = 32 * 1024;
-    setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&sndbuf), sizeof(sndbuf));
+    setsockopt(conn_.s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&sndbuf), sizeof(sndbuf));
     DWORD sendTimeout = 200; // a stalled network must not hold the capture (and the PC mute) open
-    setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&sendTimeout), sizeof(sendTimeout));
+    setsockopt(conn_.s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&sendTimeout), sizeof(sendTimeout));
     while (!stop_ && !PeerClosed()) {
         if (!Stream()) break;
         Sleep(500); // default device changed or was lost: pick up the new one
@@ -84,11 +84,11 @@ void AudioSession::Run() {
 bool AudioSession::PeerClosed() {
     fd_set rs;
     FD_ZERO(&rs);
-    FD_SET(sock_, &rs);
+    FD_SET(conn_.s, &rs);
     timeval none{0, 0};
     if (select(0, &rs, nullptr, nullptr, &none) == 0) return false;
     char c;
-    return recv(sock_, &c, 1, MSG_PEEK) <= 0;
+    return recv(conn_.s, &c, 1, MSG_PEEK) <= 0;
 }
 
 bool AudioSession::Stream() {
@@ -130,7 +130,7 @@ bool AudioSession::Stream() {
     wr32(format, rate);
     format[4] = 2;  // channels sent
     format[5] = 16; // bits per sample
-    bool ok = SendMsg(sock_, Msg::AudioFormat, format, sizeof(format));
+    bool ok = SendMsg(conn_, Msg::AudioFormat, format, sizeof(format));
     LOGI("audio: streaming %u Hz, %d ch -> stereo s16%s", rate, channels, mutePc_ ? " (PC muted)" : "");
     client->Start();
 
@@ -181,10 +181,10 @@ bool AudioSession::Stream() {
         // Latency cap: only send if the socket can take it right now; otherwise drop this packet.
         fd_set ws;
         FD_ZERO(&ws);
-        FD_SET(sock_, &ws);
+        FD_SET(conn_.s, &ws);
         timeval zero{0, 0};
         if (select(0, nullptr, &ws, nullptr, &zero) == 1) {
-            ok = SendMsg(sock_, Msg::AudioData, packet.data(), uint32_t(packet.size()));
+            ok = SendMsg(conn_, Msg::AudioData, packet.data(), uint32_t(packet.size()));
             ++sentPackets_;
         } else {
             ++droppedPackets_;

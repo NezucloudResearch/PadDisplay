@@ -18,10 +18,12 @@ import java.util.concurrent.TimeUnit
 /**
  * TCP link to the host. A reader thread parses host messages and calls [Listener] on that
  * thread; outgoing messages are queued and written by a writer thread (safe from the UI thread).
+ * With a [trust] (every connection except USB) the link is TLS, pinned to the PC's certificate.
  */
-class Connection(private val host: String, private val port: Int, private val listener: Listener) {
+class Connection(private val host: String, private val port: Int, private val trust: HostTrust?, private val listener: Listener) {
 
     interface Listener {
+        fun onFingerprintChanged(fingerprint: String)
         fun onHostHello(codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int)
         fun onConfig(data: ByteArray, length: Int)
         fun onFrame(ptsUs: Long, keyframe: Boolean, data: ByteArray, offset: Int, length: Int)
@@ -34,10 +36,13 @@ class Connection(private val host: String, private val port: Int, private val li
 
     companion object {
         private const val TAG = "PadConn"
+        // An older PadDisplay on the PC treats the TLS hello as garbage and hangs up, which looks like any other handshake failure.
+        const val HANDSHAKE_FAILED = "Could not make a secure connection. If PadDisplay on the PC is older than this app, update it there."
     }
 
     private val queue = LinkedBlockingQueue<ByteArray>()
     @Volatile private var socket: Socket? = null
+    @Volatile private var rawSocket: Socket? = null // the TCP socket under the TLS one
     @Volatile private var closed = false
     private var reader: Thread? = null
     private var writer: Thread? = null
@@ -55,23 +60,35 @@ class Connection(private val host: String, private val port: Int, private val li
 
     fun close() {
         closed = true
-        try { socket?.close() } catch (_: IOException) {}
+        Tls.hangUp(rawSocket) // this runs on the UI thread
         writer?.interrupt()
     }
 
     private fun readLoop(hello: ByteArray) {
         var reason: String? = null
+        var handshaking = false
         try {
-            val s = Socket()
-            socket = s
-            s.tcpNoDelay = true
-            s.trafficClass = 0xA0 // DSCP CS5 -> Wi-Fi WMM video access category
-            s.receiveBufferSize = 1 shl 20
-            s.sendBufferSize = 64 shl 10
-            s.soTimeout = 10_000 // host pings every 500 ms
+            val raw = Socket()
+            rawSocket = raw
+            socket = raw
+            raw.tcpNoDelay = true
+            raw.trafficClass = 0xA0 // DSCP CS5 -> Wi-Fi WMM video access category
+            raw.receiveBufferSize = 1 shl 20
+            raw.sendBufferSize = 64 shl 10
+            raw.soTimeout = 10_000 // host pings every 500 ms
             val t0 = SystemClock.elapsedRealtime()
-            s.connect(InetSocketAddress(host, port), 3000)
+            raw.connect(InetSocketAddress(host, port), 3000)
             Log.i(TAG, "connected to $host:$port in ${SystemClock.elapsedRealtime() - t0} ms")
+            if (closed) return
+            val s: Socket = if (trust != null) {
+                val t1 = SystemClock.elapsedRealtime()
+                handshaking = true
+                val ssl = Tls.wrap(raw, host, port, trust)
+                handshaking = false
+                socket = ssl
+                Log.i(TAG, "TLS ${ssl.session.protocol} ${ssl.session.cipherSuite} in ${SystemClock.elapsedRealtime() - t1} ms")
+                ssl
+            } else raw
             if (closed) return
             s.getOutputStream().apply { write(hello); flush() }
             writer = Thread({ writeLoop(s) }, "pd-writer").apply { start() }
@@ -93,6 +110,8 @@ class Connection(private val host: String, private val port: Int, private val li
                     pb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
                 }
                 input.readFully(payload, 0, len)
+                // Anything but an error means the PC accepted the PIN, so this is the PC to remember.
+                if (firstMessage && type != Protocol.ERROR) trust?.confirm()
                 if (firstMessage || (firstFrame && type == Protocol.FRAME)) {
                     Log.i(TAG, "first ${if (type == Protocol.FRAME) "frame" else "message 0x%02x".format(type)} " +
                         "${SystemClock.elapsedRealtime() - t0} ms after connect")
@@ -132,10 +151,18 @@ class Connection(private val host: String, private val port: Int, private val li
                 }
             }
         } catch (e: IOException) {
-            if (!closed) reason = e.message ?: e.javaClass.simpleName
+            val changed = Tls.fingerprintChange(e)
+            if (changed != null) {
+                // Not a failure to retry: the user has to decide whether this is still their PC.
+                closed = true
+                listener.onFingerprintChanged(changed.seen)
+            } else if (!closed) {
+                reason = if (handshaking) HANDSHAKE_FAILED else e.message ?: e.javaClass.simpleName
+            }
             Log.w(TAG, "connection ended: $e")
         } finally {
             closed = true
+            try { rawSocket?.close() } catch (_: IOException) {}
             try { socket?.close() } catch (_: IOException) {}
             writer?.interrupt()
             listener.onClosed(reason)

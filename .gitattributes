@@ -11,3 +11,6 @@ android/gradlew text eol=lf
 *.dll binary
 *.cat binary
 *.png binary
+
+# VB-CABLE is shipped exactly as VB-Audio built it: signed files must stay byte for byte
+host/driver/vbcable/** -text

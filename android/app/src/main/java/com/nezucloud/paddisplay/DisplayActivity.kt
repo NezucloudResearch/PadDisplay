@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 package com.nezucloud.paddisplay
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -21,6 +24,7 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -37,6 +41,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         const val EXTRA_ERROR = "error"
         const val RESULT_BAD_PIN = 2
         const val RESULT_FAILED = 3
+        const val RESULT_FINGERPRINT_CHANGED = 4 // EXTRA_ERROR carries the fingerprint the PC showed this time
         private const val SCANCODE_F24 = 0x76
     }
 
@@ -47,12 +52,31 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private lateinit var gamepads: Gamepads
     private var deviceInput = true    // forward the keyboard, mouse and controllers connected to the tablet
     private var mouseCapture = false  // the mouse sends raw movement (games) instead of pointing at the picture
-    private var decoder: VideoDecoder? = null
+    private var grabShortcuts = true  // also take the keys Android reserves for itself (needs ShortcutService)
+    private val pressed = BooleanArray(0x200) // PC scancodes sent as down and not yet up, lifted if focus is lost mid-chord
+    private var repeatCode = 0
+    private var hostReady = false     // the PC has sent its hello: the connection is live
+    @Volatile private var decoder: VideoDecoder? = null // null while another app is in front: frames are acked and dropped
     private var connection: Connection? = null
     private var audio: AudioStream? = null
+    private var mic: MicStream? = null
+    private var cam: CameraStream? = null
+    private var hostTrust: HostTrust? = null       // shared by the video, audio, microphone and camera connections
+    private var mediaStarted = false
+    private var micOn = false
+    private var camOn = false
+    private lateinit var mediaBadge: TextView
     private var showStats = false
     private var wifiLock: WifiManager.WifiLock? = null
     private var refreshHz = 60
+    private var keepInBackground = true // the session outlives the picture while another app is in front (SessionService)
+    private var serviceStarted = false
+    // What the decoder was started with, to start a new one on the new surface when the picture comes back. The PC sends
+    // its parameter sets once per stream, not with every keyframe. Taken only on hello, parameter sets and surface changes.
+    private val streamLock = Any()
+    private var streamCodec = 0
+    private var streamFps = 0
+    private var streamConfig: ByteArray? = null
 
     @Volatile private var videoW = 0
     @Volatile private var videoH = 0
@@ -77,18 +101,33 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             if (mode != null) preferredDisplayModeId = mode.modeId
         }
         showStats = prefs.getBoolean("stats", false)
+        keepInBackground = prefs.getBoolean("background", true)
 
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this)
         root.addView(surfaceView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        val ui = Ui(this)
         stats = TextView(this).apply {
             setTextColor(Color.WHITE)
-            setBackgroundColor(0x88000000.toInt())
+            background = ui.pill(0xB0101418.toInt())
             textSize = 12f
-            setPadding(12, 6, 12, 6)
+            typeface = Typeface.MONOSPACE
+            setPadding(ui.dp(12), ui.dp(6), ui.dp(12), ui.dp(6))
             text = "Connecting…"
         }
-        root.addView(stats, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
+        root.addView(stats, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START)
+            .apply { setMargins(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12)) })
+        // Shown whenever this tablet's microphone or camera is actually capturing, so it is never silent.
+        mediaBadge = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            background = ui.pill(0xE0B3261E.toInt())
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(ui.dp(14), ui.dp(6), ui.dp(14), ui.dp(6))
+            visibility = View.GONE
+        }
+        root.addView(mediaBadge, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END)
+            .apply { setMargins(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12)) })
         setContentView(root)
         hideSystemUi()
 
@@ -99,6 +138,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         surfaceView.holder.addCallback(this)
 
         deviceInput = prefs.getBoolean("deviceInput", true)
+        grabShortcuts = prefs.getBoolean("grabShortcuts", true)
         mouseCapture = deviceInput && prefs.getBoolean("mouseCapture", false)
         input.deviceInput = deviceInput
         gamepads = Gamepads(this) { msg -> connection?.send(msg) }
@@ -126,10 +166,20 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         if (hasFocus) {
             hideSystemUi()
             applyMouseCapture() // Android drops the capture whenever the window loses focus
+            attachKeys()
+        } else {
+            // Another window has the keyboard now: stop asking for keys, and let go of the ones the PC thinks are held.
+            KeyRouter.detach()
+            releaseAllKeys()
         }
     }
 
     // ---- keyboard, mouse and game controllers connected to the tablet ---------------------
+
+    /** Ask for the keys Android reserves for itself, only while the picture has focus and the PC has answered. */
+    private fun attachKeys() {
+        if (hostReady && deviceInput && grabShortcuts && hasWindowFocus()) KeyRouter.attach { ev -> forwardKey(ev, true) }
+    }
 
     private fun applyMouseCapture() {
         if (mouseCapture) surfaceView.requestPointerCapture() else surfaceView.releasePointerCapture()
@@ -148,8 +198,12 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean =
         (deviceInput && gamepads.onMotion(ev)) || super.dispatchGenericMotionEvent(ev)
 
-    /** true = the key went to the PC (or was used here), so Android must not act on it. */
-    private fun forwardKey(ev: KeyEvent): Boolean {
+    /**
+     * true = the key went to the PC (or was used here), so Android must not act on it.
+     * [fromService]: the key came through ShortcutService, before Android's own handling. Android then
+     * generates no auto-repeat for it, so it is made here (the PC does not repeat injected keys itself).
+     */
+    private fun forwardKey(ev: KeyEvent, fromService: Boolean = false): Boolean {
         if (gamepads.onKey(ev)) return true
         // A mouse's side buttons also arrive as Back/Forward keys. They are sent as mouse buttons.
         if (ev.isFromSource(InputDevice.SOURCE_MOUSE) || ev.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE))
@@ -173,10 +227,42 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             return true
         }
         sendKey(code, down) // repeats too: Windows does not repeat an injected key by itself
+        if (fromService) {
+            if (down && code !in noRepeat) {
+                repeatCode = code
+                root.removeCallbacks(repeater)
+                root.postDelayed(repeater, ViewConfiguration.getKeyRepeatTimeout().toLong())
+            } else if (!down && code == repeatCode) {
+                stopRepeat()
+            }
+        }
         return true
     }
 
+    // Held modifiers and lock keys are not repeated, as on a real keyboard.
+    private val noRepeat = intArrayOf(0x1D, 0x2A, 0x36, 0x38, 0x3A, 0x45, 0x46, Protocol.KEY_EXTENDED or 0x1D,
+        Protocol.KEY_EXTENDED or 0x38, Protocol.KEY_EXTENDED or 0x5B, Protocol.KEY_EXTENDED or 0x5C, Protocol.KEY_PAUSE)
+
+    private val repeater = object : Runnable {
+        override fun run() {
+            if (repeatCode == 0) return
+            sendKey(repeatCode, true)
+            root.postDelayed(this, ViewConfiguration.getKeyRepeatDelay().toLong())
+        }
+    }
+
+    private fun stopRepeat() {
+        repeatCode = 0
+        root.removeCallbacks(repeater)
+    }
+
+    private fun releaseAllKeys() {
+        stopRepeat()
+        for (c in pressed.indices) if (pressed[c]) sendKey(c, false)
+    }
+
     private fun sendKey(code: Int, down: Boolean) {
+        if (code in pressed.indices) pressed[code] = down
         connection?.send(Protocol.message(Protocol.KEY, 3) {
             it.put((if (down) Protocol.KEY_DOWN else 0).toByte())
             it.putShort(code.toShort())
@@ -186,6 +272,14 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     // ---- surface lifecycle drives the connection ------------------------------------------
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        setFrameRate(holder)
+        root.removeCallbacks(statsTick)
+        root.post(statsTick)
+        if (connection != null) {
+            // Back from the background: the session kept running without a picture, so only the decoder is new.
+            attachDecoder(holder.surface)
+            return
+        }
         decoder = VideoDecoder(holder.surface)
         val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
         val port = intent.getIntExtra(EXTRA_PORT, Protocol.TCP_PORT)
@@ -199,25 +293,70 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_H264))) mask = mask or Protocol.MASK_H264
         if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_HEVC))) mask = mask or Protocol.MASK_HEVC
         if (mask == 0) mask = Protocol.MASK_H264
-        if (Build.VERSION.SDK_INT >= 30) {
-            try {
-                holder.surface.setFrameRate(refreshHz.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
-            } catch (e: Exception) {
-                Log.w("PadDisplay", "setFrameRate: $e")
-            }
-        }
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         var flags = 0
         if (prefs.getBoolean("gamingMode", false)) flags = flags or Protocol.HELLO_GAMING_MODE
         if (prefs.getBoolean("onlyScreen", false)) flags = flags or Protocol.HELLO_ONLY_SCREEN
         val hello = Protocol.clientHello(w, h, metrics.densityDpi, mask, pin, refreshHz, flags, "${Build.MANUFACTURER} ${Build.MODEL}")
         gotFirstFrame = false
-        if (host != "127.0.0.1" && host != "localhost") acquireWifiLock()
-        connection = Connection(host, port, this).also { it.start(hello) }
+        if (!Tls.isLoopback(host)) acquireWifiLock()
+        // Everything but USB (the loopback tunnel never touches the network) is encrypted and pinned to the PC's certificate.
+        val trust = if (Tls.isLoopback(host)) null else HostTrust(prefs, host)
+        hostTrust = trust
+        mediaStarted = false
+        connection = Connection(host, port, trust, this).also { it.start(hello) }
         if (prefs.getBoolean("audio", false)) {
-            audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true)).also { it.start() }
+            audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true), trust).also { it.start() }
         }
-        root.post(statsTick)
+        if (keepInBackground) {
+            val granted = { permission: String -> checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED }
+            SessionService.onDisconnect = { finish() }
+            serviceStarted = true
+            SessionService.start(this, host, prefs.getBoolean("micToPc", false) && granted(Manifest.permission.RECORD_AUDIO),
+                prefs.getBoolean("camToPc", false) && granted(Manifest.permission.CAMERA))
+        }
+    }
+
+    private fun setFrameRate(holder: SurfaceHolder) {
+        if (Build.VERSION.SDK_INT < 30) return
+        try {
+            holder.surface.setFrameRate(refreshHz.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        } catch (e: Exception) {
+            Log.w("PadDisplay", "setFrameRate: $e")
+        }
+    }
+
+    /**
+     * A new decoder on the new surface, set up as the last one was. Frames up to the next keyframe cannot be decoded
+     * (the PC never sends one by itself), so one is asked for right away. Runs on the UI thread once per return
+     * from the background; the reader thread keeps acking frames meanwhile and only waits if a hello comes in now.
+     */
+    private fun attachDecoder(surface: Surface) {
+        val d = VideoDecoder(surface)
+        try {
+            synchronized(streamLock) {
+                if (streamCodec != 0) {
+                    d.configure(streamCodec, videoW, videoH, streamFps)
+                    streamConfig?.let { d.queueConfig(it, it.size) }
+                }
+                decoder = d
+            }
+        } catch (e: Exception) {
+            d.release()
+            fail("Decoder error: ${e.message}")
+            return
+        }
+        lastKeyframeReq = 0L
+        requestKeyframe()
+    }
+
+    /** The surface is going away: the codec must let go of it before surfaceDestroyed returns. */
+    private fun detachDecoder() {
+        synchronized(streamLock) {
+            val d = decoder
+            decoder = null // the reader thread now acks and drops frames
+            d?.release()
+        }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
@@ -243,18 +382,44 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        root.removeCallbacks(statsTick)
+        if (keepInBackground && !isFinishing && connection != null) {
+            // Another app is in front, or the screen went off: only the picture stops. Audio, microphone, camera
+            // and the PC's virtual monitor stay as they are.
+            input.releaseMouseButtons()
+            detachDecoder()
+            return
+        }
+        closeSession()
+    }
+
+    private fun closeSession() {
+        hostReady = false
+        KeyRouter.detach()
+        releaseAllKeys()
         wifiLock?.release()
         wifiLock = null
-        root.removeCallbacks(statsTick)
-        audio?.close()
-        audio = null
-        connection?.close()
+        if (serviceStarted) {
+            serviceStarted = false
+            SessionService.onDisconnect = null
+            SessionService.stop(this)
+        }
+        // The picture's connection first: the PC puts its own screens back when that one ends. Each on its own, because
+        // one that throws must not leave the others open: the microphone and the camera would go on sending.
+        val closing = listOf<() -> Unit>({ connection?.close() }, { audio?.close() }, { mic?.close() }, { cam?.close() }, { decoder?.release() })
+        for (close in closing) {
+            try { close() } catch (e: Exception) { Log.e("PadDisplay", "closing the session", e) }
+        }
         connection = null
-        decoder?.release()
+        audio = null
+        mic = null
+        cam = null
         decoder = null
     }
 
     override fun onDestroy() {
+        closeSession() // ended while in the background, where the surface was already gone
+        KeyRouter.detach()
         input.release()
         gamepads.release()
         super.onDestroy()
@@ -262,24 +427,78 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     // ---- Connection.Listener (reader thread) -----------------------------------------------
 
+    // The microphone and camera connections open only once the PC has accepted the PIN on the video connection, so a wrong
+    // PIN is counted once and not once per connection, and only if the user switched them on and Android allows it.
+    private fun startMediaStreams() {
+        if (mediaStarted) return
+        mediaStarted = true
+        val host = intent.getStringExtra(EXTRA_HOST) ?: return
+        val port = intent.getIntExtra(EXTRA_PORT, Protocol.TCP_PORT)
+        val pin = intent.getIntExtra(EXTRA_PIN, 0)
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        val granted = { permission: String -> checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED }
+        runOnUiThread {
+            if (isFinishing || connection == null) return@runOnUiThread
+            if (prefs.getBoolean("micToPc", false)) {
+                if (granted(Manifest.permission.RECORD_AUDIO)) {
+                    mic = MicStream(host, port, pin, hostTrust, object : MicStream.Listener {
+                        override fun onMicState(active: Boolean) { micOn = active; runOnUiThread { updateBadge() } }
+                        override fun onMicNotice(message: String) { runOnUiThread { Toast.makeText(this@DisplayActivity, "Microphone: $message", Toast.LENGTH_LONG).show() } }
+                    }).also { it.start() }
+                } else {
+                    Toast.makeText(this, "Microphone: permission was taken away in Android's settings", Toast.LENGTH_LONG).show()
+                }
+            }
+            if (prefs.getBoolean("camToPc", false)) {
+                if (granted(Manifest.permission.CAMERA)) {
+                    cam = CameraStream(applicationContext, host, port, pin, hostTrust, prefs.getInt("camFacing", 1) == 1, prefs.getInt("camQuality", 720) != 1080,
+                        object : CameraStream.Listener {
+                            override fun onCameraState(streaming: Boolean) { camOn = streaming; runOnUiThread { updateBadge() } }
+                            override fun onCameraNotice(message: String) { runOnUiThread { Toast.makeText(this@DisplayActivity, "Camera: $message", Toast.LENGTH_LONG).show() } }
+                        }).also { it.start() }
+                } else {
+                    Toast.makeText(this, "Camera: permission was taken away in Android's settings", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun updateBadge() {
+        val parts = listOfNotNull(if (micOn) "Microphone on" else null, if (camOn) "Camera on" else null)
+        mediaBadge.text = "● " + parts.joinToString("  ·  ")
+        mediaBadge.visibility = if (parts.isEmpty()) View.GONE else View.VISIBLE
+        // The label can't be seen from another app; the notification says it there.
+        if (keepInBackground && connection != null) SessionService.update(this, intent.getStringExtra(EXTRA_HOST) ?: "", micOn, camOn)
+    }
+
     override fun onHostHello(codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int) {
+        startMediaStreams()
         videoW = width
         videoH = height
         hostKbps = bitrateKbps
         codecName = if (codec == Protocol.CODEC_HEVC) "HEVC" else "H.264"
         runOnUiThread {
+            hostReady = true
+            attachKeys()
             fitSurface()
             if (deviceInput) gamepads.announce()
         }
         try {
-            decoder?.configure(codec, width, height, fps)
+            synchronized(streamLock) {
+                streamCodec = codec
+                streamFps = fps
+                decoder?.configure(codec, width, height, fps)
+            }
         } catch (e: Exception) {
             fail("Decoder error: ${e.message}")
         }
     }
 
     override fun onConfig(data: ByteArray, length: Int) {
-        decoder?.queueConfig(data, length)
+        synchronized(streamLock) {
+            streamConfig = data.copyOf(length) // once per stream, not per frame
+            decoder?.queueConfig(data, length)
+        }
     }
 
     override fun onFrame(ptsUs: Long, keyframe: Boolean, data: ByteArray, offset: Int, length: Int) {
@@ -299,6 +518,13 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     override fun onPing(rttUs: Int, bitrateKbps: Int) {
         this.rttUs = rttUs
         hostKbps = bitrateKbps
+    }
+
+    override fun onFingerprintChanged(fingerprint: String) {
+        runOnUiThread {
+            setResult(RESULT_FINGERPRINT_CHANGED, Intent().putExtra(EXTRA_ERROR, fingerprint))
+            finish()
+        }
     }
 
     override fun onError(code: Int, message: String) {

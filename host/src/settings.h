@@ -22,7 +22,8 @@ struct Settings {
                                  // Chosen in the tablet app; this value is for apps older than protocol v3 and --dump
     bool drawCursor = true;
     bool matchClientResolution = true;
-    bool detachOnDisconnect = false;
+    bool monitorOnlyWhileConnected = true; // the virtual monitor (the driver device) is switched off while no tablet is connected, so Windows
+                                           // shows only the real screens; on when a tablet connects, off again when it leaves
     bool removeMonitorOnExit = true;
     bool gpuMaxPerformance = true;   // NVIDIA profile "prefer maximum performance" for PadDisplay.exe (set at install)
     bool profile = false;            // time GPU compose separately from encode (diagnostics; adds a GPU sync) // disable the virtual monitor when PadDisplay exits
@@ -32,6 +33,13 @@ struct Settings {
     bool runAsAdmin = false;      // start elevated: Windows only lets an elevated program send input to elevated windows (Task Manager...)
     bool autostartTask = false;   // "Start with Windows" is a scheduled task (starts elevated without a prompt), not a Run key
     bool requireUsbPin = true;   // USB (adb reverse) is reachable by any app on the tablet, so ask for the PIN there too
+    bool acceptTabletMic = true;     // let the tablet's microphone become a PC microphone (the tablet decides whether to send it)
+    std::wstring micBackend = L"auto"; // auto (PadDisplay's driver where Windows loads it, else VB-CABLE) | driver | cable
+    std::wstring micDevice;          // VB-CABLE backend: part of the playback device's name; empty = "CABLE Input"
+    bool cableMinPeriod = false;     // VB-CABLE backend: the audio engine's smallest period (IAudioClient3, about 35 ms less delay; measured to starve
+                                     // other threads on a 2-core VM, so off by default); off = the default 10 ms period
+    bool acceptTabletCamera = true;  // let the tablet's camera show up as the PC webcam (Windows 11)
+    bool requireEncryption = false; // refuse plain (unencrypted) connections that do not come over USB; off so tablet apps from before TLS still connect
     bool uacClickableOnTablet = false; // only-screen + elevated: move UAC prompts off the (uncapturable) secure desktop so the
                                        // tablet can show and click them. Machine-wide, security-relevant (SECURITY.md); off by default
 

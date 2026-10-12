@@ -99,7 +99,7 @@ bool GamepadBridge::Connect() {
     reported_ = true;
     LOGI("gamepad: ViGEmBus unavailable (0x%08x), driver %ls", unsigned(err), VddStateText(state));
     notice_(state == VddState::NotInstalled
-                ? "Game controllers need the ViGEmBus driver on the PC. Right-click the PadDisplay tray icon and choose 'Get game controller driver'."
+                ? "Game controllers need the ViGEmBus driver on the PC. Right-click the PadDisplay tray icon and choose 'Install game controller driver'."
             : state == VddState::Ready
                 ? "The game controller driver (ViGEmBus) on the PC did not respond. See the PadDisplay log."
                 : "The game controller driver (ViGEmBus) is switched off on the PC. Right-click the PadDisplay tray icon and choose 'Enable game controller driver'.");
