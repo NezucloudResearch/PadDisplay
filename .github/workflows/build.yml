@@ -45,6 +45,12 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # Drop the action's default 'tools' package: Google removed the legacy SDK "tools" package, so
+          # "sdkmanager tools" now fails. Gradle downloads the platform and build-tools it needs by itself
+          # under the licenses this action accepts. Keep the log quiet (it otherwise prints every license).
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Build APK
         working-directory: android
         run: |
