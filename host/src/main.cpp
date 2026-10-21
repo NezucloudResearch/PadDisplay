@@ -17,10 +17,12 @@
 #include "log.h"
 #include "micbackend.h"
 #include "net.h"
+#include "service.h"
 #include "session.h"
 #include "settings.h"
 #include "setup.h"
 #include "gpu_profile.h"
+#include "gpu_select.h"
 #include "uacrelay.h"
 #include "vcam.h"
 #include "vdd.h"
@@ -28,7 +30,9 @@
 #include <windows.h>
 #include <mfapi.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
 #include <sddl.h>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -48,14 +52,17 @@ constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_STATUS = WM_APP + 2;
 constexpr UINT WM_DRIVER_DONE = WM_APP + 3; // wParam = success
 constexpr UINT WM_MIC_SETUP = WM_APP + 4;   // wParam 1 = ask now (the user ticked the option), 0 = the tablet asked: a balloon first
+constexpr UINT WM_GPU_RESTART = WM_APP + 5; // the tablet has left and the GPU choice is waiting to be applied
 
 enum MenuIdDriver : UINT { ID_DRIVER = 50, ID_GET_VIGEM, ID_ENABLE_VIGEM, ID_SETUP_CAMERA, ID_ACCEPT_MIC, ID_ACCEPT_CAM, ID_SETUP_MIC, ID_REMOVE_MIC, ID_SETUP_CABLE, ID_ABOUT_CABLE };
 
 enum MenuId : UINT {
     ID_EXIT = 100, ID_OPEN_LOG, ID_OPEN_FOLDER, ID_ADAPTIVE, ID_CURSOR, ID_MATCH_RES, ID_DETACH, ID_AUTOSTART, ID_ADMIN, ID_UAC_CLICK,
+    ID_LOCK_SCREEN, ID_PRESIGNIN,
     ID_CODEC_AUTO = 200, ID_CODEC_HEVC, ID_CODEC_H264,
     ID_USB_RATE = 300,  // + Mbps
     ID_WIFI_RATE = 400, // + Mbps
+    ID_GPU_AUTO = 500, ID_GPU_FIRST,      // ID_GPU_FIRST + index into ListEncodeGpus()
 };
 
 Settings g_settings;
@@ -73,6 +80,7 @@ bool g_balloonAboutMic = false;  // the balloon on screen offers to set up the t
 bool g_balloonAboutGamepad = false;
 bool g_restartAfterInstall = false;
 bool g_monitorRemoved = false;
+bool g_gpuRestartPending = false; // the GPU choice changed while a tablet was connected: restart (to apply it) once it has left
 bool g_handedOver = false; // another PadDisplay (with or without admin rights) takes over: leave the virtual monitor on for it
 std::atomic<int> g_setupIncomplete{-1}; // -1 unknown (checked on a worker thread), 0 complete, 1 needs the admin run
 
@@ -251,6 +259,7 @@ HICON MakeIcon() {
 }
 
 bool EnsureGpuPreference(const std::wstring& gdiName);
+bool TabletConnected();
 bool GpuPreferenceStored();
 
 void SetStatus(const std::wstring& s) {
@@ -261,9 +270,14 @@ void SetStatus(const std::wstring& s) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_STATUS, 0, 0);
 }
 
+bool IsElevated();
+
 void ApplySettings() {
     g_settings.Save();
     if (g_server) g_server->UpdateSettings(g_settings);
+    // Keep the service's machine-readable config (PIN + stream settings) in step while pre-sign-in access
+    // is on, so the sign-in-screen host uses the current PIN. Needs the admin rights that wrote the file.
+    if (g_settings.preSignInAccess && IsElevated()) SyncMachineConfig(g_settings);
 }
 
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -519,6 +533,19 @@ void ShowMenu(HWND hwnd) {
     AppendMenuW(codec, MF_STRING | (g_settings.codec == L"hevc" ? MF_CHECKED : 0), ID_CODEC_HEVC, L"HEVC");
     AppendMenuW(codec, MF_STRING | (g_settings.codec == L"h264" ? MF_CHECKED : 0), ID_CODEC_H264, L"H.264");
     AppendMenuW(m, MF_POPUP, UINT_PTR(codec), L"Codec");
+    const std::vector<EncodeGpu> gpus = ListEncodeGpus();
+    if (gpus.size() > 1) {
+        const bool named = std::any_of(gpus.begin(), gpus.end(), [](const EncodeGpu& g) { return _wcsicmp(g.name.c_str(), g_settings.gpu.c_str()) == 0; });
+        HMENU gpuMenu = CreatePopupMenu();
+        AppendMenuW(gpuMenu, MF_STRING | (!named ? MF_CHECKED : 0), ID_GPU_AUTO, L"Auto (the integrated GPU when gaming or on battery, else the fastest)");
+        for (size_t i = 0; i < gpus.size(); ++i) {
+            const bool on = _wcsicmp(g_settings.gpu.c_str(), gpus[i].name.c_str()) == 0;
+            AppendMenuW(gpuMenu, MF_STRING | (on ? MF_CHECKED : 0), ID_GPU_FIRST + UINT(i), (gpus[i].name + L" (" + EncoderName(gpus[i].vendorId) + L")").c_str());
+        }
+        AppendMenuW(gpuMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(gpuMenu, MF_STRING | MF_GRAYED, 0, L"A new choice restarts PadDisplay once (after the tablet disconnects)");
+        AppendMenuW(m, MF_POPUP, UINT_PTR(gpuMenu), L"Encode on");
+    }
     AppendMenuW(m, MF_STRING | (g_settings.adaptive ? MF_CHECKED : 0), ID_ADAPTIVE, L"Adaptive bitrate");
     AppendMenuW(m, MF_STRING | (g_settings.drawCursor ? MF_CHECKED : 0), ID_CURSOR, L"Show mouse cursor on tablet");
     AppendMenuW(m, MF_STRING | (g_settings.matchClientResolution ? MF_CHECKED : 0), ID_MATCH_RES, L"Match tablet resolution");
@@ -528,9 +555,14 @@ void ShowMenu(HWND hwnd) {
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_STRING | (IsElevated() ? MF_CHECKED : 0), ID_ADMIN, L"Run as administrator (touch and keys reach Task Manager)");
     // Only works elevated (it writes a machine policy and must inject into the elevated prompt), so only offer it then.
-    if (IsElevated())
+    if (IsElevated()) {
         AppendMenuW(m, MF_STRING | (g_settings.uacClickableOnTablet ? MF_CHECKED : 0), ID_UAC_CLICK,
                     L"Let the tablet answer UAC prompts in only-screen mode (less secure)");
+        AppendMenuW(m, MF_STRING | (g_settings.lockScreenControl ? MF_CHECKED : 0), ID_LOCK_SCREEN,
+                    L"Let the tablet see and sign in to the lock screen (types your password)");
+        AppendMenuW(m, MF_STRING | (LogonServiceInstalled() ? MF_CHECKED : 0), ID_PRESIGNIN,
+                    L"Reach the sign-in screen before anyone signs in (installs a service, Wi-Fi only)");
+    }
     AppendMenuW(m, MF_STRING, ID_OPEN_LOG, L"Open log");
     AppendMenuW(m, MF_STRING, ID_OPEN_FOLDER, L"Open settings folder");
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
@@ -540,6 +572,35 @@ void ShowMenu(HWND hwnd) {
     SetForegroundWindow(hwnd);
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(m);
+}
+
+bool TabletConnected() {
+    std::lock_guard lock(g_statusMutex);
+    return g_status != L"Waiting for tablet";
+}
+
+// Starts this program again, as it is (with administrator rights if it has them: no prompt then), and leaves the virtual monitor to it.
+void RestartForGpuPreference(HWND hwnd) {
+    g_gpuRestartPending = false;
+    if (StartOtherInstance(IsElevated())) {
+        LOGI("restarting to apply the GPU choice");
+        g_handedOver = true;
+        DestroyWindow(hwnd);
+    } else {
+        LOGI("could not restart (%lu): the GPU choice applies at the next start", GetLastError());
+    }
+}
+
+// The tray's GPU choice changed: bring the program's GPU preference in line. A restart applies it, which would cut a connected tablet
+// off, so with one connected it waits until the tablet leaves.
+void ApplyGpuChoice(HWND hwnd) {
+    if (!EnsureGpuPreference(std::wstring())) return; // already right, or only one GPU
+    if (TabletConnected()) {
+        g_gpuRestartPending = true;
+        LOGI("the GPU choice applies after the tablet disconnects (PadDisplay restarts then)");
+    } else {
+        RestartForGpuPreference(hwnd);
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -632,8 +693,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_nid.uFlags = NIF_TIP;
         Shell_NotifyIconW(NIM_MODIFY, &g_nid);
         if (g_status.rfind(L"Error: ", 0) == 0) Balloon(L"PadDisplay", g_status.substr(7), NIIF_WARNING);
+        if (g_gpuRestartPending && g_status == L"Waiting for tablet") PostMessageW(hwnd, WM_GPU_RESTART, 0, 0); // the tablet has left
         return 0;
     }
+    case WM_GPU_RESTART:
+        if (g_gpuRestartPending && !TabletConnected()) RestartForGpuPreference(hwnd);
+        return 0;
     case WM_COMMAND: {
         UINT id = LOWORD(wp);
         if (id == ID_EXIT) DestroyWindow(hwnd);
@@ -669,19 +734,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (id == ID_ACCEPT_CAM) g_settings.acceptTabletCamera = !g_settings.acceptTabletCamera;
             else if (id == ID_ADAPTIVE) g_settings.adaptive = !g_settings.adaptive;
             else if (id == ID_UAC_CLICK) g_settings.uacClickableOnTablet = !g_settings.uacClickableOnTablet;
+            else if (id == ID_LOCK_SCREEN) g_settings.lockScreenControl = !g_settings.lockScreenControl;
+            else if (id == ID_PRESIGNIN) {
+                // Install or remove the LocalSystem service. The host is elevated here (the item shows only then).
+                std::wstring svcMsg;
+                if (LogonServiceInstalled()) { g_settings.preSignInAccess = false; RemoveLogonService(svcMsg); }
+                else { g_settings.preSignInAccess = true; SyncMachineConfig(g_settings); InstallLogonService(svcMsg); }
+                if (!svcMsg.empty()) Balloon(L"PadDisplay sign-in screen access", svcMsg.c_str());
+            }
             else if (id == ID_CURSOR) g_settings.drawCursor = !g_settings.drawCursor;
             else if (id == ID_MATCH_RES) g_settings.matchClientResolution = !g_settings.matchClientResolution;
             else if (id == ID_DETACH) g_settings.monitorOnlyWhileConnected = !g_settings.monitorOnlyWhileConnected;
             else if (id == ID_CODEC_AUTO) g_settings.codec = L"auto";
             else if (id == ID_CODEC_HEVC) g_settings.codec = L"hevc";
             else if (id == ID_CODEC_H264) g_settings.codec = L"h264";
+            else if (id == ID_GPU_AUTO) g_settings.gpu = L"auto";
+            else if (id >= ID_GPU_FIRST && id < ID_GPU_FIRST + 16) {
+                const std::vector<EncodeGpu> gpus = ListEncodeGpus();
+                if (id - ID_GPU_FIRST < gpus.size()) g_settings.gpu = gpus[id - ID_GPU_FIRST].name;
+            }
             else if (id > ID_WIFI_RATE && id < ID_WIFI_RATE + 100) g_settings.wifiBitrateMbps = int(id - ID_WIFI_RATE);
             else if (id > ID_USB_RATE && id < ID_USB_RATE + 100) g_settings.usbBitrateMbps = int(id - ID_USB_RATE);
             ApplySettings();
+            if (id == ID_GPU_AUTO || (id >= ID_GPU_FIRST && id < ID_GPU_FIRST + 16)) ApplyGpuChoice(hwnd);
             if (id == ID_ACCEPT_MIC) std::thread(ApplyMicDriverState, true).detach(); // loads or unloads the driver
         }
         return 0;
     }
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_LOCK) SetSessionLocked(true);
+        else if (wp == WTS_SESSION_UNLOCK) SetSessionLocked(false);
+        return 0;
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
@@ -692,6 +775,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_DESTROY:
+        WTSUnRegisterSessionNotification(hwnd);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -699,14 +783,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// Desktop Duplication on hybrid laptops only works when this process runs on the GPU that renders
-// the virtual monitor. Windows reads the per-app GPU preference at process start, so fix it and
-// relaunch once if needed.
-bool EnsureGpuPreference(const std::wstring& gdiName) {
+// Desktop Duplication, the fast way to capture (changed rectangles only), works when the GPU Windows runs this program on is the one
+// that renders the virtual monitor. The tray's "Encode on" says which GPU that is, so the program's GPU preference follows it: 1 =
+// power saving (the integrated GPU), 2 = high performance (a discrete one). Windows reads the preference when a program starts, so a
+// change needs one restart. When the two differ anyway (Auto moving to the other GPU for gaming or battery) the session captures with
+// Windows.Graphics.Capture instead: slower, but nothing breaks and nothing restarts.
+// With one GPU there is no choice: the GPU that renders the monitor, when it is on the desktop (0 = nothing to say).
+int WantedGpuPreference(const std::wstring& gdiName) {
+    const std::vector<EncodeGpu> gpus = ListEncodeGpus();
+    if (gpus.size() >= 2) {
+        // The usual situation for Auto: on mains, no game (gaming mode and battery are decided per connection, and cannot be known now).
+        std::wstring why;
+        return ChooseEncodeGpu(gpus, g_settings.gpu, GpuSituation{}, why).integrated ? 1 : 2;
+    }
     CaptureTarget t;
-    if (gdiName.empty() || !FindOutput(gdiName, t)) return false;
-    // 2 = high performance (discrete), 1 = power saving (integrated).
-    const wchar_t* want = t.vendorId == 0x8086 ? L"GpuPreference=1;" : L"GpuPreference=2;";
+    if (gdiName.empty() || !FindOutput(gdiName, t)) return 0;
+    return t.vendorId == 0x8086 ? 1 : 2;
+}
+
+// Writes the preference for this exe if it is not the wanted one. true = it changed, so a restart is needed to apply it.
+bool EnsureGpuPreference(const std::wstring& gdiName) {
+    const int wanted = WantedGpuPreference(gdiName);
+    if (wanted == 0) return false;
+    const wchar_t* want = wanted == 1 ? L"GpuPreference=1;" : L"GpuPreference=2;";
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     HKEY key;
@@ -718,7 +817,7 @@ bool EnsureGpuPreference(const std::wstring& gdiName) {
     bool same = RegGetValueW(key, nullptr, exe, RRF_RT_REG_SZ, nullptr, cur, &size) == ERROR_SUCCESS && wcscmp(cur, want) == 0;
     if (!same) {
         RegSetValueExW(key, exe, 0, REG_SZ, reinterpret_cast<const BYTE*>(want), DWORD((wcslen(want) + 1) * sizeof(wchar_t)));
-        LOGI("gpu preference set to %ls for %ls (virtual display is on %ls)", want, exe, t.adapterName.c_str());
+        LOGI("gpu preference set to %ls for %ls", want, exe);
     }
     RegCloseKey(key);
     return !same;
@@ -866,10 +965,31 @@ int RunUninstallSetup() {
     if (AddedByPadDisplay(kAddedCable)) step("VB-CABLE", RemoveCable(ExeDir() + L"\\driver\\vbcable", message));
     RemoveToggleTasks();
     RemoveUacRelayTask();
+    { std::wstring m; if (LogonServiceInstalled()) step("sign-in-screen service", RemoveLogonService(m)); }
     DeleteTaskFolder();
     step("driver publishers", UntrustDriverPublishers(message));
     if (QueryNvidiaProfile() == GpuProfileState::Set) step("NVIDIA profile", ConfigureNvidiaProfile(false, message));
     ForgetSetupRecords();
+    return ok ? 0 : 1;
+}
+
+// Pre-sign-in access (piece 4): install/remove the LocalSystem service. Run elevated (the tray/installer
+// elevates). Install also writes the machine-readable config the service needs (PIN + stream settings).
+int RunInstallService() {
+    g_settings.preSignInAccess = true;
+    g_settings.Save();
+    SyncMachineConfig(g_settings);
+    std::wstring message;
+    const bool ok = InstallLogonService(message);
+    LOGI("setup: install sign-in-screen service %s %ls", ok ? "ok" : "FAILED", message.c_str());
+    return ok ? 0 : 1;
+}
+int RunRemoveService() {
+    g_settings.preSignInAccess = false;
+    g_settings.Save();
+    std::wstring message;
+    const bool ok = RemoveLogonService(message);
+    LOGI("setup: remove sign-in-screen service %s %ls", ok ? "ok" : "FAILED", message.c_str());
     return ok ? 0 : 1;
 }
 
@@ -890,6 +1010,8 @@ const SetupCommand kSetupCommands[] = {
     {L"--untrust-publishers", RunUntrustPublishers},
     {L"--install-autostart", RunInstallAutostart},
     {L"--remove-autostart", RunRemoveAutostart},
+    {L"--install-service", RunInstallService},
+    {L"--remove-service", RunRemoveService},
     {L"--uninstall-setup", RunUninstallSetup},
 };
 
@@ -938,6 +1060,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // by the user. They do their one job and exit, well before any of the normal start-up below.
     if (HasArg(argc, argv, L"--uac-relay")) return RunUacRelayBootstrap();
     if (HasArg(argc, argv, L"--uac-inject")) return RunUacInjector();
+    // Pre-sign-in access (piece 4). --service is the LocalSystem service (SCM entry point); --logon-host is
+    // the per-session worker it launches as SYSTEM on the Winlogon desktop. Neither is started by the user.
+    if (HasArg(argc, argv, L"--service")) return RunLogonService();
+    if (HasArg(argc, argv, L"--logon-host")) return RunLogonHost();
     const wchar_t* dumpPath = ArgValue(argc, argv, L"--dump");
     bool list = HasArg(argc, argv, L"--list");
     const SetupCommand* setup = FindSetupCommand(argc, argv);
@@ -1004,7 +1130,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
     VirtualDisplay vd;
     bool haveVd = FindVirtualDisplay(g_settings.displayOverride, vd);
-    if (haveVd && vd.attached && EnsureGpuPreference(vd.gdiName)) {
+    if (EnsureGpuPreference(haveVd && vd.attached ? vd.gdiName : std::wstring())) {
         // Relaunch so the new GPU preference takes effect.
         STARTUPINFOW si{sizeof(si)};
         PROCESS_INFORMATION pi{};
@@ -1047,6 +1173,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_hwnd = CreateWindowW(wc.lpszClassName, L"PadDisplay", 0, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     // Explorer (normal rights) announces its restart to this window; an elevated window ignores that unless allowed.
     if (IsElevated()) ChangeWindowMessageFilterEx(g_hwnd, RegisterWindowMessageW(L"TaskbarCreated"), MSGFLT_ALLOW, nullptr);
+    // Learn when this session is locked/unlocked (WM_WTSSESSION_CHANGE on the tray thread, never a hot
+    // thread), so the session can tell the tablet "the PC is locked" instead of blaming a UAC prompt.
+    WTSRegisterSessionNotification(g_hwnd, NOTIFY_FOR_THIS_SESSION);
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_hwnd;
     g_nid.uID = 1;

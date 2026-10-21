@@ -34,6 +34,7 @@ The host may send another `HostHello`, followed by a new `Config`, at any time, 
 | 0x05 | Error | u8 code (1 bad PIN, 2 version, 3 no display, 4 encoder, 6 locked out after too many wrong PINs, 7 the PC only accepts encrypted connections), UTF-8 text |
 | 0x08 | Rumble | u8 controller index, u8 largeMotor, u8 smallMotor (0–255, 0 = off). The level holds until the next `Rumble` for that controller (v3) |
 | 0x09 | Notice | UTF-8 text for the tablet to show. The session goes on. Used when a game controller cannot be created on the PC (v3) |
+| 0x0D | LockState | u8 frozen: 1 = the PC is locked / at the sign-in screen and the tablet can't show it (the picture is frozen), so the tablet offers its password box; 0 = streaming normally again, hide it. Sent only on a change, and only to a v5+ client (v5) |
 
 The stream has no B-frames and an infinite GOP, so IDRs are sent only on request. After any decode problem the client sends `KeyframeReq`.
 
@@ -52,6 +53,7 @@ The stream has no B-frames and an infinite GOP, so IDRs are sent only on request
 | 0x8A | Key | u8 flags (bit0 = down, else up), u16 scancode (v3). See *Keyboard* below |
 | 0x8B | MouseRel | u8 kind (as for `Mouse`), i16 dx, i16 dy, i16 wheelV, i16 wheelH (v3). A captured mouse: kind 0 moves the pointer by dx, dy; buttons and the wheel act where the pointer is |
 | 0x8C | Gamepad | u8 index (0–3), u8 flags (bit0 = connected), u16 buttons, u8 leftTrigger, u8 rightTrigger, i16 leftX, i16 leftY, i16 rightX, i16 rightY (v3). See *Game controllers* below |
+| 0x92 | SecureText | u8 flags (bit0 = press Enter after), then utf-8 text (v5). The Windows password, typed into a box on the tablet, to be typed into the **locked sign-in screen**. The host honours it only over an encrypted (TLS) or USB link and only when lock-screen control is on; the SYSTEM helper types it only while the sign-in (Winlogon) desktop is the input desktop, so it can never reach a normal app. See *Typing the sign-in password* below |
 
 ## Hello flags (v3)
 A v3 `ClientHello` has one more byte before the device name, with the choices made in the tablet app. v1 and v2 hellos don't have it.
@@ -126,6 +128,15 @@ To use the tablet's camera as a PC webcam, the tablet opens a connection and sen
 
 `Notice` on these connections is not tied to `Gamepad`: they belong to the microphone or camera connection only.
 
+## Typing the sign-in password (v5)
+When the PC is locked (a mid-session lock, or the sign-in screen after a boot/restart), a normal process cannot capture the secure desktop, so the tablet may not be able to *show* it. As a fallback, the tablet can show its own password box and send what the user types as `SecureText`; the PC types it into the sign-in field.
+
+- **Transport:** only over an **encrypted** Wi-Fi link (TLS) or a **USB** cable. A plain Wi-Fi link is refused with a `Notice` and the text is dropped — the password never crosses the network in the clear.
+- **Gate:** honoured only when the PC's **lock-screen control** setting is on. The actual injection is done by the SYSTEM helper (`uacrelay`), which types only while the **sign-in (Winlogon) desktop** is the input desktop, so the text can never land in a normal app, even if it arrives at the wrong moment.
+- **Encoding:** each UTF-16 code unit is injected with `KEYEVENTF_UNICODE` (independent of the PC's keyboard layout, so any character types correctly), then Enter when bit0 of the flags is set.
+- **Handling:** the text is never written to any log, and the host wipes its copy as soon as it is handed to the helper. The tablet clears its box after sending.
+- **When it is offered:** the tablet shows the password box only while the host has sent `LockState` 1 (the PC is locked and the picture is frozen because the tablet can't show that screen) — not during normal use, and not while the lock screen itself is streaming.
+
 ## Flow control (v2)
 The client acknowledges **every** `Frame`. The host stops encoding while `maxFramesInFlight` frames (default 3) are unacknowledged. Desktop updates made meanwhile are not lost; Desktop Duplication coalesces them into the next frame. This bounds queueing in the network to a few frames: over a slow link the frame rate drops instead of the delay growing. Adaptive bitrate uses the time spent waiting for acks and each frame's send-to-ack time.
 
@@ -136,6 +147,7 @@ v1 clients (no acks) are still accepted, but they only get RTT-based bitrate ada
 - **v2:** `FrameAck` (flow control).
 - **v3:** `Key`, `MouseRel`, `Gamepad`, more `Mouse` buttons, `Rumble`, `Notice`, and the flags byte in `ClientHello`.
 - **v4:** the microphone and camera connections: `MicHello`, `MicData`, `CamHello`, `CamConfig`, `CamFrame`, `CamState`, `CamKeyframeReq`. Nothing in the screen stream changed. A tablet app that sends version 4 needs a host of version 4 or later.
+- **v5:** `SecureText` (type the Windows password into the locked sign-in screen) and `LockState` (the host tells the tablet when the picture is frozen on that screen, so the box is offered only then). Older clients never send `SecureText` and ignore `LockState`, which the host sends only to a v5+ client. Nothing else changed.
 
 A host accepts every client version up to its own, and rejects a newer one with error code 2. It only sends `Rumble` or `Notice` to a client that has sent `Gamepad`.
 

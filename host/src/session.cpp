@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "session.h"
 #include "display.h"
+#include "gpu_select.h"
 #include "log.h"
 #include "vdd.h"
 
@@ -72,6 +73,15 @@ void Session::SendNotice(const char* text) {
     if (status_) status_(L"Error: " + Widen(text));
 }
 
+void Session::SendLockState(bool frozen) {
+    if (hello_.version < 5) return; // older tablets have no password box to offer
+    const int state = frozen ? 1 : 0;
+    if (state == lockStateSent_) return; // only on change: no per-iteration traffic
+    lockStateSent_ = state;
+    const uint8_t b = uint8_t(state);
+    Send(Msg::LockState, &b, 1);
+}
+
 void Session::SendError(ErrorCode code, const char* text) {
     LOGI("session error %d: %s", code, text);
     std::vector<uint8_t> p(1 + strlen(text));
@@ -102,6 +112,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     // The tablet asks for its panel refresh rate; the virtual monitor switches to the closest mode.
     fps_ = std::clamp(std::min(settings_.maxFps, hello_.maxFps ? int(hello_.maxFps) : 60), 10, 240);
 
+    ChooseMonitorGpu();
     VirtualDisplay vd;
     bool switchedOn = false, switchOnFailed = false;
     if (!FindVirtualDisplay(settings_.displayOverride, vd) && settings_.displayOverride.empty() && QueryVdd() == VddState::Disabled) {
@@ -109,6 +120,11 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         // monitor arrival can take several seconds together (more right after boot); a shorter wait ended the session while
         // the monitor was still coming. The pings above keep the tablet waiting, and both waits end as soon as it is there.
         switchedOn = SetVirtualMonitorEnabled(true, 15000);
+        bool changed = false;
+        if (!switchedOn && !fallbackGpu_.empty() && SetVddGpu(fallbackGpu_, changed)) {
+            LOGI("session: the virtual monitor did not come up on the chosen GPU, trying %ls", fallbackGpu_.c_str());
+            switchedOn = SetVirtualMonitorEnabled(true, 15000);
+        }
         switchOnFailed = !switchedOn;
         for (int i = 0; switchedOn && i < 100 && !FindVirtualDisplay(L"", vd); ++i) Sleep(100);
     }
@@ -166,20 +182,23 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         onlyScreen_ = false;
         SendNotice("Could not switch the PC's own screens off. The tablet is an extra screen for now. See the PadDisplay log.");
     }
-    // In only-screen mode a UAC prompt on the secure desktop would be invisible and unanswerable. If the
-    // user opted in (and the host is elevated), move prompts to the normal desktop so the tablet can
-    // see them. Restored on teardown and at start-up; a no-op otherwise.
-    if (onlyScreen_ && settings_.uacClickableOnTablet) {
-        AllowUacClicksOnTablet();
-        // Seeing the prompt is not clicking it: the prompt runs above administrator level, so the click
-        // has to go through a System-level helper. Register its task now (needs the admin rights we have).
-        // Only forward clicks (uacClickable_) if the task is in place and we are elevated.
-        if (HostIsElevated()) {
-            std::wstring msg;
-            uacClickable_ = EnsureUacRelayTask(msg);
-            if (!uacClickable_) LOGI("session: UAC-click helper not available: %s", Narrow(msg).c_str());
+    // Two secure-desktop features share one System helper (uacrelay.*), which only an elevated host can
+    // register and drive:
+    //  - UAC-click (only-screen + uacClickableOnTablet): move prompts off the secure desktop so the tablet
+    //    can show them, and click them through the helper.
+    //  - lock-screen control (lockScreenControl, any mode): see and type into the locked sign-in screen.
+    const bool wantUac = onlyScreen_ && settings_.uacClickableOnTablet;
+    const bool wantLock = settings_.lockScreenControl;
+    if (wantUac || wantLock) {
+        if (!HostIsElevated()) {
+            LOGI("session: secure-desktop help needs PadDisplay elevated (run as administrator); not available");
         } else {
-            LOGI("session: tablet cannot click UAC prompts (PadDisplay is not elevated); it can only show them");
+            if (wantUac) AllowUacClicksOnTablet(); // prompts onto the normal desktop; restored on teardown / at start-up
+            std::wstring msg;
+            const bool task = EnsureUacRelayTask(msg);
+            uacClickable_ = task && wantUac;
+            lockControl_ = task && wantLock;
+            if (!task) LOGI("session: secure-desktop helper not available: %s", Narrow(msg).c_str());
         }
     }
     // Attaching/reloading may have moved real screens. Windows re-applies its own layout for a
@@ -216,13 +235,18 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     waiting.reset();
     if (conn_.s != INVALID_SOCKET) {
         input_ = std::make_unique<InputInjector>(HostIsElevated(), [this](const char* text) { SendNotice(text); });
-        if (uacClickable_) {
-            uacClick_ = std::make_unique<UacClickClient>([this](const char* text) { SendNotice(text); });
-            // Called on the input thread for every tap / allowed key while the feature is on. The client
-            // tests cheaply whether it lands on a UAC prompt and ignores it otherwise; only a real hit is
-            // enqueued, and the client's worker thread does the slow task/pipe work.
-            input_->SetUacForward([this](bool click, int x, int y, WORD vk) {
-                if (click) uacClick_->Click(x, y); else uacClick_->Key(vk);
+        if (uacClickable_ || lockControl_) {
+            uacClick_ = std::make_unique<UacClickClient>([this](const char* text) { SendNotice(text); }, lockControl_);
+            // Called on the input thread for every tap / move / key while a secure-desktop feature is on.
+            // Each method returns at once unless its target (a UAC prompt, or the locked sign-in screen) is
+            // actually up, so normal input costs only a cheap check; the worker thread does the pipe work.
+            input_->SetUacForward([this](const UacForwardEvent& e) {
+                switch (e.kind) {
+                case UacForwardEvent::Click: uacClick_->Click(e.x, e.y); break;
+                case UacForwardEvent::KeyVk: uacClick_->Key(e.vk); break;
+                case UacForwardEvent::KeyScan: uacClick_->KeyScan(e.code, e.down); break;
+                case UacForwardEvent::MouseMove: uacClick_->MouseMove(e.x, e.y); break;
+                }
             });
         }
         recvThread_ = std::thread([this] { RecvLoop(); });
@@ -230,30 +254,78 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     }
 
     int failures = 0;
-    bool toldAboutPrompt = false;
+    enum class Told { None, Locked, Uac } told = Told::None;
     while (!stop_) {
         int r = SetupPipeline();
-        // ~30 s of retries (mode switch). A UAC prompt can stay up for minutes and is no failure: keep
-        // the tablet connected (it gives up after a few seconds of silence) and wait for the answer.
+        // ~30 s of retries (mode switch). A locked PC or a UAC prompt can stay up for minutes and is no
+        // failure: keep the tablet connected (it gives up after a few seconds of silence) and wait.
         if (r < 0 || (r == 0 && !secureDesktop_ && ++failures > 150)) {
             SendError(ErrEncoder, "Could not start capture/encoding on the PC. See the host log.");
             break;
         }
         if (r == 0) {
-            if (secureDesktop_ && !toldAboutPrompt) {
-                toldAboutPrompt = true;
-                SendNotice(onlyScreen_ ? "Windows is asking for administrator approval (UAC). The tablet cannot show that prompt, and the PC's own screens are off. Answer it with the PC's keyboard, or disconnect the tablet to get the PC screens back."
-                                       : "Windows is asking for administrator approval (UAC). The tablet cannot show that prompt: answer it on the PC's own screen. The picture continues afterwards.");
+            // Capture is refused both when the PC is locked (the Winlogon desktop) and while a UAC prompt
+            // is up. They look the same to the capture call; WM_WTSSESSION_CHANGE tells them apart.
+            const Told reason = SessionIsLocked() ? Told::Locked : Told::Uac;
+
+            // Lock-screen capture (piece 3): if the user enabled it, the PC is locked, and we already have
+            // an encoder (locked mid-session), the System helper captures the sign-in desktop into our
+            // shared texture and we stream it so the tablet can see and sign in. Starting a session while
+            // already locked (no encoder yet) still just shows the notice below.
+            bool streamed = false;
+            if (reason == Told::Locked && lockControl_ && uacClick_ && encoder_ && device_ && width_ > 0) {
+                // Capture the lock screen from a REAL display, never the tablet's own virtual monitor: when
+                // the tablet is the only screen, Windows moves the sign-in screen to the real laptop screen,
+                // and an indirect-display adapter cannot share a capture texture anyway. gdiName_ is that
+                // virtual monitor, so the lock capture skips it.
+                if (!lockCap_.Active() && lockCap_.Start(device_.Get(), width_, height_, gdiName_))
+                    uacClick_->StartCapture(lockCap_.AdapterLuid(), width_, height_);
+                bool fresh = false;
+                if (lockCap_.Active() && lockCap_.Next(device_.Get(), 100, encoder_->InputTexture(), fresh)) {
+                    bool pendingIdr = !configSent_; // first locked frame carries Config + a keyframe
+                    Emit e = EmitFrame(pendingIdr);
+                    if (e == Emit::SendFailed) break;
+                    if (e == Emit::EncoderFailed) encoder_.reset(); // SetupPipeline rebuilds it
+                    else streamed = true;
+                }
+            } else if (lockCap_.Active()) {
+                lockCap_.Stop();            // no longer locked (or feature off): stop the helper capture
+                uacClick_->StopCapture();
             }
+
+            // Offer the tablet's password box when the picture is frozen because we cannot show the sign-in
+            // screen AND we can actually type what the user enters: lock-screen control is on and the injector
+            // is up (lockControl_ && uacClick_). It covers a mid-session lock (reason Locked) and the pre-sign-in
+            // service, where every frozen secure desktop IS the sign-in screen (SessionIsLocked has no window
+            // proc there, so reason reads as Uac). Not for a genuine mid-session UAC freeze, not while the lock
+            // screen itself is streaming, and never when the box's input would be dropped for lack of the feature
+            // (that silent drop was the bug: the box would appear, take a password, and discard it).
+            const bool offerPasswordBox = lockControl_ && uacClick_ && !streamed &&
+                                          (reason == Told::Locked || settings_.preSignInAccess);
+            // The "sign in on the PC itself" notice contradicts an open password box, so send it only when no
+            // box is offered; when the box is up, the tablet's own box status tells the user what to do.
+            if (!streamed && secureDesktop_ && told != reason && !offerPasswordBox) {
+                told = reason;
+                if (reason == Told::Locked)
+                    SendNotice(onlyScreen_ ? "The PC is locked. The tablet cannot show the Windows sign-in screen, and the PC's own screens are off. Sign in on the PC, or disconnect the tablet to get the PC screens back."
+                                           : "The PC is locked. Sign in on the PC's own screen; the picture continues afterwards.");
+                else
+                    SendNotice(onlyScreen_ ? "Windows is asking for administrator approval (UAC). The tablet cannot show that prompt, and the PC's own screens are off. Answer it with the PC's keyboard, or disconnect the tablet to get the PC screens back."
+                                           : "Windows is asking for administrator approval (UAC). The tablet cannot show that prompt: answer it on the PC's own screen. The picture continues afterwards.");
+            }
+            if (streamed) told = Told::None; // streaming again: a later freeze should re-notify
+            SendLockState(offerPasswordBox);
             if (!Heartbeat(NowUs())) break;
-            Sleep(200);
+            if (!streamed) Sleep(200); // lockCap_.Next already waited up to 100 ms for a frame
             continue;
         }
         failures = 0;
-        toldAboutPrompt = false;
+        told = Told::None;
+        SendLockState(false); // streaming the desktop normally: hide the password box
         if (!StreamLoop()) break;
     }
     stop_ = true;
+    if (lockCap_.Active()) { lockCap_.Stop(); if (uacClick_) uacClick_->StopCapture(); } // end any locked-screen capture
     if (recvThread_.joinable()) recvThread_.join();
     if (inputThread_.joinable()) inputThread_.join();
     if (layoutThread_.joinable()) layoutThread_.join();
@@ -313,9 +385,57 @@ bool Session::Heartbeat(uint64_t now) {
     return true;
 }
 
+bool Session::GamingMode() const {
+    return hello_.version >= 3 ? (hello_.flags & HelloGamingMode) != 0 : settings_.gamingMode;
+}
+
+void Session::ChooseMonitorGpu() {
+    if (!settings_.displayOverride.empty()) return; // the user named the display: its GPU is theirs
+    const std::vector<EncodeGpu> gpus = ListEncodeGpus();
+    if (gpus.size() < 2) return; // nothing to choose from
+    std::wstring why;
+    GpuSituation now;
+    now.gaming = GamingMode();
+    now.onBattery = OnBattery();
+    const EncodeGpu& gpu = ChooseEncodeGpu(gpus, settings_.gpu, now, why);
+    LOGI("session: encoding on %ls (%ls): %ls", gpu.name.c_str(), EncoderName(gpu.vendorId), why.c_str());
+    chosenGpu_ = gpu.name;
+    // If the monitor will not come up on this GPU (the driver could not use it, or it is asleep), another one is the way out.
+    auto other = std::find_if(gpus.begin(), gpus.end(), [&](const EncodeGpu& g) { return g.name != gpu.name && g.integrated; });
+    if (other == gpus.end()) other = std::find_if(gpus.begin(), gpus.end(), [&](const EncodeGpu& g) { return g.name != gpu.name; });
+    fallbackGpu_ = other == gpus.end() ? L"" : other->name;
+
+    bool changed = false;
+    if (!SetVddGpu(gpu.name, changed) || !changed) return;
+    VirtualDisplay vd;
+    if (!FindVirtualDisplay(L"", vd)) return; // it is off, which is the usual case: switching it on reads the new GPU
+    // It is on (the tray option "only while connected" is off, or an earlier run left it): the driver re-plugs it on the new GPU.
+    // The waiting ping keeps the tablet from timing out meanwhile.
+    ReloadVddDriver();
+    for (int i = 0; i < 80; ++i) {
+        Sleep(100);
+        CaptureTarget t;
+        if (FindVirtualDisplay(L"", vd) && (FindRenderAdapter(vd.gdiName, t) || FindOutput(vd.gdiName, t)) && t.adapterName == gpu.name) return;
+    }
+    LOGI("session: the virtual monitor did not move to %ls in time", gpu.name.c_str());
+}
+
 int Session::SetupPipeline() {
     CaptureTarget t;
     if (!FindOutput(gdiName_, t)) return 0; // display still settling
+    // Desktop Duplication needs the adapter this process finds the monitor under to be the one that renders it. DXGI lists the monitor
+    // under whichever adapter Windows' GPU preference for this program picks (always so in only-screen mode), which is not always the
+    // GPU the virtual monitor was put on: every AcquireNextFrame then fails. Windows.Graphics.Capture does not care, so it takes over.
+    CaptureTarget render = t;
+    bool renderKnown = FindRenderAdapter(gdiName_, render);
+    // Windows could not say which GPU renders the monitor: it is the one it was asked to put it on.
+    if (!renderKnown && wgcOnly_ && !chosenGpu_.empty()) renderKnown = FindAdapterByName(chosenGpu_, render);
+    const bool wgc = wgcOnly_ || (renderKnown && render.adapterName != t.adapterName);
+    if (wgc && renderKnown) {
+        t.adapter = render.adapter;
+        t.vendorId = render.vendorId;
+        t.adapterName = render.adapterName;
+    }
     DXGI_ADAPTER_DESC1 newDesc{}, oldDesc{};
     t.adapter->GetDesc1(&newDesc);
     if (target_.adapter) target_.adapter->GetDesc1(&oldDesc);
@@ -325,23 +445,22 @@ int Session::SetupPipeline() {
         capture_ = DesktopCapture();
         device_.Reset();
         ctx_.Reset();
-        // The tablet app decides; an app from before v3 cannot, so settings.ini does.
-        bool gamingMode = hello_.version >= 3 ? (hello_.flags & HelloGamingMode) != 0 : settings_.gamingMode;
-        if (!CreateDevice(t.adapter.Get(), gamingMode, device_, ctx_)) return -1;
-        LOGI("session: capturing on %ls", t.adapterName.c_str());
-        if (t.vendorId != 0x10DE)
-            LOGI("session: the virtual display is not rendered by the NVIDIA GPU; using Media Foundation. "
-                 "Set <gpu><friendlyname> in C:\\VirtualDisplayDriver\\vdd_settings.xml to the NVIDIA GPU for NVENC.");
+        if (!CreateDevice(t.adapter.Get(), GamingMode(), device_, ctx_)) return -1;
+        LOGI("session: capturing on %ls%s", t.adapterName.c_str(),
+             wgc ? " with Windows.Graphics.Capture (Desktop Duplication cannot see this monitor from this process)" : "");
+        if (t.vendorId != 0x10DE) LOGI("session: encoding with Media Foundation (%ls)", EncoderName(t.vendorId));
     }
     target_ = t;
 
-    HRESULT hr = capture_.Init(device_.Get(), t.output.Get(), settings_.drawCursor);
+    HRESULT hr = wgc ? capture_.InitWgc(device_.Get(), gdiName_, settings_.drawCursor, unsigned(std::max(1, 500 / fps_)))
+                     : capture_.Init(device_.Get(), t.output.Get(), settings_.drawCursor);
     secureDesktop_ = hr == E_ACCESSDENIED;
     if (FAILED(hr)) {
         static int logged = 0;
-        if (logged++ < 5 || hr != E_ACCESSDENIED) LOGI("session: DuplicateOutput failed 0x%08lx%s", hr,
-            hr == DXGI_ERROR_UNSUPPORTED ? " (hybrid GPU: restart PadDisplay so the high-performance GPU preference applies)" :
+        if (logged++ < 5 || hr != E_ACCESSDENIED) LOGI("session: %s failed 0x%08lx%s", wgc ? "Windows.Graphics.Capture" : "DuplicateOutput", hr,
+            hr == DXGI_ERROR_UNSUPPORTED ? " (Desktop Duplication cannot see the monitor from this GPU: using Windows.Graphics.Capture)" :
             hr == E_ACCESSDENIED ? " (secure desktop / UAC prompt active)" : "");
+        if (hr == DXGI_ERROR_UNSUPPORTED && !wgc) wgcOnly_ = true; // the next try builds it the other way
         return 0;
     }
     if (input_) input_->SetTarget(t.desktopRect);
@@ -388,6 +507,37 @@ int Session::SetupPipeline() {
         keyframeRequested_ = true;
     }
     return 1;
+}
+
+// Encode encoder_->InputTexture() and send it, Config first if the decoder has not been configured.
+// Mirrors StreamLoop's inline encode/send but stands alone for the locked-screen path, so the tuned
+// StreamLoop is left exactly as it was. Keeps the same flow-control and counter bookkeeping.
+Session::Emit Session::EmitFrame(bool& pendingIdr) {
+    uint64_t t0 = NowUs();
+    bool key = false;
+    if (!encoder_->Encode(pendingIdr, t0 - startUs_, au_, key)) return Emit::EncoderFailed;
+    encodeUsThisSecond_ += NowUs() - t0;
+    if (key) pendingIdr = false;
+    if (!configSent_) {
+        auto ps = encoder_->ParameterSets();
+        if (ps.empty()) ps = ExtractParameterSets(au_, codec_);
+        if (ps.empty()) { pendingIdr = true; return Emit::NeedIdr; } // cannot start the decoder without them
+        if (!Send(Msg::Config, ps.data(), uint32_t(ps.size()))) return Emit::SendFailed;
+        configSent_ = true;
+    }
+    msg_.resize(9 + au_.size());
+    wr64(msg_.data(), t0 - startUs_);
+    msg_[8] = key ? 1 : 0;
+    memcpy(msg_.data() + 9, au_.data(), au_.size());
+    if (flowControl_) {
+        std::lock_guard lock(inflightMutex_);
+        inflight_.emplace_back(t0 - startUs_, NowUs());
+    }
+    ++framesSent_;
+    if (!Send(Msg::Frame, msg_.data(), uint32_t(msg_.size()))) return Emit::SendFailed;
+    ++framesThisSecond_;
+    bytesThisSecond_ += au_.size();
+    return Emit::Sent;
 }
 
 bool Session::StreamLoop() {
@@ -439,14 +589,32 @@ bool Session::StreamLoop() {
         auto r = capture_.Next(force ? 0 : 20, tex, force, fresh);
         uint64_t tCaptured = NowUs();
         if (r == DesktopCapture::Lost) {
-            LOGI("session: duplication lost (mode change / secure desktop), restarting capture");
+            // A mode change loses the capture once and the next try works. Losing it again at once, for seconds, means Windows
+            // cannot capture this monitor on this GPU at all: give up with a message instead of a blank tablet and a busy loop.
+            if (captureLostNoFrame_++ == 0) captureLostSinceUs_ = tCaptured;
+            if (captureLostInRow_++ == 0 || captureLostInRow_ % 200 == 0)
+                LOGI("session: duplication lost (mode change / secure desktop), restarting capture (%d since the last frame)", captureLostNoFrame_);
+            if (!capture_.UsesWgc() && !wgcOnly_ && captureLostNoFrame_ >= 3 && tCaptured - captureLostSinceUs_ > 300000) {
+                LOGI("session: Desktop Duplication cannot capture this monitor from here: switching to Windows.Graphics.Capture");
+                wgcOnly_ = true;
+                captureLostNoFrame_ = captureLostInRow_ = 0;
+                return true; // SetupPipeline builds the capture the other way (and the encoder, if the GPU changes with it)
+            }
+            if (captureLostNoFrame_ >= 5 && tCaptured - captureLostSinceUs_ > 8000000) {
+                LOGI("session: capture on %ls keeps failing: giving up", target_.adapterName.c_str());
+                SendError(ErrNoDisplay, "Windows cannot capture the virtual monitor on this GPU. In the PC's tray menu, open 'Encode on' and choose another GPU (or Auto), then connect again.");
+                return false;
+            }
+            if (captureLostInRow_ > 3) SleepUs(50000); // not a tight loop: each try builds the capture again
             return true;
         }
         if (r == DesktopCapture::Failed) {
             Sleep(100);
             return true;
         }
-        if (r == DesktopCapture::Timeout) continue;
+        captureLostInRow_ = 0;
+        if (r == DesktopCapture::Timeout) continue; // nothing changed: says nothing about whether capture works
+        captureLostNoFrame_ = 0;                    // a real frame
         if (fresh) refines = 2;
         else if (refine) --refines;
 
@@ -548,6 +716,35 @@ void Session::RecvLoop() {
                     ++rttCount_;
                 }
                 break;
+            case Msg::SecureText: {
+                // A password typed into a box on the tablet, to be typed into the locked sign-in screen (the
+                // workaround for when the tablet cannot show that screen). Accepted only when lock-screen
+                // control is on AND the link carries no eavesdroppers: encrypted Wi-Fi (TLS) or a USB cable.
+                // The injector types it only onto the sign-in desktop. The text is never logged, and both the
+                // wire buffer and the wide copy are wiped as soon as it is handed off.
+                if (!lockControl_ || !uacClick_) { SecureZeroMemory(buf.data(), buf.size()); break; }
+                if (!conn_.tls && !usb_) {
+                    SecureZeroMemory(buf.data(), buf.size());
+                    SendNotice("This PC will only accept the password over an encrypted connection. Connect over Wi-Fi with encryption on, or by USB.");
+                    break;
+                }
+                if (!buf.empty()) {
+                    const bool submit = (buf[0] & SecureTextSubmit) != 0;
+                    // Cap the length: a legitimate password is short, and this bounds the injector's work.
+                    size_t len = buf.size() - 1;
+                    if (len > 256) {
+                        len = 256;
+                        // Don't cut in the middle of a UTF-8 sequence, or Widen would corrupt the last
+                        // character: back off while the first dropped byte is a continuation byte (10xxxxxx).
+                        while (len > 0 && (static_cast<uint8_t>(p[1 + len]) & 0xC0) == 0x80) --len;
+                    }
+                    std::wstring text = Widen(std::string(reinterpret_cast<const char*>(p + 1), len));
+                    uacClick_->TypeUnicode(text, submit);
+                    SecureZeroMemory(text.data(), text.size() * sizeof(wchar_t));
+                }
+                SecureZeroMemory(buf.data(), buf.size());
+                break;
+            }
             default: break;
             }
         }
@@ -714,7 +911,9 @@ std::vector<uint8_t> ExtractParameterSets(const std::vector<uint8_t>& au, Codec 
 
 bool Server::Start() {
     // Before listening: it reads (or makes) the key file, which no connection thread should ever wait for.
-    tls_ = TlsIdentity::LoadOrCreate();
+    // With pre-sign-in access on, use the machine-wide identity so this host and the SYSTEM sign-in-screen
+    // service present one fingerprint to the tablet (see TlsIdentity).
+    tls_ = TlsIdentity::LoadOrCreate(settings_.preSignInAccess);
     if (tls_) LOGI("server: TLS ready, fingerprint %s", tls_->Fingerprint().c_str());
     else LOGI("server: TLS unavailable - Wi-Fi connections cannot be encrypted");
     listen_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
@@ -726,7 +925,19 @@ bool Server::Start() {
     a.sin6_family = AF_INET6;
     a.sin6_port = htons(kTcpPort);
     a.sin6_addr = in6addr_any;
-    if (bind(listen_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(listen_, 4) != 0) {
+    // Bind can briefly fail with "address in use" during the sign-in handoff: the pre-sign-in logon service
+    // stops its SYSTEM host (which holds this port) at the same moment the per-user tray host autostarts.
+    // Retry on that one error for ~2 s so the handoff never leaves the port unserved. Deliberately NOT
+    // SO_REUSEADDR: on Windows that lets any process bind a port already in use, which would let another
+    // process steal this one - and it carries the Windows password. Startup path only; no hot-path cost, and
+    // the normal (no-conflict) case binds on the first try with no delay.
+    bool bound = false;
+    for (int attempt = 0; attempt < 20 && !bound; ++attempt) {
+        if (bind(listen_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) { bound = true; break; }
+        if (WSAGetLastError() != WSAEADDRINUSE) break; // a real error (e.g. a genuine second instance): fail fast
+        Sleep(100);
+    }
+    if (!bound || listen(listen_, 4) != 0) {
         LOGI("server: cannot listen on port %u (%d) - is another PadDisplay running?", kTcpPort, WSAGetLastError());
         closesocket(listen_);
         listen_ = INVALID_SOCKET;

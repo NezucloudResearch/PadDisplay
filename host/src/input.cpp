@@ -29,7 +29,7 @@ void InputInjector::SetTarget(const RECT& r) {
     rect_ = r;
 }
 
-void InputInjector::SetUacForward(std::function<void(bool click, int x, int y, WORD vk)> forward) {
+void InputInjector::SetUacForward(std::function<void(const UacForwardEvent&)> forward) {
     std::lock_guard lock(mutex_);
     uacForward_ = std::move(forward);
 }
@@ -55,6 +55,13 @@ static WORD UacVkFromWire(uint16_t code) {
 // virtual screen, not screen coordinates: with a monitor left of the primary they differ.
 static POINT ToVirtualScreen(POINT pt) {
     return {pt.x - GetSystemMetrics(SM_XVIRTUALSCREEN), pt.y - GetSystemMetrics(SM_YVIRTUALSCREEN)};
+}
+
+// The classic on-screen keyboard (osk.exe). WindowFromPoint sends no message to another thread's window, so a hung
+// app under the finger cannot stall the input thread.
+static bool OnScreenKeyboardAt(POINT screen) {
+    wchar_t cls[16] = {};
+    return GetClassNameW(GetAncestor(WindowFromPoint(screen), GA_ROOT), cls, int(std::size(cls))) && wcscmp(cls, L"OSKMainClass") == 0;
 }
 
 POINT InputInjector::Map(uint16_t x, uint16_t y) const {
@@ -129,6 +136,13 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
         }
 
         Contact& c = contacts_[slot];
+        if (kind == TouchDown) c.onKeyboard = OnScreenKeyboardAt(screen);
+        if (c.onKeyboard) {
+            PressKeyboardWithMouse(slot, kind, screen);
+            c.active = kind == TouchDown || kind == TouchMove;
+            c.clientId = id;
+            continue;
+        }
         auto& ti = c.info.touchInfo;
         c.info.type = PT_TOUCH;
         ti.pointerInfo.pointerType = PT_TOUCH;
@@ -151,7 +165,8 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
     }
     // Every active contact must appear in each frame.
     for (int s = 0; s < int(contacts_.size()) && used < frame.size(); ++s) {
-        if (!contacts_[s].active || std::find(frameSlot.begin(), frameSlot.begin() + used, s) != frameSlot.begin() + used) continue;
+        if (!contacts_[s].active || contacts_[s].onKeyboard || std::find(frameSlot.begin(), frameSlot.begin() + used, s) != frameSlot.begin() + used)
+            continue;
         auto info = contacts_[s].info;
         info.touchInfo.pointerInfo.pointerFlags = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
         frameSlot[used] = s;
@@ -163,7 +178,7 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
     // offer each new contact to the UAC click path too. The client ignores it unless a prompt is up, and
     // the injector re-checks the window under the point, so a normal tap costs only an atomic read.
     if (uacForward_)
-        for (UINT32 i = 0; i < downs; ++i) uacForward_(true, downPts[i].x, downPts[i].y, 0);
+        for (UINT32 i = 0; i < downs; ++i) uacForward_({UacForwardEvent::Click, downPts[i].x, downPts[i].y});
 
     for (UINT32 i = 0; i < used; ++i) {
         Contact& c = contacts_[frameSlot[i]];
@@ -172,11 +187,31 @@ void InputInjector::OnTouch(const uint8_t* p, size_t n) {
     }
 }
 
+// osk.exe types on a mouse press but on a touch release (measured: a tapped key arrived as the finger lifted, a held one
+// only after it), so a finger that lands on it is sent as the mouse, and the key comes as the finger touches. A mouse has
+// one left button: a second finger takes it over, so typing with overlapping fingers still gives each its key.
+void InputInjector::PressKeyboardWithMouse(int slot, uint8_t kind, POINT screen) {
+    if (kind == TouchDown) {
+        if (keyboardPress_ >= 0) SendMouse(MOUSEEVENTF_LEFTUP, screen);
+        SendMouse(MOUSEEVENTF_LEFTDOWN, screen);
+        keyboardPress_ = slot;
+        buttonsDown_ |= 1; // ReleaseAll lifts it on disconnect
+    } else if (keyboardPress_ == slot) {
+        if (kind == TouchMove) {
+            SendMouse(0, screen);
+            return;
+        }
+        SendMouse(MOUSEEVENTF_LEFTUP, screen);
+        keyboardPress_ = -1;
+        buttonsDown_ &= ~1;
+    }
+}
+
 void InputInjector::InjectTouchFrame() {
     std::array<POINTER_TYPE_INFO, 10> frame{};
     UINT32 used = 0;
     for (auto& c : contacts_)
-        if (c.active) frame[used++] = c.info;
+        if (c.active && !c.onKeyboard) frame[used++] = c.info;
     if (used) Inject(touchDev_, frame.data(), used, "touch refresh");
     lastTouchInject_ = GetTickCount64();
 }
@@ -294,9 +329,10 @@ void InputInjector::OnMouse(const uint8_t* p, size_t n) {
         // consent prompt (it silently drops it, no ERROR_ACCESS_DENIED), so this cannot key off the
         // inject result; the client ignores it unless a prompt is actually up and the injector re-checks
         // the window under the point, so a normal press is a cheap atomic read and nothing more.
-        if (button == 0 && down && uacForward_) uacForward_(true, pt.x, pt.y, 0);
+        if (button == 0 && down && uacForward_) uacForward_({UacForwardEvent::Click, pt.x, pt.y});
     } else if (p[0] == MouseMove) {
         SendMouse(0, pt);
+        if (uacForward_) uacForward_({UacForwardEvent::MouseMove, pt.x, pt.y}); // dropped unless the sign-in screen is up
     } else if (p[0] == MouseWheel) {
         if (wheelV) SendMouse(MOUSEEVENTF_WHEEL, pt, DWORD(int32_t(wheelV)));
         if (wheelH) SendMouse(MOUSEEVENTF_HWHEEL, pt, DWORD(int32_t(wheelH)));
@@ -344,11 +380,14 @@ void InputInjector::OnKey(const uint8_t* p, size_t n) {
     std::lock_guard lock(mutex_);
     const bool down = (p[0] & KeyDown) != 0;
     SendKey(code, down);
-    // Enter / Esc / Tab / arrows: offer to the UAC click path (dropped unless a prompt is up). Not gated
-    // on the inject result, since injection into a consent prompt returns success but is dropped.
-    if (down && uacForward_) {
-        WORD vk = UacVkFromWire(code);
-        if (vk) uacForward_(false, 0, 0, vk);
+    if (uacForward_) {
+        // Enter / Esc / Tab / arrows: offer to the UAC prompt (dropped unless one is up). Not gated on the
+        // inject result, since injection into a consent prompt returns success but is dropped.
+        if (down) { WORD vk = UacVkFromWire(code); if (vk) uacForward_({UacForwardEvent::KeyVk, 0, 0, vk}); }
+        // Every key, down and up: offer to the lock / sign-in screen as a full scancode so the PC's own
+        // layout and modifiers apply (typing the password). Dropped on the helper side unless the Windows
+        // sign-in screen is up, so a normal keypress costs only a cheap atomic read there.
+        uacForward_({UacForwardEvent::KeyScan, 0, 0, 0, code, down});
     }
 }
 
@@ -363,11 +402,13 @@ void InputInjector::ReleaseAll() {
     std::array<POINTER_TYPE_INFO, 10> frame{};
     UINT32 used = 0;
     for (auto& c : contacts_) {
-        if (!c.active) continue;
-        frame[used] = c.info;
-        frame[used++].touchInfo.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_CANCELED;
+        if (c.active && !c.onKeyboard) {
+            frame[used] = c.info;
+            frame[used++].touchInfo.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_CANCELED;
+        }
         c.active = false;
     }
+    keyboardPress_ = -1; // its button is lifted with the others below
     if (used) Inject(touchDev_, frame.data(), used, "touch release");
     if (penInContact_) InjectPen(POINTER_FLAG_UP | POINTER_FLAG_INRANGE, POINTER_CHANGE_FIRSTBUTTON_UP);
     if (penInRange_) InjectPen(POINTER_FLAG_UPDATE, POINTER_CHANGE_NONE);

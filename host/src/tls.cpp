@@ -12,6 +12,8 @@
 #include <bcrypt.h>
 #include <security.h>
 #include <schnlsp.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -28,6 +30,46 @@ constexpr wchar_t kKeyName[] = PD_TLS_KEY_NAME; // in the Windows user's key sto
 constexpr size_t kMaxHandshakeBytes = 64 * 1024;
 
 std::wstring IdentityPath() { return AppDataDir() + L"\\tls-identity.bin"; }
+
+// The machine-wide certificate lives beside the service's machine config, under %ProgramData%\PadDisplay,
+// readable by everyone (the certificate is public) but writable only by SYSTEM + administrators.
+std::wstring MachineIdentityPath() {
+    wchar_t pd[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(pd) : std::wstring(L"C:\\ProgramData");
+    dir += L"\\PadDisplay";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\tls-identity.bin";
+}
+
+// Grant the machine key to the signed-in user as well as SYSTEM and administrators, so the non-elevated tray
+// host can sign with the same key the SYSTEM pre-sign-in service uses. Without this a machine key is usable
+// only by its creator and SYSTEM, and the tray host's handshakes would fail.
+void GrantMachineKeyToUsers(NCRYPT_KEY_HANDLE key) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;AU)",
+                                                              SDDL_REVISION_1, &sd, nullptr))
+        return;
+    DWORD len = GetSecurityDescriptorLength(sd);
+    NCryptSetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, static_cast<PBYTE>(sd), len,
+                      NCRYPT_SILENT_FLAG | DACL_SECURITY_INFORMATION);
+    LocalFree(sd);
+}
+
+// Lock the machine certificate file to SYSTEM + administrators (full) and everyone else to read: the public
+// certificate must be readable by the tray host but tamper-proof to a standard user.
+void RestrictMachineFile(const std::wstring& path) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;AU)",
+                                                              SDDL_REVISION_1, &sd, nullptr))
+        return;
+    BOOL present = FALSE, defaulted = FALSE;
+    PACL dacl = nullptr;
+    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present)
+        SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr);
+    LocalFree(sd);
+}
 
 std::string HexColon(const uint8_t* p, size_t n) {
     static const char kDigits[] = "0123456789ABCDEF";
@@ -273,6 +315,7 @@ struct TlsIdentity::Impl {
     PCCERT_CONTEXT cert = nullptr;
     CredHandle cred{};
     bool haveCred = false;
+    bool machine = false; // the machine-wide identity (shared with the SYSTEM pre-sign-in service), vs the per-user one
     std::string fingerprint;
 
     ~Impl() {
@@ -281,23 +324,27 @@ struct TlsIdentity::Impl {
         if (prov) NCryptFreeObject(prov);
     }
 
-    // Schannel signs with the key the certificate points to. The key itself stays in the Windows user's key store:
-    // non-exportable, so the identity file holds only the public certificate.
+    std::wstring FilePath() const { return machine ? MachineIdentityPath() : IdentityPath(); }
+    DWORD KeyFlags() const { return machine ? NCRYPT_MACHINE_KEY_FLAG : 0; } // which key store the named key lives in
+
+    // Schannel signs with the key the certificate points to. The key itself stays in a Windows key store
+    // (per-user or machine), non-exportable, so the identity file holds only the public certificate.
     bool PointCertificateAtKey() {
         CRYPT_KEY_PROV_INFO kpi{};
         kpi.pwszContainerName = const_cast<LPWSTR>(kKeyName);
         kpi.pwszProvName = const_cast<LPWSTR>(MS_KEY_STORAGE_PROVIDER);
+        kpi.dwFlags = KeyFlags(); // CRYPT_MACHINE_KEYSET-equivalent, so Schannel opens the machine key
         return CertSetCertificateContextProperty(cert, CERT_KEY_PROV_INFO_PROP_ID, 0, &kpi) != 0;
     }
 
     bool Load() {
         std::vector<uint8_t> file;
         const size_t magic = sizeof(kFileMagic) - 1;
-        if (!ReadFileAll(IdentityPath(), file) || file.size() < magic + 4 || memcmp(file.data(), kFileMagic, magic) != 0) return false;
+        if (!ReadFileAll(FilePath(), file) || file.size() < magic + 4 || memcmp(file.data(), kFileMagic, magic) != 0) return false;
         uint32_t derLen = rd32(&file[magic]);
         if (derLen != file.size() - magic - 4) return false;
         NCRYPT_KEY_HANDLE key = 0;
-        if (NCryptOpenKey(prov, &key, kKeyName, 0, 0) != ERROR_SUCCESS) return false; // the file outlived its key
+        if (NCryptOpenKey(prov, &key, kKeyName, 0, KeyFlags()) != ERROR_SUCCESS) return false; // the file outlived its key
         cert = CertCreateCertificateContext(X509_ASN_ENCODING, &file[magic + 4], derLen);
         // The key under this name may have been replaced since the file was written (the file restored from a backup,
         // or deleted and made again): a certificate for another key would make every handshake fail.
@@ -314,9 +361,13 @@ struct TlsIdentity::Impl {
     }
 
     bool CreateAndSave() {
-        // A new key replaces whatever an earlier identity left under this name.
+        // A new key replaces whatever an earlier identity left under this name. Creating a machine key needs
+        // elevation (or SYSTEM); NCryptCreatePersistedKey fails for a standard user, and the caller falls back.
         NCRYPT_KEY_HANDLE key = 0;
-        if (NCryptCreatePersistedKey(prov, &key, NCRYPT_ECDSA_P256_ALGORITHM, kKeyName, 0, NCRYPT_OVERWRITE_KEY_FLAG) != ERROR_SUCCESS) return false;
+        if (NCryptCreatePersistedKey(prov, &key, NCRYPT_ECDSA_P256_ALGORITHM, kKeyName, 0,
+                                     NCRYPT_OVERWRITE_KEY_FLAG | KeyFlags()) != ERROR_SUCCESS)
+            return false;
+        if (machine) GrantMachineKeyToUsers(key); // before finalize, so the DACL is on the persisted key
         std::vector<uint8_t> der;
         bool ok = NCryptFinalizeKey(key, 0) == ERROR_SUCCESS && BuildSelfSignedCertificate(key, der);
         NCryptFreeObject(key);
@@ -328,22 +379,38 @@ struct TlsIdentity::Impl {
         wr32(&file[magic], uint32_t(der.size()));
         memcpy(&file[magic + 4], der.data(), der.size());
         // An identity that cannot be kept would change at every start and make tablets refuse the PC.
-        if (!WriteFileAtomic(IdentityPath(), file.data(), file.size())) return false;
+        const std::wstring path = FilePath();
+        if (!WriteFileAtomic(path, file.data(), file.size())) return false;
+        if (machine) RestrictMachineFile(path);
         cert = CertCreateCertificateContext(X509_ASN_ENCODING, der.data(), DWORD(der.size()));
         return cert && PointCertificateAtKey();
     }
 
-    bool Init() {
-        if (NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS) return false;
+    // Load the existing identity or make a new one, for whichever store `machine` currently selects.
+    bool LoadOrMake() {
         if (Load()) {
-            LOGI("tls: loaded the host identity");
-        } else {
-            if (cert) CertFreeCertificateContext(cert), cert = nullptr;
-            if (!CreateAndSave()) {
-                LOGI("tls: cannot create the host identity");
-                return false;
-            }
-            LOGI("tls: made a new host identity");
+            LOGI(machine ? "tls: loaded the machine identity" : "tls: loaded the host identity");
+            return true;
+        }
+        if (cert) { CertFreeCertificateContext(cert); cert = nullptr; }
+        if (!CreateAndSave()) return false;
+        LOGI(machine ? "tls: made a new machine identity" : "tls: made a new host identity");
+        return true;
+    }
+
+    bool Init(bool machineWide) {
+        if (NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS) return false;
+        machine = machineWide;
+        if (machine && !LoadOrMake()) {
+            // No machine identity and this process cannot create one (a standard user): keep the tablet working
+            // by presenting the per-user identity. The sign-in-screen service, which runs as SYSTEM, always can.
+            LOGI("tls: machine identity unavailable; falling back to the per-user identity");
+            machine = false;
+            if (cert) { CertFreeCertificateContext(cert); cert = nullptr; }
+        }
+        if (!machine && !LoadOrMake()) {
+            LOGI("tls: cannot create the host identity");
+            return false;
         }
         uint8_t hash[32];
         DWORD hashLen = sizeof(hash);
@@ -374,9 +441,9 @@ TlsIdentity::~TlsIdentity() = default;
 
 const std::string& TlsIdentity::Fingerprint() const { return impl_->fingerprint; }
 
-std::unique_ptr<TlsIdentity> TlsIdentity::LoadOrCreate() {
+std::unique_ptr<TlsIdentity> TlsIdentity::LoadOrCreate(bool machineWide) {
     std::unique_ptr<TlsIdentity> id(new TlsIdentity());
-    if (!id->impl_->Init()) return nullptr;
+    if (!id->impl_->Init(machineWide)) return nullptr;
     return id;
 }
 

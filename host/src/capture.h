@@ -1,7 +1,10 @@
 // PadDisplay by Nezucloud. Copyright (c) 2026 Nezucloud.
 // SPDX-License-Identifier: MIT
 // DXGI Desktop Duplication of one output, composed with the mouse cursor into a caller texture.
+// Or, where Desktop Duplication cannot see the monitor from this process, Windows.Graphics.Capture (capture_wgc.h).
 #pragma once
+#include "capture_wgc.h"
+
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -21,8 +24,16 @@ struct CaptureTarget {
     std::wstring adapterName;
 };
 
-// Finds the DXGI output (and the adapter that renders it) for a GDI source name.
+// Finds the DXGI output (and the adapter it is listed under) for a GDI source name.
 bool FindOutput(const std::wstring& gdiName, CaptureTarget& target);
+
+// The GPU that really renders this monitor, from Windows' display configuration: the monitor's adapter is the virtual display
+// driver's own, which carries the name of the GPU it renders on; the real adapter with that name is returned in target (adapter,
+// vendorId, adapterName; the rest is left alone). False when it cannot be told. DXGI cannot say: in only-screen mode it lists the
+// monitor under whichever adapter this process prefers, which may be the other GPU.
+bool FindRenderAdapter(const std::wstring& gdiName, CaptureTarget& target);
+// The first hardware adapter with this name (what the user chose), filling target the same way. For when FindRenderAdapter cannot say.
+bool FindAdapterByName(const std::wstring& name, CaptureTarget& target);
 
 // Creates a D3D11 device on the given adapter with video support (needed by both encoders).
 // gamingMode raises this process's GPU scheduling priority from high to realtime.
@@ -33,6 +44,10 @@ public:
     enum Result { Frame, Timeout, Lost, Failed };
 
     HRESULT Init(ID3D11Device* device, IDXGIOutput1* output, bool drawCursor);
+    // The same through Windows.Graphics.Capture. It copies whole frames, with the pointer drawn by Windows, and does not depend on the
+    // GPU this process prefers; the device should be on the GPU that renders the monitor. minIntervalMs: see WgcSource::Create.
+    HRESULT InitWgc(ID3D11Device* device, const std::wstring& gdiName, bool drawCursor, unsigned minIntervalMs);
+    bool UsesWgc() const { return wgc_ != nullptr; }
     // Waits up to timeoutMs for a desktop or pointer change and brings dst up to date: dst is the
     // encoder's persistent input (same size, B8G8R8A8, render-target bindable). Only the changed
     // rectangles are copied into it, then the cursor is drawn on top. force = compose even if
@@ -46,6 +61,7 @@ public:
     int Height() const { return height_; }
 
 private:
+    Result NextWgc(UINT timeoutMs, ID3D11Texture2D* dst, bool force, bool& fresh);
     bool InitCursorPipeline();
     void UpdateCursorShape(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& info, const std::vector<uint8_t>& shape);
     void DrawCursor(ID3D11Texture2D* dst);
@@ -54,6 +70,7 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<IDXGIOutputDuplication> dupl_;
+    std::unique_ptr<WgcSource> wgc_;
     ID3D11Texture2D* filled_ = nullptr; // the dst that currently holds the full desktop
     std::vector<uint8_t> meta_;          // move/dirty rectangle buffer
     std::vector<RECT> rects_;

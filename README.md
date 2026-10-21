@@ -8,7 +8,7 @@ Use an Android tablet as a **real extended monitor** for your Windows PC, over U
 - **A real second monitor,** not a mirror. Windows extends the desktop onto a virtual display, and the tablet shows it.
 - **Low latency.**
   - Capture copies only the parts of the screen that changed, straight into the hardware encoder's input, all on the GPU.
-  - Encoding uses NVENC (H.264/HEVC, ultra-low-latency) on NVIDIA GPUs, with a Media Foundation fallback for Intel and AMD.
+  - Encoding uses NVENC (H.264/HEVC, ultra-low-latency) on NVIDIA GPUs, and Intel Quick Sync or AMD AMF through Media Foundation. On a PC with two GPUs it picks the one that suits the moment (see *GPU choice*).
   - The tablet uses its hardware decoder in low-latency mode.
   - Measured on an RTX 4050 Laptop at 2560×1600: about 3.3 ms per frame to encode (H.264), and up to 120 fps.
 - **USB** (through `adb reverse`, set up automatically) **or Wi-Fi** (PCs are found automatically).
@@ -38,7 +38,7 @@ USB = adb reverse tcp:27183 (automatic) · Wi-Fi = UDP discovery on 27184, encry
 ## Requirements
 - **PC:**
   - Windows 10 1809+ or Windows 11, x64.
-  - An NVIDIA GPU is recommended (NVENC). Intel and AMD work through Media Foundation, but that path is less tested.
+  - An NVIDIA GPU is recommended (NVENC). Intel Quick Sync works through Media Foundation (measured at about 115 fps at 2560x1600 on an Intel UHD); AMD uses the same path and is less tested.
   - For USB mode, [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`), in `C:\android-platform-tools` or on PATH.
   - For game controllers, the [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver. It ships with PadDisplay and is installed by the admin setup step; the keyboard and mouse work without it.
   - For the tablet's microphone: Windows 10 or later. PadDisplay's own microphone driver (Windows 10 2004 or later) and VB-CABLE both ship with PadDisplay and are installed on request (tray menu, one administrator prompt). For the tablet's camera: Windows 11.
@@ -67,6 +67,7 @@ USB = adb reverse tcp:27183 (automatic) · Wi-Fi = UDP discovery on 27184, encry
 - **Input:**
   - The stylus is always a Windows pen. Fingers are ignored while the pen is near the screen.
   - With *Touch acts as mouse* on: tap = click, drag = drag, long-press or two-finger tap = right-click, two-finger drag = scroll.
+  - With it off, a finger on Windows' classic On-Screen Keyboard (osk.exe) presses the mouse button, because that keyboard types on a mouse press but only on a touch release: keys come as the finger touches. The mouse pointer moves to the key.
 - **Keyboard, mouse and game controllers:** connect them to the tablet (Bluetooth or USB) and they work on the PC. Turn this off with *Send keyboard, mouse and game controllers to the PC*.
   - **Keyboard:** the PC's keyboard layout applies, not the tablet's.
   - **System shortcuts (Alt+Tab, the Windows key, Ctrl+Esc, Alt+F4 and so on):** Android normally takes these for itself. To send them to the PC instead, switch on the **PadDisplay keyboard shortcuts** service once in Android's accessibility settings (the tablet app has a button for it, under *Input*). While PadDisplay is open and connected, every key goes to the PC and none of them acts on the tablet; leave PadDisplay (or pull down the notification shade) and Android has its keys back. Turn it off with *Send the keyboard's system shortcuts too*. The service reads no screen content and is only asked for keys during a session. On Android 13 and later, a sideloaded app may first need *Allow restricted settings* in its App info page.
@@ -91,6 +92,10 @@ USB = adb reverse tcp:27183 (automatic) · Wi-Fi = UDP discovery on 27184, encry
   - On: the PC's own screens are switched off while the tablet is connected, and everything moves to the tablet. They come back, arranged as they were, when it disconnects, when PadDisplay exits, and after a restart. A monitor that was dark for a while needs a second or two to wake up.
 - **Switching apps on the tablet:** PadDisplay stays connected while another app is in front or the tablet's screen is off (*Display → Stay connected in the background*, on by default). PC audio, the microphone and the camera keep running, the PC keeps the virtual monitor, and the picture is back as soon as you return. A notification shows meanwhile: tap it to go back, or tap *Disconnect*. While nothing is shown the tablet still receives the picture and throws it away, so disconnect when you are done to save battery. Turn the switch off to disconnect whenever you leave PadDisplay, as before.
 - **Gaming mode:** in the tablet app, *Display → Gaming mode*. Turn it on if the picture stutters while a game uses the whole GPU. With little free video memory it can freeze the NVIDIA encoder, so it's off by default.
+- **GPU choice** (tray menu *Encode on*, shown when the PC has more than one GPU, and listing only the GPUs this PC has): the encoder runs on the GPU that draws the virtual monitor, so this picks both. Choose any GPU you like: it is used in every mode, including when the tablet is the PC's only screen. PadDisplay sets its Windows GPU preference to match your choice (that is what keeps the fast capture below available), which takes one restart of PadDisplay: it happens when you choose, or after the tablet disconnects if one is connected, never in the middle of a connection. *Auto* (the default) is only a suggestion: the integrated GPU when the tablet's *Gaming mode* is on or the PC is on battery, and NVIDIA's NVENC otherwise.
+  - Measured on a laptop with an Intel UHD and an RTX 4050, 2560x1440 at 120 Hz: with no game, NVENC took 5.4 ms a frame and Quick Sync 7.8 ms, and NVENC used about a quarter of the CPU. With a game using the RTX 4050, NVENC fell to 42-49 fps and slowed the game by about 8%, while Quick Sync held 114-118 fps and the game lost under 2%. If you start a game without Gaming mode, the stream can slow down: connect again with Gaming mode on.
+  - **How the picture is captured:** with DXGI Desktop Duplication (changed areas only) when Windows lets PadDisplay see the monitor from the GPU it runs on, which is the case for the GPU you chose. Otherwise, for example when *Auto* moves to the other GPU for gaming or battery, with Windows.Graphics.Capture (whole frames; Windows 10 2004 or later; a little slower on Intel in my tests: about 10 ms against 9 ms to encode a 2560x1600 frame). PadDisplay switches by itself, with no restart. If capture still fails, it stops after about 8 seconds and tells the tablet, instead of leaving it blank.
+  - Other GPU combinations (AMD, Intel Arc) were not measured: Auto uses the integrated GPU there.
 - **Exit** from the tray removes the virtual monitor, leaving only your real screens.
 
 ## Build from source
@@ -130,6 +135,7 @@ Code layout:
 | `gpuMaxPerformance` | 1 | NVIDIA "prefer maximum performance" profile, applied by the admin setup step. Without it, the GPU idles between light updates and encoding slows from about 3 ms to 13–15 ms |
 | `nvencPreset` | `0` (auto) | auto = H.264 P2 / HEVC P3 |
 | `encoder` | `auto` | `nvenc` / `mf` (Media Foundation) |
+| `gpu` | `auto` | `auto`, or the name of one GPU as the tray menu *Encode on* shows it. The virtual monitor, and so the encoder, is on that GPU from the next connection |
 | `wifiQos` | 0 | tag the Wi-Fi stream as video (qWAVE). Off by default, because some routers drop the tagged packets |
 | `display` | empty | force a specific `\\.\DISPLAYn` |
 | `profile` | 0 | diagnostics: GPU copy time and the share of the screen copied per frame, in the stats line |
@@ -142,6 +148,8 @@ Diagnostics:
 
 ## Known limits
 - Desktop Duplication can't capture the UAC secure desktop or DRM-protected video; those show as black or frozen.
+  - **When the PC is locked** (or sitting at the Windows sign-in screen), that protected desktop can't be captured either. By default the tablet gets a notice saying the PC is locked, stays connected, and the picture continues once you sign in on the PC. To **sign in from the tablet instead**, run as administrator and turn on **tray → Let the tablet see and sign in to the lock screen** (or `lockScreenControl=1`): the tablet can then see and type into the sign-in screen (enter your Windows password) through a hidden System-level helper. Whoever has the PIN can then sign in to Windows, so treat the PIN like your password; it is off by default and a separate switch from the UAC option below. See [SECURITY.md](SECURITY.md).
+  - That covers locking **after** you have signed in. To reach the sign-in screen **straight from a cold boot** (before anyone signs in), also turn on **tray → Reach the sign-in screen before anyone signs in** (or `--install-service`): it installs an always-on SYSTEM service that serves the tablet over Wi-Fi only while no one is signed in, and steps aside the moment you sign in. It is the largest-surface feature, off until you install it. See [SECURITY.md](SECURITY.md).
   - **UAC prompts** (for example when you start an app as administrator) are shown on that secure desktop, so the tablet can't show them or answer them. The tablet gets a notice, stays connected, and the picture continues once the prompt is answered on the PC.
   - With the tablet as the PC's only screen, the PC's own screens are off, so answer the prompt with the PC's keyboard. If the tablet disconnects meanwhile, PadDisplay keeps trying to switch the PC's screens back on, and does as soon as the prompt is answered.
   - To **click UAC prompts from the tablet** in only-screen mode, run as administrator and turn on **tray → Let the tablet answer UAC prompts in only-screen mode**. While a tablet is the only screen, prompts then move to the normal (capturable) desktop so the tablet shows them, and a hidden System-level helper (a scheduled task PadDisplay registers) injects the tap, because the prompt runs above administrator level and an ordinary elevated program cannot click it. The helper only acts while the UAC prompt is in front and only forwards a click or Enter/Esc/Tab/arrows. This is the most powerful thing the tablet can do — whoever has the PIN can approve elevation — so it is off by default and weakens UAC while active; the secure-desktop change is put back on disconnect/exit. See [SECURITY.md](SECURITY.md).

@@ -47,6 +47,7 @@ void Settings::Load() {
     codec = GetStr(L"codec", codec);
     maxFps = std::clamp(GetInt(L"maxFps", maxFps), 10, 240);
     encoder = GetStr(L"encoder", encoder);
+    gpu = GetStr(L"gpu", gpu);
     nvencPreset = std::clamp(GetInt(L"nvencPreset", nvencPreset), 0, 7);
     gamingMode = GetInt(L"gamingMode", gamingMode) != 0;
     drawCursor = GetInt(L"drawCursor", drawCursor) != 0;
@@ -65,6 +66,8 @@ void Settings::Load() {
     cableMinPeriod = GetInt(L"cableMinPeriod", cableMinPeriod) != 0;
     acceptTabletCamera = GetInt(L"acceptTabletCamera", acceptTabletCamera) != 0;
     uacClickableOnTablet = GetInt(L"uacClickableOnTablet", uacClickableOnTablet) != 0;
+    lockScreenControl = GetInt(L"lockScreenControl", lockScreenControl) != 0;
+    preSignInAccess = GetInt(L"preSignInAccess", preSignInAccess) != 0;
     runAsAdmin = GetInt(L"runAsAdmin", runAsAdmin) != 0;
     autostartTask = GetInt(L"autostartTask", autostartTask) != 0;
     pin =uint32_t(wcstoul(GetStr(L"pin", L"0").c_str(), nullptr, 10));
@@ -85,6 +88,7 @@ void Settings::Save() const {
     PutStr(L"codec", codec);
     PutInt(L"maxFps", maxFps);
     PutStr(L"encoder", encoder);
+    PutStr(L"gpu", gpu);
     PutInt(L"nvencPreset", nvencPreset);
     PutInt(L"gamingMode", gamingMode);
     PutInt(L"drawCursor", drawCursor);
@@ -102,6 +106,8 @@ void Settings::Save() const {
     PutInt(L"cableMinPeriod", cableMinPeriod);
     PutInt(L"acceptTabletCamera", acceptTabletCamera);
     PutInt(L"uacClickableOnTablet", uacClickableOnTablet);
+    PutInt(L"lockScreenControl", lockScreenControl);
+    PutInt(L"preSignInAccess", preSignInAccess);
     PutInt(L"runAsAdmin", runAsAdmin);
     PutInt(L"autostartTask", autostartTask);
     PutInt(L"pin", pin);

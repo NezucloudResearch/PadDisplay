@@ -8,10 +8,12 @@
 
 #include <strmif.h>
 #include <codecapi.h>
+#include <mmsystem.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mftransform.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <array>
 
 using Microsoft::WRL::ComPtr;
@@ -30,10 +32,15 @@ public:
             mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
         }
         if (activate_) activate_->ShutdownObject();
+        if (timerRaised_) timeEndPeriod(1);
     }
 
     bool Init(ID3D11Device* device, const EncoderConfig& cfg) override {
         cfg_ = cfg;
+        // The Intel encoder MFT waits on the system timer between its pipeline stages: at the default 15.6 ms tick an
+        // encode took ~20 ms (p99 31 ms), at 1 ms ~8 ms (p99 12 ms; 0.5 ms is no better). Held only while this encoder
+        // exists, so an idle host does not pay for the extra wakeups.
+        timerRaised_ = timeBeginPeriod(1) == TIMERR_NOERROR;
         device_ = device;
         device_->GetImmediateContext(&ctx_);
         if (!FindMft()) return false;
@@ -59,7 +66,7 @@ public:
             SetCodecValue(CODECAPI_AVEncCommonMeanBitRate, VT_UI4, cfg.bitrateKbps * 1000);
             SetCodecValue(CODECAPI_AVEncMPVDefaultBPictureCount, VT_UI4, 0);
             SetCodecValue(CODECAPI_AVEncMPVGOPSize, VT_UI4, 0xFFFFFFFF);
-            SetCodecValue(CODECAPI_AVEncCommonQualityVsSpeed, VT_UI4, 60);
+            SetCodecValue(CODECAPI_AVEncCommonQualityVsSpeed, VT_UI4, 0); // fastest: ~1 ms less per 1440p frame than 60 on Intel
         }
 
         ComPtr<IMFMediaType> out, in;
@@ -147,23 +154,40 @@ private:
         if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, nullptr,
                              &outType, &acts, &count)) || count == 0)
             return Fail("no hardware encoder MFT for this codec");
-        int chosen = -1;
-        for (UINT32 i = 0; i < count && chosen < 0; ++i) {
+        // The adapter LUID attribute is often absent (0), so the vendor id is what ties an MFT to the capture adapter.
+        // Without it the first MFT (e.g. NVIDIA's) was taken even when the capture device was Intel's.
+        const UINT64 adapterLuid = (UINT64(UINT32(ad.AdapterLuid.HighPart)) << 32) | ad.AdapterLuid.LowPart;
+        wchar_t adapterVendor[16];
+        swprintf_s(adapterVendor, L"VEN_%04X", ad.VendorId);
+        auto matchRank = [&](IMFActivate* act) {
             UINT64 luid = 0;
-            if (SUCCEEDED(acts[i]->GetUINT64(MFT_ENUM_ADAPTER_LUID, &luid)) &&
-                luid == ((UINT64(UINT32(ad.AdapterLuid.HighPart)) << 32) | ad.AdapterLuid.LowPart))
-                chosen = int(i);
+            if (SUCCEEDED(act->GetUINT64(MFT_ENUM_ADAPTER_LUID, &luid)) && luid == adapterLuid) return 0;
+            wchar_t vendor[32] = L"";
+            if (SUCCEEDED(act->GetString(MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, vendor, 32, nullptr)) &&
+                _wcsicmp(vendor, adapterVendor) == 0)
+                return 1;
+            return 2;
+        };
+        std::vector<UINT32> order(count);
+        for (UINT32 i = 0; i < count; ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](UINT32 a, UINT32 b) { return matchRank(acts[a]) < matchRank(acts[b]); });
+
+        // An MFT whose GPU is asleep or missing (a dormant laptop dGPU) is listed but cannot be activated: try the next.
+        HRESULT hr = E_FAIL;
+        for (UINT32 i : order) {
+            wchar_t name[256] = L"?";
+            acts[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
+            hr = acts[i]->ActivateObject(IID_PPV_ARGS(&mft_));
+            if (SUCCEEDED(hr)) {
+                name_ = Narrow(name);
+                activate_ = acts[i];
+                break;
+            }
+            LOGI("mf: %ls could not be activated (0x%08lx)", name, hr);
         }
-        if (chosen < 0) chosen = 0;
-        wchar_t name[256] = L"?";
-        acts[chosen]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
-        name_ = Narrow(name);
-        HRESULT hr = acts[chosen]->ActivateObject(IID_PPV_ARGS(&mft_));
-        activate_ = acts[chosen];
         for (UINT32 i = 0; i < count; ++i) acts[i]->Release();
         CoTaskMemFree(acts);
-        if (FAILED(hr)) return Fail("ActivateObject");
-        return true;
+        return SUCCEEDED(hr) || Fail("no hardware encoder MFT could be activated");
     }
 
     bool InitConverter() {
@@ -282,6 +306,7 @@ private:
     std::array<ComPtr<ID3D11VideoProcessorInputView>, kRing> inViews_;
     std::array<ComPtr<ID3D11VideoProcessorOutputView>, kRing> outViews_;
     int cur_ = 0;
+    bool timerRaised_ = false;
 
     ComPtr<IMFActivate> activate_;
     ComPtr<IMFTransform> mft_;

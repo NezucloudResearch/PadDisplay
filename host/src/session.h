@@ -8,6 +8,7 @@
 #include "encoder.h"
 #include "gamepad.h"
 #include "input.h"
+#include "lockcapture.h"
 #include "micsink.h"
 #include "net.h"
 #include "settings.h"
@@ -56,14 +57,21 @@ public:
     void Stop();
 
 private:
+    bool GamingMode() const; // the tablet app decides; an app from before v3 cannot, so settings.ini does
+    void ChooseMonitorGpu(); // before the virtual monitor is switched on: which GPU renders it, and so encodes it
     int SetupPipeline();  // 1 ready, 0 retry later, -1 fatal
     bool StreamLoop();    // true = rebuild the pipeline, false = session over
+    // Encode the encoder's current input texture and send it (Config first if needed). Used by the
+    // locked-screen path (not the normal StreamLoop, which keeps its own tuned inline copy).
+    enum class Emit { Sent, EncoderFailed, SendFailed, NeedIdr };
+    Emit EmitFrame(bool& pendingIdr);
     bool Heartbeat(uint64_t now); // pings the tablet; false = it stopped answering or the connection is gone
     void RecvLoop();
     void InputLoop();
     bool Send(Msg type, const void* payload, uint32_t len);
     void SendError(ErrorCode code, const char* text);
     void SendNotice(const char* text); // shown on the tablet and as a tray warning; the session goes on
+    void SendLockState(bool frozen);   // tell a v5+ tablet whether the picture is frozen on the locked sign-in screen (offer the password box); sent only on change
     void AdaptBitrate();
     void ReportStatus(uint64_t now);
 
@@ -115,6 +123,12 @@ private:
     std::atomic<bool> layoutChanged_{false}; // it moved one: the capture target must be re-read
 
     std::wstring gdiName_;
+    std::wstring chosenGpu_;          // session thread only: the GPU the virtual monitor was asked to be rendered on (empty: not chosen)
+    std::wstring fallbackGpu_;        // session thread only: another GPU to try if the monitor does not come up on the chosen one
+    bool wgcOnly_ = false;            // session thread only: Desktop Duplication did not work here, capture with Windows.Graphics.Capture
+    int captureLostInRow_ = 0;        // session thread only: captures lost one right after the other (throttles the retries)
+    int captureLostNoFrame_ = 0;      // session thread only: captures lost since the last frame that arrived
+    uint64_t captureLostSinceUs_ = 0; // session thread only: when the first of those was lost
     CaptureTarget target_;
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> ctx_;
@@ -122,7 +136,10 @@ private:
     std::unique_ptr<Encoder> encoder_;
     std::unique_ptr<InputInjector> input_;
     bool uacClickable_ = false;              // only-screen + elevated + opted in: the tablet may click UAC prompts
-    std::unique_ptr<UacClickClient> uacClick_; // the client side of the System-level UAC injector (uacrelay.*)
+    bool lockControl_ = false;               // elevated + opted in: the tablet may see and type into the locked sign-in screen
+    std::unique_ptr<UacClickClient> uacClick_; // the client side of the System-level secure-desktop helper (uacrelay.*)
+    LockCaptureReceiver lockCap_;            // shared texture the helper writes the locked sign-in screen into (piece 3)
+    std::vector<uint8_t> au_, msg_;          // reused encode/send buffers for EmitFrame (locked path)
     Codec codec_ = CodecHEVC;
     int width_ = 0, height_ = 0, fps_ = 60;
     int bitrateKbps_ = 0, maxBitrateKbps_ = 0;
@@ -143,6 +160,7 @@ private:
     uint64_t lastSecondUs_ = 0;
     uint64_t lastPingUs_ = 0;         // session thread only
     bool secureDesktop_ = false;      // Windows is showing a UAC prompt, which cannot be captured
+    int lockStateSent_ = -1;          // session thread only: last LockState sent to the tablet (-1 none, 0/1), to send only on change
     uint32_t statusCount_ = 0;
 };
 

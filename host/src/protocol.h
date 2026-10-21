@@ -8,8 +8,9 @@
 namespace pd {
 
 // v2 adds FrameAck (flow control); v3 adds keyboard, relative mouse and game controllers; v4 adds the tablet's
-// microphone and camera as PC devices (their own connections). Older clients are still accepted.
-constexpr uint16_t kProtocolVersion = 4;
+// microphone and camera as PC devices (their own connections); v5 adds SecureText (type a password into the
+// locked sign-in screen from a box on the tablet). Older clients are still accepted.
+constexpr uint16_t kProtocolVersion = 5;
 constexpr uint16_t kMinProtocolVersion = 1;
 constexpr uint16_t kTcpPort = 27183;
 constexpr uint16_t kDiscoveryPort = 27184;
@@ -30,6 +31,8 @@ enum class Msg : uint8_t {
     CamState = 0x0A,    // camera connection: u8 active. 1 = a PC app has the webcam open, so capture; 0 = nobody does, stop (v4)
     CamKeyframeReq = 0x0B, // camera connection: empty; the host could not decode, send an IDR (v4)
     MicState = 0x0C,    // microphone connection: u8 active. 1 = a PC app records from the virtual microphone, so capture; 0 = nobody does, stop (v4)
+    LockState = 0x0D,   // u8 frozen. 1 = the PC is locked / at the sign-in screen and the tablet cannot show it (the picture is
+                        // frozen), so offer the password box; 0 = streaming normally again. Only sent to a v5+ client (v5)
     // client -> host
     ClientHello = 0x81, // u16 version, u16 screenW, u16 screenH, u16 dpi, u8 codecMask,
                         // u8 maxTouch, u32 pin, u16 maxFps, [v3: u8 flags,] utf-8 device name
@@ -51,6 +54,9 @@ enum class Msg : uint8_t {
     CamHello = 0x8F,    // first message of a camera connection: u16 version, u32 pin, u8 codec (1 = H.264), u16 width, u16 height, u8 fps (v4)
     CamConfig = 0x90,   // Annex-B SPS/PPS of the camera stream (v4)
     CamFrame = 0x91,    // u64 ptsUs, u8 flags (bit0 = keyframe), Annex-B access unit (v4)
+    SecureText = 0x92,  // u8 flags (bit0 = press Enter after), utf-8 text: type the Windows password into the
+                        // locked sign-in screen. Honoured only over an encrypted (or USB) link and only when
+                        // lock-screen control is on; the SYSTEM injector types it only onto the sign-in desktop (v5)
 };
 
 enum Codec : uint8_t { CodecH264 = 1, CodecHEVC = 2 };
@@ -67,6 +73,7 @@ enum MouseKind : uint8_t {
     MouseMiddleDown = 6, MouseMiddleUp = 7, MouseX1Down = 8, MouseX1Up = 9, MouseX2Down = 10, MouseX2Up = 11 // v3
 };
 enum KeyFlags : uint8_t { KeyDown = 1 };
+enum SecureTextFlags : uint8_t { SecureTextSubmit = 1 }; // press Enter after the text (submit the password)
 enum GamepadFlags : uint8_t { GamepadConnected = 1 };
 constexpr uint16_t kKeyExtended = 0x100; // the scancode has the E0 prefix (arrows, right Ctrl, ...)
 constexpr uint16_t kKeyPause = 0x145;    // Pause, whose real code (E1 1D 45) does not fit this scheme
