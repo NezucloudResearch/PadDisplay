@@ -1,6 +1,10 @@
 // Windows version info shown in the exe's Properties > Details.
 #include <winver.h>
 
+// The application icon (Explorer, the installer, shortcuts and the taskbar). Same artwork as the
+// Android launcher icon. The lowest icon ID is the one the shell shows for the exe.
+1 ICON "app.ico"
+
 #ifndef PD_VERSION_MAJOR
 #define PD_VERSION_MAJOR 0
 #define PD_VERSION_MINOR 0
