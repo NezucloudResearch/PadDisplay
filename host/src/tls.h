@@ -30,10 +30,16 @@ private:
 // The host's certificate and key, made on first run. The certificate is kept in %LOCALAPPDATA%\PadDisplay\tls-identity.bin;
 // the private key stays in the Windows user's key store (non-exportable). Tablets remember the certificate's
 // fingerprint the first time they connect.
+//
+// machineWide picks a single identity the whole PC shares: the cert in %ProgramData%\PadDisplay and a machine
+// key store key ACL'd to SYSTEM, administrators and the signed-in user. The pre-sign-in service (SYSTEM) and
+// the normal tray host then present the SAME fingerprint, so the tablet trusts the sign-in screen and the
+// desktop as one PC. Creating it needs elevation (or SYSTEM); a non-elevated host that finds none falls back
+// to the per-user identity. Used only when pre-sign-in access is on, so ordinary users are unaffected.
 class TlsIdentity {
 public:
     ~TlsIdentity();
-    static std::unique_ptr<TlsIdentity> LoadOrCreate(); // null if Schannel or the key store failed
+    static std::unique_ptr<TlsIdentity> LoadOrCreate(bool machineWide = false); // null if Schannel or the key store failed
     // Server handshake on a connected socket. Blocking; the socket's SO_RCVTIMEO / SO_SNDTIMEO apply. Null = failed.
     std::shared_ptr<TlsState> Accept(SOCKET s, std::string* info = nullptr);
     const std::string& Fingerprint() const; // SHA-256 of the certificate, "AB:CD:..."

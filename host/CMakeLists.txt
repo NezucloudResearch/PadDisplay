@@ -11,6 +11,8 @@ add_executable(PadDisplay WIN32
     src/settings.cpp
     src/display.cpp
     src/capture.cpp
+    src/capture_wgc.cpp
+    src/lockcapture.cpp
     src/encoder_nvenc.cpp
     src/encoder_mf.cpp
     src/net.cpp
@@ -20,6 +22,7 @@ add_executable(PadDisplay WIN32
     src/session.cpp
     src/vdd.cpp
     src/gpu_profile.cpp
+    src/gpu_select.cpp
     src/audio.cpp
     src/micsink.cpp
     src/micuse.cpp
@@ -29,6 +32,7 @@ add_executable(PadDisplay WIN32
     src/camsink.cpp
     src/vcam.cpp
     src/uacrelay.cpp
+    src/service.cpp
     src/app.rc
 )
 
@@ -49,7 +53,7 @@ target_compile_definitions(PadDisplay PRIVATE
 target_compile_options(PadDisplay PRIVATE /W4 /permissive- /utf-8 /wd4100 /wd4201)
 target_link_libraries(PadDisplay PRIVATE
     ViGEmClient d3d11 dxgi d3dcompiler ws2_32 iphlpapi shell32 user32 gdi32 advapi32
-    mfplat mfuuid mf mfreadwrite qwave setupapi newdev cfgmgr32 avrt ole32 secur32 crypt32 ncrypt bcrypt wmcodecdspuuid wintrust taskschd oleaut32 wtsapi32 userenv
+    mfplat mfuuid mf mfreadwrite qwave setupapi newdev cfgmgr32 avrt winmm windowsapp ole32 secur32 crypt32 ncrypt bcrypt wmcodecdspuuid wintrust taskschd oleaut32 wtsapi32 userenv
     ${CMAKE_SOURCE_DIR}/third_party/nvapi/amd64/nvapi64.lib)
 
 # The virtual monitor driver package ships next to the exe (driver\vdd).

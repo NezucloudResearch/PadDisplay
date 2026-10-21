@@ -33,17 +33,39 @@
 namespace pd {
 
 // Fixed 12-byte command frames on the pipe (no variable-length parsing).
-enum class UacCmd : uint32_t { Click = 1, Key = 2 };
+//   Click    - a UAC button, or a control on the locked sign-in screen
+//   Key      - a UAC-navigation virtual key (Enter/Esc/Tab/Space/arrows), consent prompts only
+//   KeyScan  - a full key for typing into the locked sign-in screen (the Windows password)
+//   UnicodeChar - one UTF-16 code unit typed into the locked sign-in screen (a password box on the tablet
+//                 sends its text this way: layout-independent, any character, no per-key scancode mapping)
+//   MouseMove- move the cursor on the locked sign-in screen
+//   CaptureLuid + StartCapture - ask the helper to capture the sign-in (Winlogon) desktop into the
+//                                host's shared texture so the tablet can SEE the locked screen (piece 3);
+//                                CaptureLuid carries the host encode GPU's adapter, StartCapture the size.
+//   StopCapture               - stop that capture (unlocked, or the session ended).
+enum class UacCmd : uint32_t {
+    Click = 1, Key = 2, KeyScan = 3, MouseMove = 4,
+    CaptureLuid = 5,  // a = LUID.LowPart, b = LUID.HighPart (signed)
+    StartCapture = 6, // a = width, b = height
+    StopCapture = 7,  // a = 0, b = 0
+    UnicodeChar = 8,  // a = one UTF-16 code unit; b = 0 (the injector presses and releases it)
+};
 #pragma pack(push, 1)
 struct UacFrame {
     uint32_t cmd; // UacCmd
-    int32_t a;    // Click: screen x; Key: virtual-key code
-    int32_t b;    // Click: screen y; Key: 0
+    int32_t a;    // Click/MouseMove: screen x; Key: virtual-key code; KeyScan: wire scancode (bit 8 = E0-extended); UnicodeChar: UTF-16 unit
+    int32_t b;    // Click/MouseMove: screen y; Key: 0; KeyScan: 1 = down, 0 = up; UnicodeChar: 0
 };
 #pragma pack(pop)
 
 constexpr wchar_t kUacRelayTask[] = L"\\PadDisplay\\UacClickRelay";
 constexpr wchar_t kUacPipeName[] = L"\\\\.\\pipe\\PadDisplayUacClick";
+
+// Shared objects for lock-screen capture (piece 3), both in the Global namespace so the elevated host
+// (interactive session) and the SYSTEM helper (its own session) name the same kernel objects. The host
+// creates them with a SYSTEM+administrators-only security descriptor; the helper opens them by name.
+constexpr wchar_t kLockTexName[] = L"Global\\PadDisplayLockScreenTex";  // a shared keyed-mutex B8G8R8A8 texture
+constexpr wchar_t kLockFrameEvent[] = L"Global\\PadDisplayLockScreenFrame"; // auto-reset: the helper set a fresh frame
 
 // --- used by the main (elevated) PadDisplay ------------------------------------------------------
 
@@ -67,20 +89,43 @@ bool ConsentPromptOpen();                  // some top-level consent.exe window 
 // helper cannot be reached. Safe to construct when the feature is off; then it is simply never fed.
 class UacClickClient {
 public:
-    explicit UacClickClient(std::function<void(const char*)> notice);
+    // [allowLockScreen]: the lockScreenControl setting is on, so while the session is locked this may also
+    // forward full keystrokes and cursor moves to the sign-in screen (type the Windows password). When it
+    // is off, the client only ever forwards UAC-prompt clicks/keys, even if the PC is locked - so turning
+    // on the UAC-click feature alone never grants lock-screen typing.
+    UacClickClient(std::function<void(const char*)> notice, bool allowLockScreen);
     ~UacClickClient();
-    // [x],[y] in virtual-desktop pixels (the same screen coordinates InputInjector::Map returns). Dropped
-    // unless the window under the point is a consent prompt; the injector re-checks before it clicks.
+    // [x],[y] in virtual-desktop pixels (the same screen coordinates InputInjector::Map returns). A click
+    // is forwarded when the window under the point is a consent prompt, or (lock-screen feature on, and the
+    // session locked) unconditionally; the injector re-checks the target desktop before it clicks.
     void Click(int x, int y);
     // [vk] is checked against the small allow-list on the injector side too. Dropped unless a prompt is up.
     void Key(WORD vk);
+    // Lock / sign-in screen only (session locked): a full key for typing the Windows password, and cursor
+    // moves. Both return at once (a cheap atomic read) unless the session is locked, so they cost nothing on
+    // the normal input path. The injector drops them unless the Winlogon (sign-in) desktop is the input desktop.
+    void KeyScan(uint16_t code, bool down);
+    // Lock / sign-in screen only: type [text] (the Windows password, typed into a box on the tablet) as a
+    // run of UTF-16 code units, then press Enter when [submit]. Unlike KeyScan this is independent of the
+    // PC's keyboard layout, so any character types correctly. Gated on the lock-screen feature here; the
+    // injector additionally drops it unless the sign-in (Winlogon) desktop is the input desktop, so the
+    // password can never be typed into a normal app. The caller zeroes [text] afterwards.
+    void TypeUnicode(const std::wstring& text, bool submit);
+    void MouseMove(int x, int y);
+    // Ask the System helper to start/stop capturing the sign-in desktop into the host's shared texture
+    // (named kLockTexName), on the adapter [luid] at [w]x[h]. The host sets up the shared texture first
+    // (LockCaptureReceiver). Capture only happens on the helper side while the Winlogon desktop is active.
+    void StartCapture(LUID luid, int w, int h);
+    void StopCapture();
 
 private:
     void Worker();
+    void Enqueue(const UacFrame& f); // bounded, drop-oldest; coalesces cursor moves
     bool Ensure();          // task triggered + pipe connected (worker thread only)
     bool Send(const UacFrame& f);
 
     std::function<void(const char*)> notice_;
+    const bool allowLockScreen_;
     std::thread thread_;
     std::mutex mutex_;
     std::condition_variable cv_;

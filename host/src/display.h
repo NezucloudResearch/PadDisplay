@@ -89,6 +89,15 @@ bool AllowUacClicksOnTablet(); // true = UAC prompts are now on the normal deskt
 bool HostIsElevated();         // the PadDisplay process runs with administrator rights
 void RestoreSecureDesktop();   // undo AllowUacClicksOnTablet; a no-op if nothing was changed
 
+// Whether this interactive session is locked (Win+L, timeout, Ctrl+Alt+Del lock). The tray window
+// learns it from WM_WTSSESSION_CHANGE and reports it here. A locked session, unlike a UAC prompt,
+// moves the desktop to Winlogon: Desktop Duplication and injection are both refused to the host
+// there (E_ACCESSDENIED / ERROR_ACCESS_DENIED), and only a System helper on that desktop can reach
+// it. The session uses this to tell the tablet the truth ("the PC is locked") instead of blaming a
+// UAC prompt, and to decide whether to hand capture and input to that helper.
+void SetSessionLocked(bool locked); // called from the tray window proc only
+bool SessionIsLocked();
+
 // Logs every display device and DXGI output (for --list and diagnostics).
 void LogDisplays();
 

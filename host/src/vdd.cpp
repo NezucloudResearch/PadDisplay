@@ -75,10 +75,11 @@ bool FindDevice(HDEVINFO set, SP_DEVINFO_DATA& out, const wchar_t* hardwareId = 
 }
 
 std::wstring GpuFriendlyName() {
-    // Prefer the discrete GPU so NVENC/AMF can encode the virtual monitor without cross-adapter copies.
+    // The encoder runs on the GPU that renders the virtual monitor (no cross-adapter copies). Prefer Intel, so
+    // Quick Sync encodes and the discrete GPU can stay asleep; otherwise the discrete GPU for NVENC/AMF.
     Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return L"default";
-    std::wstring best = L"default";
+    std::wstring best = L"default", intel;
     SIZE_T bestMem = 0;
     int hardware = 0;
     Microsoft::WRL::ComPtr<IDXGIAdapter1> a;
@@ -87,12 +88,14 @@ std::wstring GpuFriendlyName() {
         a->GetDesc1(&d);
         if ((d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || d.VendorId == 0x1414) continue;
         ++hardware;
+        if (d.VendorId == 0x8086 && intel.empty()) intel = d.Description;
         if (d.DedicatedVideoMemory > bestMem) {
             bestMem = d.DedicatedVideoMemory;
             best = d.Description;
         }
     }
-    return hardware > 1 ? best : L"default"; // single GPU: let the driver pick
+    if (hardware <= 1) return L"default"; // single GPU: let the driver pick
+    return intel.empty() ? best : intel;
 }
 
 std::string DefaultSettingsXml() {
@@ -382,6 +385,62 @@ std::atomic<bool> vddFailed{false};
 void SetVddFailed(bool failed) { vddFailed = failed; }
 bool VddFailed() { return vddFailed; }
 
+namespace {
+
+// The "oemNN.inf" Windows copied the driver package to when it was installed, read from the device's driver key.
+std::wstring StoredInfOf(HDEVINFO set, SP_DEVINFO_DATA& d) {
+    wchar_t driverKey[MAX_PATH] = {};
+    if (!SetupDiGetDeviceRegistryPropertyW(set, &d, SPDRP_DRIVER, nullptr, reinterpret_cast<BYTE*>(driverKey), sizeof(driverKey) - sizeof(wchar_t), nullptr))
+        return L"";
+    wchar_t name[MAX_PATH] = {};
+    DWORD size = sizeof(name) - sizeof(wchar_t);
+    const std::wstring key = std::wstring(L"SYSTEM\\CurrentControlSet\\Control\\Class\\") + driverKey;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"InfPath", RRF_RT_REG_SZ, nullptr, name, &size) != ERROR_SUCCESS) return L"";
+    wchar_t windows[MAX_PATH];
+    if (!GetWindowsDirectoryW(windows, MAX_PATH)) return L"";
+    return std::wstring(windows) + L"\\INF\\" + name;
+}
+
+// The on task can fail for good: pnputil once answered error 1167 ("the device is not connected") to the disabled device, while
+// the tray's "Enable virtual monitor driver" got it going with SetupAPI's enable (setupapi.dev.log showed it started before that
+// item's driver update ran). So enable it the same way, and if it still does not start (a device stuck in a problem state),
+// reinstall its driver, which restarts it. The driver comes from Windows' own driver store, which only an administrator can
+// write: an elevated process must not install, unasked, from the PadDisplay folder, which may be a copy any program of the
+// user can change. Needs administrator rights.
+bool RepairVddDevice() {
+    HDEVINFO set = SetupDiGetClassDevsW(&kDisplayClass, nullptr, nullptr, 0);
+    if (set == INVALID_HANDLE_VALUE) return false;
+    SP_DEVINFO_DATA d{sizeof(d)};
+    std::wstring inf;
+    const bool found = FindDevice(set, d);
+    if (found) {
+        const bool enabled = ChangeState(set, d, DICS_ENABLE, DICS_FLAG_GLOBAL) || ChangeState(set, d, DICS_ENABLE, DICS_FLAG_CONFIGSPECIFIC);
+        LOGI("vdd: repair: enable device -> %s", enabled ? "ok" : Narrow(LastErrorText(GetLastError())).c_str());
+        inf = StoredInfOf(set, d);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    if (!found) {
+        LOGI("vdd: repair: no device to repair");
+        return false;
+    }
+    for (int i = 0; i < 15 && QueryVdd() != VddState::Ready; ++i) Sleep(100);
+    if (QueryVdd() == VddState::Ready) return true;
+    if (inf.empty()) {
+        LOGI("vdd: repair: the device is still not ready, and its driver package is not in the driver store");
+        return false;
+    }
+    // Forced: this is the installed package itself, which without the flag counts as no better and is skipped (error 259).
+    BOOL reboot = FALSE;
+    const bool bound = UpdateDriverForPlugAndPlayDevicesW(nullptr, kHardwareId, inf.c_str(), INSTALLFLAG_FORCE, &reboot) != FALSE;
+    LOGI("vdd: repair: reinstall driver %ls -> %s", inf.c_str(), bound ? "ok" : Narrow(LastErrorText(GetLastError())).c_str());
+    return bound;
+}
+
+// How long the on task gets before an administrator host repairs the device itself (it takes 0.25 to 2 s when it works).
+constexpr ULONGLONG kTaskGraceMs = 3000;
+
+} // namespace
+
 bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs) {
     VddState want = on ? VddState::Ready : VddState::Disabled;
     if (QueryVdd() == want) return true;
@@ -389,12 +448,14 @@ bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs) {
     if (on) RememberRealScreens();
     DWORD code = 1;
     RunCapture(L"schtasks.exe /run /tn \"" + std::wstring(on ? kTaskOn : kTaskOff) + L"\"", 10000, &code);
+    const bool canRepair = on && HostIsElevated();
     if (code != 0) {
         LOGI("vdd: cannot start the %s task (%lu)", on ? "on" : "off", code);
-        return false;
+        if (!canRepair) return false;
     }
-    ULONGLONG deadline = GetTickCount64() + timeoutMs;
-    while (GetTickCount64() < deadline) {
+    const ULONGLONG start = GetTickCount64(), deadline = start + timeoutMs;
+    bool repaired = false;
+    for (;;) {
         if (QueryVdd() == want) {
             LOGI("vdd: virtual monitor %s", on ? "enabled" : "removed");
             // Windows re-applies its stored layout for the new monitor set a moment later; if that
@@ -402,6 +463,16 @@ bool SetVirtualMonitorEnabled(bool on, unsigned timeoutMs) {
             RestoreRealScreens();
             return true;
         }
+        const ULONGLONG now = GetTickCount64();
+        if (canRepair && !repaired && (code != 0 || now - start > kTaskGraceMs)) {
+            repaired = true;
+            std::wstring detail;
+            QueryVdd(&detail);
+            LOGI("vdd: the on task did not bring the virtual monitor up (%ls): repairing the device", detail.c_str());
+            RepairVddDevice();
+            continue; // look at once; the repair may have used up the rest of the time
+        }
+        if (now >= deadline) break;
         Sleep(100);
     }
     LOGI("vdd: virtual monitor did not %s in time", on ? "come back" : "go away");
@@ -431,7 +502,11 @@ static VddState QueryDevice(const GUID& deviceClass, const wchar_t* hardwareId, 
         else if (problem == CM_PROB_DISABLED) state = VddState::Disabled;
         else if ((status & DN_HAS_PROBLEM) || !(status & DN_STARTED)) state = VddState::Problem;
         else state = VddState::Ready;
-        if (detail) *detail = L"status 0x" + std::to_wstring(status) + L", problem " + std::to_wstring(problem);
+        if (detail) {
+            wchar_t text[64];
+            swprintf_s(text, L"status 0x%lx, problem %lu", status, problem);
+            *detail = text;
+        }
         if (problemOut) *problemOut = problem;
     }
     SetupDiDestroyDeviceInfoList(set);
@@ -1032,5 +1107,27 @@ bool EnsureVddMode(int width, int height, int hz, bool& changed) {
     LOGI("vdd: added %dx%d@%d to vdd_settings.xml", width, height, hz);
     return ReloadDriver();
 }
+
+bool SetVddGpu(const std::wstring& name, bool& changed) {
+    changed = false;
+    if (!EnsureSettingsFile()) return false;
+    std::string xml;
+    if (!ReadFile(VddSettingsPath(), xml)) return false;
+    const std::string want = Narrow(name);
+    static const std::regex gpuName("(<gpu>\\s*<friendlyname>)[^<]*(</friendlyname>)");
+    std::smatch m;
+    if (!std::regex_search(xml, m, gpuName)) return false; // a file from another version of the driver: leave it alone
+    if (m.str().find(">" + want + "<") != std::string::npos) return true;
+    xml = std::regex_replace(xml, gpuName, "$1" + want + "$2", std::regex_constants::format_first_only);
+    if (!WriteFileAtomic(VddSettingsPath(), xml)) {
+        LOGI("vdd: cannot write %ls (%lu)", VddSettingsPath().c_str(), GetLastError());
+        return false;
+    }
+    LOGI("vdd: the virtual monitor is rendered by '%s' from now on", want.c_str());
+    changed = true;
+    return true;
+}
+
+bool ReloadVddDriver() { return ReloadDriver(); }
 
 } // namespace pd

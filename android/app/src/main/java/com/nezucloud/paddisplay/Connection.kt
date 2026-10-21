@@ -24,13 +24,14 @@ class Connection(private val host: String, private val port: Int, private val tr
 
     interface Listener {
         fun onFingerprintChanged(fingerprint: String)
-        fun onHostHello(codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int)
+        fun onHostHello(version: Int, codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int)
         fun onConfig(data: ByteArray, length: Int)
         fun onFrame(ptsUs: Long, keyframe: Boolean, data: ByteArray, offset: Int, length: Int)
         fun onPing(rttUs: Int, bitrateKbps: Int)
         fun onError(code: Int, message: String)
         fun onRumble(index: Int, large: Int, small: Int)
         fun onNotice(message: String)
+        fun onLockState(frozen: Boolean) // the PC is locked and cannot be shown (true) or streaming again (false)
         fun onClosed(reason: String?)
     }
 
@@ -120,6 +121,7 @@ class Connection(private val host: String, private val port: Int, private val tr
                 }
                 when (type) {
                     Protocol.HOST_HELLO -> if (len >= 12) listener.onHostHello(
+                        pb.getShort(0).toInt() and 0xFFFF,
                         payload[2].toInt() and 0xFF,
                         pb.getShort(3).toInt() and 0xFFFF,
                         pb.getShort(5).toInt() and 0xFFFF,
@@ -142,6 +144,7 @@ class Connection(private val host: String, private val port: Int, private val tr
                     Protocol.RUMBLE -> if (len >= 3) listener.onRumble(
                         payload[0].toInt() and 0xFF, payload[1].toInt() and 0xFF, payload[2].toInt() and 0xFF)
                     Protocol.NOTICE -> listener.onNotice(String(payload, 0, len, Charsets.UTF_8))
+                    Protocol.LOCK_STATE -> if (len >= 1) listener.onLockState(payload[0].toInt() != 0)
                     Protocol.ERROR -> {
                         val code = if (len > 0) payload[0].toInt() and 0xFF else 0
                         val text = if (len > 1) String(payload, 1, len - 1, Charsets.UTF_8) else "Error $code"

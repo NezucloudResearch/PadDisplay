@@ -45,6 +45,13 @@ bool CreateTaskFromXml(const wchar_t* name, const std::wstring& xml, std::wstrin
 // the running driver to reload it (no administrator rights needed). changed reports a reload.
 bool EnsureVddMode(int width, int height, int hz, bool& changed);
 
+// Names the GPU that renders the virtual monitor in vdd_settings.xml (the encoder follows it). The driver reads it when the
+// monitor is switched on, or on ReloadVddDriver for a monitor that is on. changed reports a different GPU than before.
+// No administrator rights needed.
+bool SetVddGpu(const std::wstring& name, bool& changed);
+// Asks the running driver to read vdd_settings.xml again (the monitor is re-plugged for a moment).
+bool ReloadVddDriver();
+
 std::wstring VddSettingsPath();
 
 // ViGEmBus (Nefarius), the virtual game controller bus. The installer ships in driver\vigem (BSD-3-Clause).

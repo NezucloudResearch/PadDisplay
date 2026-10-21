@@ -31,6 +31,73 @@ bool FindOutput(const std::wstring& gdiName, CaptureTarget& target) {
     return false;
 }
 
+bool FindRenderAdapter(const std::wstring& gdiName, CaptureTarget& target) {
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) return false;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS) return false;
+    LUID monitorAdapter{};
+    bool found = false;
+    for (const auto& path : paths) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), path.sourceInfo.adapterId, path.sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&source.header) == ERROR_SUCCESS && _wcsicmp(source.viewGdiDeviceName, gdiName.c_str()) == 0) {
+            monitorAdapter = path.sourceInfo.adapterId;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    std::vector<ComPtr<IDXGIAdapter1>> adapters;
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) adapters.push_back(adapter);
+    auto sameLuid = [&](const DXGI_ADAPTER_DESC1& d) { return d.AdapterLuid.LowPart == monitorAdapter.LowPart && d.AdapterLuid.HighPart == monitorAdapter.HighPart; };
+    // The monitor's adapter is the virtual display driver's, named after the GPU it renders on...
+    const ComPtr<IDXGIAdapter1>* driverAdapter = nullptr;
+    DXGI_ADAPTER_DESC1 driverDesc{};
+    for (auto& a : adapters) {
+        DXGI_ADAPTER_DESC1 d;
+        a->GetDesc1(&d);
+        if (sameLuid(d)) { driverAdapter = &a; driverDesc = d; break; }
+    }
+    if (!driverAdapter) return false;
+    // ...and the real adapter of that name is the one to put a device on (the driver's own one is only its stand-in).
+    for (auto& a : adapters) {
+        DXGI_ADAPTER_DESC1 d;
+        a->GetDesc1(&d);
+        if (!sameLuid(d) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && wcscmp(d.Description, driverDesc.Description) == 0) {
+            target.adapter = a;
+            target.vendorId = d.VendorId;
+            target.adapterName = d.Description;
+            return true;
+        }
+    }
+    target.adapter = *driverAdapter;
+    target.vendorId = driverDesc.VendorId;
+    target.adapterName = driverDesc.Description;
+    return true;
+}
+
+bool FindAdapterByName(const std::wstring& name, CaptureTarget& target) {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d;
+        adapter->GetDesc1(&d);
+        if ((d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || name != d.Description) continue;
+        target.adapter = adapter;
+        target.vendorId = d.VendorId;
+        target.adapterName = d.Description;
+        return true;
+    }
+    return false;
+}
+
 // D3DKMTSetProcessSchedulingPriorityClass (gdi32): lets our copy/encode work preempt normal GPU work.
 // High is enough next to desktop apps, but a game that keeps the GPU at 100% still starves it
 // (a frame took 30-40 ms instead of 6). Gaming mode asks for realtime, as Sunshine does. It is
@@ -75,6 +142,7 @@ HRESULT DesktopCapture::Init(ID3D11Device* device, IDXGIOutput1* output, bool dr
     device_->GetImmediateContext(&ctx_);
     drawCursor_ = drawCursor;
     dupl_.Reset();
+    wgc_.reset();
     filled_ = nullptr;
     rtvFor_ = nullptr;
     rtv_.Reset();
@@ -101,8 +169,39 @@ HRESULT DesktopCapture::Init(ID3D11Device* device, IDXGIOutput1* output, bool dr
     return S_OK;
 }
 
+HRESULT DesktopCapture::InitWgc(ID3D11Device* device, const std::wstring& gdiName, bool drawCursor, unsigned minIntervalMs) {
+    device_ = device;
+    device_->GetImmediateContext(&ctx_);
+    dupl_.Reset();
+    filled_ = nullptr;
+    rtvFor_ = nullptr;
+    rtv_.Reset();
+    underSaved_ = false;
+    drawCursor_ = false; // Windows draws the pointer into the frames: nothing of ours to draw or restore
+    wgc_ = WgcSource::Create(device, gdiName, drawCursor, minIntervalMs, width_, height_);
+    return wgc_ ? S_OK : E_FAIL;
+}
+
+DesktopCapture::Result DesktopCapture::NextWgc(UINT timeoutMs, ID3D11Texture2D* dst, bool force, bool& fresh) {
+    switch (wgc_->Next(timeoutMs, ctx_.Get(), dst)) {
+    case WgcSource::Result::Frame:
+        filled_ = dst;
+        fresh = true;
+        lastCopied_ = 1;
+        return Frame;
+    case WgcSource::Result::Lost:
+        return Lost;
+    case WgcSource::Result::Timeout:
+        break;
+    }
+    if (!force || filled_ != dst) return Timeout;
+    lastCopied_ = 0;
+    return Frame; // nothing new, but the caller wants the picture encoded again: dst still holds it
+}
+
 DesktopCapture::Result DesktopCapture::Next(UINT timeoutMs, ID3D11Texture2D* dst, bool force, bool& fresh) {
     fresh = false;
+    if (wgc_) return NextWgc(timeoutMs, dst, force, fresh);
     DXGI_OUTDUPL_FRAME_INFO info{};
     ComPtr<IDXGIResource> res;
     HRESULT hr = dupl_->AcquireNextFrame(timeoutMs, &info, &res);

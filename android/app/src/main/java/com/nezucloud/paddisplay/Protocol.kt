@@ -7,7 +7,7 @@ import java.nio.ByteOrder
 
 /** Wire protocol shared with the Windows host (see docs/PROTOCOL.md). Little-endian. */
 object Protocol {
-    const val VERSION = 4 // v2: client acks every frame (host flow control); v3: keyboard, relative mouse, game controllers; v4: microphone and camera to the PC
+    const val VERSION = 5 // v2: client acks every frame (host flow control); v3: keyboard, relative mouse, game controllers; v4: microphone and camera to the PC; v5: type the password into the locked sign-in screen
     const val TCP_PORT = 27183
     const val DISCOVERY_PORT = 27184
     const val HEADER_SIZE = 5
@@ -25,6 +25,7 @@ object Protocol {
     const val CAM_STATE = 0x0A         // camera connection: u8 active (a PC app has the webcam open)
     const val CAM_KEYFRAME_REQ = 0x0B  // camera connection: the host needs an IDR
     const val MIC_STATE = 0x0C         // microphone connection: u8 active (a PC app records from the virtual microphone)
+    const val LOCK_STATE = 0x0D        // u8 frozen: the PC is locked and the tablet cannot show it, so offer the password box (v5)
 
     // client -> host
     const val CLIENT_HELLO = 0x81
@@ -44,6 +45,8 @@ object Protocol {
     const val CAM_HELLO = 0x8F
     const val CAM_CONFIG = 0x90
     const val CAM_FRAME = 0x91
+    const val SECURE_TEXT = 0x92        // u8 flags (bit0 = press Enter) + utf-8 text: type into the locked sign-in screen (v5)
+    const val SECURE_TEXT_SUBMIT = 1    // press Enter after the text (submit the password)
     const val AUDIO_MUTE_PC = 1
     const val HELLO_GAMING_MODE = 1
     const val HELLO_ONLY_SCREEN = 2
@@ -117,6 +120,15 @@ object Protocol {
         buf.putInt(payloadSize)
         fill(buf)
         return bytes
+    }
+
+    /** The Windows password (typed into a box on the tablet), to be typed into the locked sign-in screen. */
+    fun secureText(text: String, submit: Boolean): ByteArray {
+        val textBytes = text.toByteArray(Charsets.UTF_8)
+        return message(SECURE_TEXT, 1 + textBytes.size) {
+            it.put((if (submit) SECURE_TEXT_SUBMIT else 0).toByte())
+            it.put(textBytes)
+        }
     }
 
     fun clientHello(screenW: Int, screenH: Int, dpi: Int, codecMask: Int, pin: Int, maxFps: Int, flags: Int, name: String): ByteArray {

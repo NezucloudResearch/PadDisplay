@@ -625,6 +625,12 @@ bool WriteUacPolicy(DWORD value) {
 
 bool HostIsElevated() { return IsProcessElevated(); }
 
+// Set from the tray message thread, read from the session thread: a plain atomic is enough (no
+// ordering with other state), and it never blocks a hot thread.
+namespace { std::atomic<bool> g_sessionLocked{false}; }
+void SetSessionLocked(bool locked) { g_sessionLocked.store(locked, std::memory_order_relaxed); }
+bool SessionIsLocked() { return g_sessionLocked.load(std::memory_order_relaxed); }
+
 bool AllowUacClicksOnTablet() {
     if (!IsProcessElevated()) { // writing HKLM policy, and clicking the elevated prompt, both need elevation
         LOGI("uac: not moving prompts off the secure desktop - PadDisplay is not elevated");
