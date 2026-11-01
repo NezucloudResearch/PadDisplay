@@ -26,6 +26,7 @@ struct Settings {
     bool monitorOnlyWhileConnected = true; // the virtual monitor (the driver device) is switched off while no tablet is connected, so Windows
                                            // shows only the real screens; on when a tablet connects, off again when it leaves
     bool removeMonitorOnExit = true;
+    int reconnectGraceSeconds = 30; // a tablet that lost its link has this long to come back before the monitor goes off (0 = at once)
     bool gpuMaxPerformance = true;   // NVIDIA profile "prefer maximum performance" for PadDisplay.exe (set at install)
     bool profile = false;            // time GPU compose separately from encode (diagnostics; adds a GPU sync) // disable the virtual monitor when PadDisplay exits
     std::wstring displayOverride; // e.g. \\.\DISPLAY5; empty = auto-detect the virtual display

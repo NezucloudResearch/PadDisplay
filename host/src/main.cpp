@@ -13,6 +13,7 @@
 //                                  capture+encode the virtual display to a raw stream file (no tablet needed)
 #include "cablesink.h"
 #include "capture.h"
+#include "crashdump.h"
 #include "display.h"
 #include "log.h"
 #include "micbackend.h"
@@ -575,8 +576,7 @@ void ShowMenu(HWND hwnd) {
 }
 
 bool TabletConnected() {
-    std::lock_guard lock(g_statusMutex);
-    return g_status != L"Waiting for tablet";
+    return g_server && g_server->TabletConnected();
 }
 
 // Starts this program again, as it is (with administrator rights if it has them: no prompt then), and leaves the virtual monitor to it.
@@ -1069,7 +1069,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     const SetupCommand* setup = FindSetupCommand(argc, argv);
     bool console = HasArg(argc, argv, L"--console") || list || dumpPath;
 
-    // Before LogInit, which truncates host.log: a second copy must not wipe the running one's log.
+    // Before LogInit: a second copy must not write into the running one's log.
     HANDLE single = nullptr;
     if (!dumpPath && !list && !setup) {
         bool running = false;
@@ -1080,8 +1080,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
     }
 
+    // The tray host appends: its log then also holds the run before (a crash, the restart for administrator rights).
+    const bool tray = !setup && !dumpPath && !list;
     LogInit(AppDataDir() + (setup ? L"\\install-driver.log" : dumpPath || list ? L"\\host-cli.log" : L"\\host.log"), console,
-            setup && HasArg(argc, argv, L"--append-log"));
+            tray || (setup && HasArg(argc, argv, L"--append-log")));
+    if (tray) InstallCrashHandler(AppDataDir());
     g_settings.Load();
     if (setup) return setup->run();
     if (single && g_settings.runAsAdmin && !IsElevated()) {
@@ -1218,6 +1221,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     adb.Stop();
     beacon.Stop();
+    // Restarting (another PadDisplay takes over, or one starts after an install): the tablet reconnects to it by itself.
+    if (g_server) g_server->Stop(g_handedOver || g_restartAfterInstall ? SessionEnd::HostRestart : SessionEnd::HostExit);
     g_server.reset();       // ends the session, which restores the secure desktop if it had moved UAC prompts
     RestoreSecureDesktop(); // and again here in case no session was tracking it
     WaitScreenRestore(5000); // the PC's own screens must not stay off just because a UAC prompt was up when we left

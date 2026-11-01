@@ -16,6 +16,18 @@ static FILE* g_file = nullptr;
 static bool g_console = false;
 static std::wstring g_path;
 
+// A log kept across runs moves to "<name>.old.log" once it is this big, so the run before a crash is still there and the
+// files do not grow for ever.
+static void RotateIfLarge(const std::wstring& path) {
+    constexpr ULONGLONG kMaxBytes = 2 * 1024 * 1024;
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) return;
+    if ((ULONGLONG(info.nFileSizeHigh) << 32 | info.nFileSizeLow) < kMaxBytes) return;
+    const size_t dot = path.rfind(L'.');
+    const std::wstring old = (dot == std::wstring::npos ? path : path.substr(0, dot)) + L".old.log";
+    MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
 void LogInit(const std::wstring& path, bool console, bool append) {
     g_path = path;
     g_console = console;
@@ -25,7 +37,12 @@ void LogInit(const std::wstring& path, bool console, bool append) {
         freopen_s(&f, "CONOUT$", "w", stdout);
         SetConsoleOutputCP(CP_UTF8);
     }
+    if (append) RotateIfLarge(path);
     g_file = _wfsopen(path.c_str(), append ? L"a" : L"w", _SH_DENYNO); // readable while running
+    // The lines carry the time of day only: this says which day, and where one run ends and the next begins.
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    Log("---- %04d-%02d-%02d, process %lu", t.wYear, t.wMonth, t.wDay, GetCurrentProcessId());
 }
 
 std::wstring LogPath() { return g_path; }
@@ -46,6 +63,13 @@ void Log(const char* fmt, ...) {
     OutputDebugStringA(line);
     if (g_console) fputs(line, stdout), fflush(stdout);
     if (g_file) fputs(line, g_file), fflush(g_file);
+}
+
+bool LogNoWait(const char* text) {
+    std::unique_lock lock(g_mutex, std::try_to_lock);
+    if (!lock.owns_lock() || !g_file) return false;
+    fputs(text, g_file), fputc('\n', g_file), fflush(g_file);
+    return true;
 }
 
 std::string Narrow(const std::wstring& w) {

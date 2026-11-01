@@ -47,9 +47,11 @@ object Protocol {
     const val CAM_FRAME = 0x91
     const val SECURE_TEXT = 0x92        // u8 flags (bit0 = press Enter) + utf-8 text: type into the locked sign-in screen (v5)
     const val SECURE_TEXT_SUBMIT = 1    // press Enter after the text (submit the password)
+    const val BYE = 0x93                // empty: the user disconnected, so the host need not wait for a reconnect
     const val AUDIO_MUTE_PC = 1
     const val HELLO_GAMING_MODE = 1
     const val HELLO_ONLY_SCREEN = 2
+    const val HELLO_RECONNECTS = 4      // this app says BYE when the user disconnects and reconnects by itself after a lost link
 
     const val CODEC_H264 = 1
     const val CODEC_HEVC = 2
@@ -58,6 +60,8 @@ object Protocol {
 
     const val ERR_BAD_PIN = 1
     const val ERR_ENCRYPTION_REQUIRED = 7 // sent to a plain connection when the PC's requireEncryption is on; this app is always TLS over Wi-Fi
+    const val ERR_HOST_CLOSED = 8         // PadDisplay was closed on the PC: do not reconnect
+    const val ERR_REPLACED = 9            // another tablet took over the PC: do not reconnect
 
     const val TOUCH_DOWN = 0
     const val TOUCH_MOVE = 1

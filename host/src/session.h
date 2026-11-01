@@ -47,6 +47,13 @@ private:
     std::thread thread_;
 };
 
+// Why a session ended. It decides whether the tablet is told (so it does not reconnect) and whether the virtual monitor stays on.
+enum class SessionEnd { None, TabletLeft, Lost, Replaced, HostExit, HostRestart, Failed };
+const char* SessionEndName(SessionEnd why);
+
+// Switches the virtual monitor off (or, without the on/off tasks, takes it off the desktop). Slow: seconds.
+void SwitchVirtualMonitorOff(const std::wstring& gdiName);
+
 // One connected tablet: captures the virtual display, encodes, streams, and injects its input.
 // With conn.s == INVALID_SOCKET and a dump file it runs the capture/encode pipeline only (test mode).
 class Session {
@@ -54,12 +61,21 @@ public:
     Session(Conn conn, const ClientHello& hello, bool usb, const Settings& settings, StatusFn status);
     ~Session();
     void Run(FILE* dump = nullptr, int dumpSeconds = 0);
-    void Stop();
+    void Stop(SessionEnd why);
+    // After Run: the tablet lost its link and reconnects by itself, so the virtual monitor was left on for it.
+    bool KeepsMonitorForReconnect() const { return keepMonitor_; }
+    const std::wstring& MonitorName() const { return gdiName_; }
 
 private:
+    bool PrepareDisplay();   // false = the session cannot go on; the tablet has been told
+    void Serve();            // streams and injects input until the session ends
+    void Teardown();         // always last: the threads end, the PC's screens and the virtual monitor are put back
+    void EndAs(SessionEnd why); // the first reason given is kept
+    void SendGoodbye(SessionEnd why);
     bool GamingMode() const; // the tablet app decides; an app from before v3 cannot, so settings.ini does
     void ChooseMonitorGpu(); // before the virtual monitor is switched on: which GPU renders it, and so encodes it
     int SetupPipeline();  // 1 ready, 0 retry later, -1 fatal
+    bool DeviceLost() const; // the GPU was reset or its driver replaced: the device and all made on it are gone
     bool StreamLoop();    // true = rebuild the pipeline, false = session over
     // Encode the encoder's current input texture and send it (Config first if needed). Used by the
     // locked-screen path (not the normal StreamLoop, which keeps its own tuned inline copy).
@@ -84,6 +100,9 @@ private:
     std::mutex sendMutex_; // frames, rumble and notices are sent from different threads
 
     std::atomic<bool> stop_{false};
+    std::atomic<SessionEnd> end_{SessionEnd::None};
+    bool monitorUsed_ = false;  // session thread only: the virtual monitor was found or switched on for this session
+    bool keepMonitor_ = false;  // set by Teardown, see KeepsMonitorForReconnect
     std::atomic<bool> keyframeRequested_{true};
     std::atomic<uint32_t> lastRttUs_{0};
     std::atomic<uint64_t> rttSumUs_{0};
@@ -164,21 +183,43 @@ private:
     uint32_t statusCount_ = 0;
 };
 
+// Switches the virtual monitor off a while after a session lost its tablet, unless a new session comes first: the windows on it
+// stay where they are for a tablet that reconnects. Waits on a condition variable (no polling) on its own thread. Its calls come
+// one after the other: the ending session's thread schedules, and whoever starts or stops the next session cancels or runs it.
+class DeferredMonitorOff {
+public:
+    ~DeferredMonitorOff() { Cancel(); }
+    void Schedule(int seconds, const std::wstring& gdiName);
+    void Cancel(); // a new session uses the monitor as it is; waits if the switching is under way
+    void RunNow(); // PadDisplay exits: switch it off now, if that was pending
+
+private:
+    void Finish(bool switchOff);
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool cancel_ = false, now_ = false;
+    std::thread thread_;
+};
+
 // Accepts tablets on TCP 27183 (dual-stack). A newly connected tablet replaces the current one.
 class Server {
 public:
     Server(const Settings& settings, StatusFn status) : settings_(settings), status_(std::move(status)) {}
-    ~Server() { Stop(); }
+    ~Server() { Stop(SessionEnd::HostExit); }
     bool Start();
-    void Stop();
+    void Stop(SessionEnd why); // HostExit tells the tablet; HostRestart lets it reconnect to the next PadDisplay
     void UpdateSettings(const Settings& s);
+    bool TabletConnected() const { return tabletConnected_; }
     // SHA-256 of the certificate tablets pin, "AB:CD:..."; empty when TLS is unavailable.
     std::string TlsFingerprint() const { return tls_ ? tls_->Fingerprint() : std::string(); }
 
 private:
     void AcceptLoop();
-    void Handle(SOCKET s, const sockaddr_storage& addr);
-    void StopSession();
+    void CutSlowHandshakes();
+    static void CutOff(SOCKET s);
+    void EndHandshakeDeadline(uint64_t id); // the connection passes to a session: it is no handshake to cut off any more
+    bool Handle(SOCKET s, const sockaddr_storage& addr, uint64_t id); // true = a session owns the socket now
+    void StopSession(SessionEnd why);
     void StopAudio();
     void StopMic();
     void StopCam();
@@ -196,7 +237,20 @@ private:
     std::mutex pinMutex_;
     std::map<std::string, PinBucket> pinBuckets_;
 
-    std::atomic<int> handshakes_{0}; // connections still in the hello/PIN stage (own threads)
+    // Connections in the hello/PIN stage, each on its own thread. The accept loop cuts off those that take too long (a client
+    // trickling one byte at a time would otherwise hold a slot for ever), and Stop waits until every one of those threads is done.
+    struct Handshake {
+        SOCKET s = INVALID_SOCKET;
+        ULONGLONG startedMs = 0;
+        bool cuttable = true;
+    };
+    std::mutex handshakeMutex_;
+    std::condition_variable handshakeDone_;
+    std::map<uint64_t, Handshake> handshakes_;
+    uint64_t nextHandshakeId_ = 0; // accept thread only
+
+    DeferredMonitorOff monitorOff_;
+    std::atomic<bool> tabletConnected_{false};
     std::mutex sessionMutex_;        // serializes "replace the running session"
     std::mutex mutex_;
     Settings settings_;

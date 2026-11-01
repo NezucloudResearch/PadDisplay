@@ -1,4 +1,4 @@
-# PadDisplay wire protocol (version 3)
+# PadDisplay wire protocol (version 5)
 
 There is one TCP connection per tablet (encrypted with TLS over Wi-Fi: see *Transport security*). The tablet is the client and the host listens on **27183**, dual-stack. Over USB the tablet connects to `127.0.0.1:27183`, which `adb reverse` tunnels to the PC. The PIN is checked on every connection, USB included, unless the host sets `requireUsbPin=0`: the tunnel is reachable by any app on the tablet. All integers are **little-endian**.
 
@@ -31,7 +31,7 @@ The host may send another `HostHello`, followed by a new `Config`, at any time, 
 | 0x02 | Config | Annex-B parameter sets (VPS/SPS/PPS); queue with `BUFFER_FLAG_CODEC_CONFIG` |
 | 0x03 | Frame | u64 ptsUs, u8 flags (bit0 = keyframe), Annex-B access unit |
 | 0x04 | Ping | u64 hostTimeUs, u32 lastRttUs, u32 currentBitrateKbps. The client must answer with `Pong`. hostTimeUs is 0 in the pings before `HostHello`: those only keep the connection alive |
-| 0x05 | Error | u8 code (1 bad PIN, 2 version, 3 no display, 4 encoder, 6 locked out after too many wrong PINs, 7 the PC only accepts encrypted connections), UTF-8 text |
+| 0x05 | Error | u8 code (1 bad PIN, 2 version, 3 no display, 4 encoder, 6 locked out after too many wrong PINs, 7 the PC only accepts encrypted connections, 8 PadDisplay was closed on the PC, 9 another tablet took over the PC), UTF-8 text. After 8 and 9 a client must not reconnect (see *Ending a session and reconnecting*) |
 | 0x08 | Rumble | u8 controller index, u8 largeMotor, u8 smallMotor (0–255, 0 = off). The level holds until the next `Rumble` for that controller (v3) |
 | 0x09 | Notice | UTF-8 text for the tablet to show. The session goes on. Used when a game controller cannot be created on the PC (v3) |
 | 0x0D | LockState | u8 frozen: 1 = the PC is locked / at the sign-in screen and the tablet can't show it (the picture is frozen), so the tablet offers its password box; 0 = streaming normally again, hide it. Sent only on a change, and only to a v5+ client (v5) |
@@ -41,7 +41,7 @@ The stream has no B-frames and an infinite GOP, so IDRs are sent only on request
 ## Client → host
 | type | name | payload |
 |---|---|---|
-| 0x81 | ClientHello | u16 version, u16 screenW, u16 screenH, u16 dpi, u8 codecMask (bit0 H.264, bit1 HEVC), u8 maxTouch, u32 pin, u16 maxFps (the refresh rate chosen on the tablet; the host switches the virtual monitor to the closest mode), v3 only: u8 flags (bit0 = gaming mode, bit1 = only screen), UTF-8 device name |
+| 0x81 | ClientHello | u16 version, u16 screenW, u16 screenH (the resolution the client asks the host to render; below the panel's own when the tablet app's *PC renders at* is under 100%, and the client upscales), u16 dpi, u8 codecMask (bit0 H.264, bit1 HEVC), u8 maxTouch, u32 pin, u16 maxFps (the refresh rate chosen on the tablet; the host switches the virtual monitor to the closest mode), v3 only: u8 flags (bit0 = gaming mode, bit1 = only screen), UTF-8 device name |
 | 0x82 | Touch | u8 count, then count × { u8 pointerId, u8 kind (0 down, 1 move, 2 up, 3 cancel), u16 x, u16 y, u16 pressure (0–1024), u16 size } |
 | 0x83 | Pen | u8 kind (0 hover, 1 down, 2 move, 3 up, 4 leave), u8 buttons (bit0 barrel, bit1 eraser), u16 x, u16 y, u16 pressure (0–1024), i8 tiltX, i8 tiltY (−90…90) |
 | 0x84 | Mouse | u8 kind (0 move, 1 left down, 2 left up, 3 right down, 4 right up, 5 wheel; v3: 6 middle down, 7 middle up, 8 X1/back down, 9 X1 up, 10 X2/forward down, 11 X2 up), u16 x, u16 y, i16 wheelV, i16 wheelH (120 = one notch) |
@@ -54,11 +54,20 @@ The stream has no B-frames and an infinite GOP, so IDRs are sent only on request
 | 0x8B | MouseRel | u8 kind (as for `Mouse`), i16 dx, i16 dy, i16 wheelV, i16 wheelH (v3). A captured mouse: kind 0 moves the pointer by dx, dy; buttons and the wheel act where the pointer is |
 | 0x8C | Gamepad | u8 index (0–3), u8 flags (bit0 = connected), u16 buttons, u8 leftTrigger, u8 rightTrigger, i16 leftX, i16 leftY, i16 rightX, i16 rightY (v3). See *Game controllers* below |
 | 0x92 | SecureText | u8 flags (bit0 = press Enter after), then utf-8 text (v5). The Windows password, typed into a box on the tablet, to be typed into the **locked sign-in screen**. The host honours it only over an encrypted (TLS) or USB link and only when lock-screen control is on; the SYSTEM helper types it only while the sign-in (Winlogon) desktop is the input desktop, so it can never reach a normal app. See *Typing the sign-in password* below |
+| 0x93 | Bye | empty. The user disconnected on purpose, so the host need not keep the virtual monitor for a reconnect. Sent last, right before the client closes the connection. Hosts that predate it ignore it |
 
 ## Hello flags (v3)
 A v3 `ClientHello` has one more byte before the device name, with the choices made in the tablet app. v1 and v2 hellos don't have it.
 - **bit0, gaming mode:** the host asks Windows for realtime GPU scheduling, so a game that uses the whole GPU can't starve capture and encoding. For older clients the host uses `gamingMode` from `settings.ini` instead.
 - **bit1, only screen:** once the virtual monitor is attached, the host makes it the PC's only active display, so the PC's own screens go dark. When the session ends they come back. The host applies this without saving it in Windows' display database, so after a crash or a restart Windows returns to the stored setup by itself. If it can't be applied, the host sends a `Notice` and the tablet stays an extra screen.
+- **bit2, reconnects:** the client sends `Bye` when the user disconnects, and connects again by itself (with the same `ClientHello`) after losing the connection. The host then keeps the virtual monitor for it a while. Hosts that predate it ignore the bit.
+
+## Ending a session and reconnecting
+- **The user disconnects:** the client sends `Bye` and closes the connection. The host switches the virtual monitor off at once (`monitorOnlyWhileConnected`).
+- **The connection is lost** (no message for 10 s, a reset, a failed send) **from a client that set bit2:** the host keeps the virtual monitor on, with the windows on it, for `reconnectGraceSeconds` (default 30), unless the tablet was the PC's only screen: the PC's own screens always come back at once. A `ClientHello` within that time gets the monitor as it was; otherwise the host switches it off.
+- **A new connection replaces the session** (newest wins): the old connection gets `Error` 9 first, and the virtual monitor stays on for the new session.
+- **PadDisplay exits on the PC:** the client gets `Error` 8. When PadDisplay only restarts (another copy takes over, the sign-in screen's host hands over to the user's), the client gets nothing and reconnects.
+- **The client reconnects** only after it has received `HostHello` once on this screen, and not after an `Error`. It retries after 0.5, 1 and then every 2 s, for up to 60 s, keeping the last picture on screen meanwhile.
 
 ## Keyboard (v3)
 `Key` carries the key's **position**, as a PC scancode (set 1 make code, 1–0x7F), not a character: the PC applies its own keyboard layout, as for a keyboard plugged into it.
@@ -148,6 +157,7 @@ v1 clients (no acks) are still accepted, but they only get RTT-based bitrate ada
 - **v3:** `Key`, `MouseRel`, `Gamepad`, more `Mouse` buttons, `Rumble`, `Notice`, and the flags byte in `ClientHello`.
 - **v4:** the microphone and camera connections: `MicHello`, `MicData`, `CamHello`, `CamConfig`, `CamFrame`, `CamState`, `CamKeyframeReq`. Nothing in the screen stream changed. A tablet app that sends version 4 needs a host of version 4 or later.
 - **v5:** `SecureText` (type the Windows password into the locked sign-in screen) and `LockState` (the host tells the tablet when the picture is frozen on that screen, so the box is offered only then). Older clients never send `SecureText` and ignore `LockState`, which the host sends only to a v5+ client. Nothing else changed.
+- **Since v5, with no new version number** (old peers simply ignore them): `Bye`, `ClientHello` flag bit2, and `Error` codes 8 and 9.
 
 A host accepts every client version up to its own, and rejects a newer one with error code 2. It only sends `Rumble` or `Notice` to a client that has sent `Gamepad`.
 

@@ -54,6 +54,7 @@ void Settings::Load() {
     matchClientResolution = GetInt(L"matchClientResolution", matchClientResolution) != 0;
     monitorOnlyWhileConnected = GetInt(L"monitorOnlyWhileConnected", monitorOnlyWhileConnected) != 0;
     removeMonitorOnExit = GetInt(L"removeMonitorOnExit", removeMonitorOnExit) != 0;
+    reconnectGraceSeconds = std::clamp(GetInt(L"reconnectGraceSeconds", reconnectGraceSeconds), 0, 600);
     gpuMaxPerformance = GetInt(L"gpuMaxPerformance", gpuMaxPerformance) != 0;
     profile = GetInt(L"profile", profile) != 0;
     displayOverride = GetStr(L"display", L"");
@@ -95,6 +96,7 @@ void Settings::Save() const {
     PutInt(L"matchClientResolution", matchClientResolution);
     PutInt(L"monitorOnlyWhileConnected", monitorOnlyWhileConnected);
     PutInt(L"removeMonitorOnExit", removeMonitorOnExit);
+    PutInt(L"reconnectGraceSeconds", reconnectGraceSeconds);
     PutInt(L"gpuMaxPerformance", gpuMaxPerformance);
     PutStr(L"display", displayOverride);
     PutStr(L"adbPath", adbPath);

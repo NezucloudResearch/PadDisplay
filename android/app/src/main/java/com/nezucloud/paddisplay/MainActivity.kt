@@ -145,6 +145,14 @@ class MainActivity : Activity() {
         ui.addRow(display, labelled("Refresh rate", choiceList("refreshRate", 0,
             listOf(0 to "Highest (${rates.last()} Hz)") + rates.map { it to "$it Hz" }),
             "The PC's virtual monitor switches to match."))
+        ui.addRow(display, labelled("PC renders at", choiceList("renderScale", 100, listOf(
+            100 to "Native (sharpest)",
+            75 to "75% (faster)",
+            50 to "50% (fastest)")),
+            "Lower = less work for the PC and this tablet, so less delay; the picture is upscaled here. The PC's virtual monitor switches to match."))
+        ui.addRow(display, toggle("Sharp upscaling",
+            "Upscales with the GPU (Snapdragon GSR, works on Snapdragon and MediaTek). Off = plain stretch, the least delay. Only used below Native.",
+            "sharpUpscale", true))
         ui.addRow(display, labelled("Wi-Fi power mode while streaming", choiceList("wifiMode", 1, listOf(
             1 to "High performance (recommended)",
             2 to "Low latency (may stall a few seconds when connecting on some devices)",

@@ -39,7 +39,7 @@ WaitingPing::~WaitingPing() {
 }
 
 Session::~Session() {
-    Stop();
+    Stop(SessionEnd::Failed); // Run has ended by now, with its own reason; this only makes sure the threads are told
     if (recvThread_.joinable()) recvThread_.join();
     if (inputThread_.joinable()) inputThread_.join();
     if (layoutThread_.joinable()) layoutThread_.join();
@@ -51,9 +51,32 @@ Session::~Session() {
     if (conn_.s != INVALID_SOCKET) closesocket(conn_.s);
 }
 
-void Session::Stop() {
+void Session::Stop(SessionEnd why) {
+    EndAs(why);
+    if (conn_.s == INVALID_SOCKET) {
+        stop_ = true;
+        return;
+    }
+    if (why == SessionEnd::HostExit || why == SessionEnd::Replaced) SendGoodbye(why);
     stop_ = true;
-    if (conn_.s != INVALID_SOCKET) shutdown(conn_.s, SD_BOTH); // unblocks send/recv in the session threads
+    shutdown(conn_.s, SD_BOTH); // unblocks send/recv in the session threads
+}
+
+// Tells the tablet that the session was ended on purpose, so it does not try to reconnect (two tablets would otherwise take
+// the PC from each other in turn). Runs on the thread that stops the session, never a session thread. Skipped when the link
+// is stalled and a session thread is stuck in a send: the tablet then finds out by itself.
+void Session::SendGoodbye(SessionEnd why) {
+    std::unique_lock lock(sendMutex_, std::defer_lock);
+    for (int i = 0; i < 20 && !lock.try_lock(); ++i) Sleep(10); // a frame being sent takes well under that
+    if (!lock.owns_lock()) return;
+    DWORD timeout = 500;
+    setsockopt(conn_.s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
+    const bool exiting = why == SessionEnd::HostExit;
+    const char* text = exiting ? "PadDisplay was closed on the PC." : "Another tablet connected to this PC.";
+    std::vector<uint8_t> p(1 + strlen(text));
+    p[0] = exiting ? ErrHostClosed : ErrReplaced;
+    memcpy(p.data() + 1, text, p.size() - 1);
+    SendMsg(conn_, Msg::Error, p.data(), uint32_t(p.size()));
 }
 
 bool Session::Send(Msg type, const void* payload, uint32_t len) {
@@ -65,7 +88,9 @@ bool Session::Send(Msg type, const void* payload, uint32_t len) {
     }
     if (conn_.s == INVALID_SOCKET) return false;
     std::lock_guard lock(sendMutex_);
-    return SendMsg(conn_, type, payload, len);
+    if (SendMsg(conn_, type, payload, len)) return true;
+    EndAs(SessionEnd::Lost);
+    return false;
 }
 
 void Session::SendNotice(const char* text) {
@@ -84,6 +109,7 @@ void Session::SendLockState(bool frozen) {
 
 void Session::SendError(ErrorCode code, const char* text) {
     LOGI("session error %d: %s", code, text);
+    EndAs(SessionEnd::Failed);
     std::vector<uint8_t> p(1 + strlen(text));
     p[0] = code;
     memcpy(p.data() + 1, text, p.size() - 1);
@@ -98,9 +124,19 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     lastRecvUs_ = startUs_;
     deadlineUs_ = dumpSeconds > 0 ? startUs_ + uint64_t(dumpSeconds) * 1000000 : 0;
     CancelScreenRestore(); // this session arranges the screens now; an earlier one's retry must not undo that
-    std::optional<WaitingPing> waiting; // until the receive thread and the stream take over
-    if (conn_.s != INVALID_SOCKET) waiting.emplace(conn_, sendMutex_);
+    bool prepared = false;
+    {
+        std::optional<WaitingPing> waiting; // until the receive thread and the stream take over
+        if (conn_.s != INVALID_SOCKET) waiting.emplace(conn_, sendMutex_);
+        prepared = PrepareDisplay();
+    }
+    if (prepared) Serve();
+    Teardown(); // every way out, so a monitor switched on above is switched off again
+}
 
+// Chooses the stream format and the GPU, switches the virtual monitor on and attaches it, arranges the real screens. Slow
+// (seconds): the caller keeps the tablet waiting with pings. false = the session cannot go on (the tablet has been told).
+bool Session::PrepareDisplay() {
     // Auto: H.264 over USB (bandwidth to spare, fastest encode), HEVC over Wi-Fi (better quality per bit).
     bool wantHevc = settings_.codec == L"hevc" || (settings_.codec == L"auto" && !usb_);
     bool hevcOk = (hello_.codecMask & MaskHEVC) != 0, h264Ok = (hello_.codecMask & MaskH264) != 0;
@@ -126,6 +162,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
             switchedOn = SetVirtualMonitorEnabled(true, 15000);
         }
         switchOnFailed = !switchedOn;
+        monitorUsed_ = switchedOn;
         for (int i = 0; switchedOn && i < 100 && !FindVirtualDisplay(L"", vd); ++i) Sleep(100);
     }
     if (gdiName_.empty() && vd.gdiName.empty()) {
@@ -138,10 +175,11 @@ void Session::Run(FILE* dump, int dumpSeconds) {
                       ? "PadDisplay could not switch the virtual monitor on. Right-click the PadDisplay tray icon on the PC and choose 'Enable virtual monitor driver'."
                   : state == VddState::Disabled ? "The virtual monitor driver is disabled on the PC. Right-click the PadDisplay tray icon and choose 'Enable virtual monitor driver'."
                                                 : "Virtual monitor not found on the PC. Right-click the PadDisplay tray icon and choose 'Repair virtual monitor driver'.");
-        return;
+        return false;
     }
     SetVddFailed(false);
     gdiName_ = vd.gdiName;
+    monitorUsed_ = true;
     // With the virtual monitor off the desktop, the real screens are exactly as the user arranged them: remember that
     // (never while it is attached: Windows shifts things then). Switching it on above has done so already, and the
     // screens may have moved since.
@@ -159,7 +197,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
             if (i % 5 == 0 && conn_.s != INVALID_SOCKET) {
                 uint8_t ping[16] = {};
                 wr64(ping, NowUs());
-                if (!Send(Msg::Ping, ping, sizeof(ping))) return;
+                if (!Send(Msg::Ping, ping, sizeof(ping))) return false;
             }
             if (!FindVirtualDisplay(L"", vd)) continue;
             auto modes = ListModes(vd.gdiName);
@@ -174,7 +212,7 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     bool haveSaved = settings_.displayOverride.empty() && LoadVirtualPlacement(want.width, want.height, saved);
     if (!EnsureAttached(gdiName_, want, settings_.matchClientResolution, haveSaved ? &saved : nullptr, active)) {
         SendError(ErrNoDisplay, "Could not attach the virtual display to the desktop.");
-        return;
+        return false;
     }
     havePlacement_ = CurrentPlacement(gdiName_, placement_);
     onlyScreen_ = (hello_.flags & HelloOnlyScreen) != 0 && conn_.s != INVALID_SOCKET && settings_.displayOverride.empty();
@@ -231,8 +269,11 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     }
     if (!flowControl_ && conn_.s != INVALID_SOCKET)
         LOGI("session: client speaks protocol v%u, no flow control (update the tablet app)", hello_.version);
+    return true;
+}
 
-    waiting.reset();
+// Streams until the tablet leaves or the session is stopped; injects the tablet's input meanwhile.
+void Session::Serve() {
     if (conn_.s != INVALID_SOCKET) {
         input_ = std::make_unique<InputInjector>(HostIsElevated(), [this](const char* text) { SendNotice(text); });
         if (uacClickable_ || lockControl_) {
@@ -324,6 +365,10 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         SendLockState(false); // streaming the desktop normally: hide the password box
         if (!StreamLoop()) break;
     }
+}
+
+// Ends the session's threads and puts the PC back: the controllers, the real screens and the virtual monitor.
+void Session::Teardown() {
     stop_ = true;
     if (lockCap_.Active()) { lockCap_.Stop(); if (uacClick_) uacClick_->StopCapture(); } // end any locked-screen capture
     if (recvThread_.joinable()) recvThread_.join();
@@ -331,7 +376,16 @@ void Session::Run(FILE* dump, int dumpSeconds) {
     if (layoutThread_.joinable()) layoutThread_.join();
     if (input_) input_->ReleaseAll();
     gamepads_.reset(); // unplugs the virtual controllers
-    const bool ownMonitor = conn_.s != INVALID_SOCKET && settings_.displayOverride.empty();
+    EndAs(SessionEnd::Failed); // no reason given (the test mode's time ran out): put everything back at once
+    const SessionEnd why = end_;
+    const bool ownMonitor = conn_.s != INVALID_SOCKET && settings_.displayOverride.empty() && monitorUsed_;
+    // The windows on the virtual monitor stay where they are while it stays on: for the session that replaces this one
+    // (most often this tablet again, its old link not yet timed out), or for a while for a tablet that reconnects by itself
+    // after losing the link. Never in only-screen mode for a lost link: the PC's own screens must come back at once.
+    const bool nextSessionFollows = why == SessionEnd::Replaced;
+    keepMonitor_ = ownMonitor && settings_.monitorOnlyWhileConnected && why == SessionEnd::Lost && !onlyScreen_ &&
+                   (hello_.flags & HelloReconnects) != 0 && settings_.reconnectGraceSeconds > 0;
+    const bool monitorStaysOn = nextSessionFollows || keepMonitor_;
     // How the user set the virtual monitor up (they may have moved or re-sized it in Windows' display settings during the
     // session), for the next connection. Read before the monitor leaves the desktop below.
     VirtualDisplay current;
@@ -347,22 +401,42 @@ void Session::Run(FILE* dump, int dumpSeconds) {
         // The PC's own screens come back first, whatever else happens below: in one step, exactly as they were, when the
         // virtual monitor is about to be switched off anyway. Otherwise, or if Windows refuses that, back to the setup
         // Windows stored. If it refuses that too (a UAC prompt is up), ShowOnAllAgain keeps trying in the background.
-        const bool inOneStep = settings_.monitorOnlyWhileConnected && ShowRealScreensOnly();
+        const bool inOneStep = settings_.monitorOnlyWhileConnected && !monitorStaysOn && ShowRealScreensOnly();
         if (!inOneStep && ShowOnAllAgain()) RestoreRealScreens();
     }
     if (ownMonitor) {
         if (havePlacement) SaveVirtualPlacement(hello_.screenW, hello_.screenH, now);
-        if (settings_.monitorOnlyWhileConnected) {
-            // Nobody is using it any more: switch the virtual monitor off, so Windows shows only the real screens and the
-            // user's layout is back as they had it (SetVirtualMonitorEnabled restores it). Without the on/off tasks (the
-            // admin setup was never run) the device cannot be switched, so at least take it off the desktop.
-            if (!SetVirtualMonitorEnabled(false, 5000)) {
-                Detach(gdiName_);
-                RestoreRealScreens(); // detaching can make Windows shuffle the real screens
-            }
-        }
+        if (settings_.monitorOnlyWhileConnected && !monitorStaysOn) SwitchVirtualMonitorOff(gdiName_);
     }
-    LOGI("session: ended");
+    if (keepMonitor_) LOGI("session: ended (%s): keeping the virtual monitor for %d s for the tablet to reconnect", SessionEndName(why), settings_.reconnectGraceSeconds);
+    else LOGI("session: ended (%s)", SessionEndName(why));
+}
+
+const char* SessionEndName(SessionEnd why) {
+    switch (why) {
+    case SessionEnd::TabletLeft: return "the tablet disconnected";
+    case SessionEnd::Lost: return "connection lost";
+    case SessionEnd::Replaced: return "a new connection took over";
+    case SessionEnd::HostExit: return "PadDisplay exits";
+    case SessionEnd::HostRestart: return "PadDisplay restarts";
+    case SessionEnd::Failed: return "error";
+    default: return "?";
+    }
+}
+
+// Nobody is using it any more: switch the virtual monitor off, so Windows shows only the real screens and the user's layout is
+// back as they had it (SetVirtualMonitorEnabled restores it). Without the on/off tasks (the admin setup was never run) the device
+// cannot be switched, so at least take it off the desktop.
+void SwitchVirtualMonitorOff(const std::wstring& gdiName) {
+    if (SetVirtualMonitorEnabled(false, 5000)) return;
+    Detach(gdiName);
+    RestoreRealScreens(); // detaching can make Windows shuffle the real screens
+}
+
+// The first reason given is the one that counts: a lost link noticed after the tablet said goodbye is no lost link.
+void Session::EndAs(SessionEnd why) {
+    SessionEnd none = SessionEnd::None;
+    end_.compare_exchange_strong(none, why);
 }
 
 // Keeps the tablet's connection alive (it gives up after a few seconds of silence) and notices when
@@ -372,6 +446,7 @@ bool Session::Heartbeat(uint64_t now) {
     // Signed: the receive thread may have stamped lastRecvUs_ after `now` was read.
     if (int64_t(now) - int64_t(lastRecvUs_.load()) > 10000000) {
         LOGI("session: client stopped responding");
+        EndAs(SessionEnd::Lost);
         return false;
     }
     if (now - lastPingUs_ >= 500000) {
@@ -382,6 +457,15 @@ bool Session::Heartbeat(uint64_t now) {
         if (!Send(Msg::Ping, ping, sizeof(ping))) return false;
         lastPingUs_ = now;
     }
+    return true;
+}
+
+// A GPU reset (TDR) or driver update removes the device: everything made on it is dead and has to be made again.
+bool Session::DeviceLost() const {
+    if (!device_) return false;
+    const HRESULT reason = device_->GetDeviceRemovedReason();
+    if (reason == S_OK) return false;
+    LOGI("session: the GPU device was removed (0x%08lx), starting capture and encoding again", reason);
     return true;
 }
 
@@ -440,9 +524,14 @@ int Session::SetupPipeline() {
     t.adapter->GetDesc1(&newDesc);
     if (target_.adapter) target_.adapter->GetDesc1(&oldDesc);
     bool sameAdapter = target_.adapter && memcmp(&newDesc.AdapterLuid, &oldDesc.AdapterLuid, sizeof(LUID)) == 0;
-    if (!device_ || !sameAdapter) {
+    if (!device_ || !sameAdapter || DeviceLost()) {
         encoder_.reset();
         capture_ = DesktopCapture();
+        if (lockCap_.Active()) { // it shares a texture made on the old device
+            lockCap_.Stop();
+            if (uacClick_) uacClick_->StopCapture();
+        }
+        probe_.Reset();
         device_.Reset();
         ctx_.Reset();
         if (!CreateDevice(t.adapter.Get(), GamingMode(), device_, ctx_)) return -1;
@@ -556,6 +645,9 @@ bool Session::StreamLoop() {
         if (now - lastSecondUs_ >= 1000000) {
             AdaptBitrate();
             ReportStatus(now);
+            // Once a second, not per frame: after a GPU reset Windows.Graphics.Capture just stops delivering frames,
+            // which looks like an idle desktop. SetupPipeline builds a new device.
+            if (DeviceLost()) return true;
         }
 
         // Pace to the display rate: the cursor alone can update far faster than 60 Hz. Waiting lets
@@ -690,6 +782,10 @@ void Session::RecvLoop() {
                 break;
             }
             case Msg::KeyframeReq: keyframeRequested_ = true; break;
+            case Msg::Bye: // the user disconnected on the tablet: no reconnect is coming
+                EndAs(SessionEnd::TabletLeft);
+                stop_ = true;
+                break;
             case Msg::FrameAck:
                 if (buf.size() >= 8) {
                     uint64_t pts = rd64(p);
@@ -750,6 +846,7 @@ void Session::RecvLoop() {
         }
     }
     LOGI("session: connection closed");
+    EndAs(SessionEnd::Lost); // unless the tablet said goodbye, or the session was stopped
     stop_ = true;
     ackCv_.notify_all();
     inputCv_.notify_all();
@@ -948,13 +1045,21 @@ bool Server::Start() {
     return true;
 }
 
-void Server::Stop() {
+void Server::Stop(SessionEnd why) {
     stopping_ = true;
     if (acceptThread_.joinable()) acceptThread_.join(); // it polls stopping_: no need to wake it by closing the socket
     if (listen_ != INVALID_SOCKET) closesocket(listen_), listen_ = INVALID_SOCKET;
-    for (int i = 0; i < 100 && handshakes_ > 0; ++i) Sleep(100); // they time out after 5 s at most
+    {
+        // Each handshake thread uses this object to the end, so none may outlive it. Shutting their sockets down ends a
+        // hello or PIN read at once; one that already passed its connection on is replacing the session, which ends.
+        std::unique_lock lock(handshakeMutex_);
+        for (auto& [id, h] : handshakes_)
+            if (h.cuttable) CutOff(h.s);
+        handshakeDone_.wait(lock, [this] { return handshakes_.empty(); });
+    }
     std::lock_guard lock(sessionMutex_);
-    StopSession();
+    StopSession(why);
+    monitorOff_.RunNow(); // Exit puts the PC back: a monitor kept for a reconnect goes off now
     StopAudio();
     StopMic();
     StopCam();
@@ -1000,6 +1105,7 @@ void Server::UpdateSettings(const Settings& s) {
 
 void Server::AcceptLoop() {
     while (!stopping_) {
+        CutSlowHandshakes(); // on the wakeup that is here anyway: no timer of its own
         // Wait with a timeout rather than blocking in accept(): closing a socket does not reliably wake
         // a thread blocked in accept(), and Exit has to be able to stop this loop.
         fd_set rs;
@@ -1021,17 +1127,53 @@ void Server::AcceptLoop() {
         }
         NoInherit(s);
         // Each hello/PIN exchange runs on its own thread, so a client that connects and stays silent
-        // cannot block others (it times out after 5 s). Cap the number in progress.
-        if (handshakes_ >= 4) {
-            closesocket(s);
-            continue;
+        // cannot block others (it is cut off after kHandshakeMs). Cap the number in progress.
+        const uint64_t id = nextHandshakeId_++;
+        {
+            std::lock_guard lock(handshakeMutex_);
+            if (handshakes_.size() >= 4) {
+                closesocket(s);
+                continue;
+            }
+            handshakes_[id] = Handshake{s, GetTickCount64()};
         }
-        ++handshakes_;
-        std::thread([this, s, addr] {
-            Handle(s, addr);
-            --handshakes_;
+        std::thread([this, s, addr, id] {
+            const bool handedOver = Handle(s, addr, id);
+            // Closed under the lock, together with forgetting it: a socket number is reused at once, and the accept loop
+            // must never cut off a newer connection that got the same number. Notified under the lock too, so Stop cannot
+            // return, and this object go, before this thread is done with it.
+            std::lock_guard lock(handshakeMutex_);
+            if (!handedOver) closesocket(s);
+            handshakes_.erase(id);
+            handshakeDone_.notify_all();
         }).detach();
     }
+}
+
+// A whole handshake (TLS, hello, PIN) takes well under a second. Each read already gives up after 5 s of silence, but a client
+// sending one byte now and then would keep its slot for ever, and four of them would lock every tablet out.
+void Server::CutSlowHandshakes() {
+    constexpr ULONGLONG kHandshakeMs = 10000;
+    const ULONGLONG now = GetTickCount64();
+    std::lock_guard lock(handshakeMutex_);
+    for (auto& [id, h] : handshakes_) {
+        if (!h.cuttable || now - h.startedMs < kHandshakeMs) continue;
+        LOGI("server: a connection took more than %llu s to say hello, cut off", kHandshakeMs / 1000);
+        CutOff(h.s); // its thread's read fails now, and it closes the socket
+        h.cuttable = false;
+    }
+}
+
+// Ends a handshake's connection from another thread. shutdown() alone does not wake a recv() that is already waiting (it would
+// sit out its 5 s timeout); cancelling the socket's I/O does. The socket stays open: its own thread closes it.
+void Server::CutOff(SOCKET s) {
+    shutdown(s, SD_BOTH);
+    CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
+}
+
+void Server::EndHandshakeDeadline(uint64_t id) {
+    std::lock_guard lock(handshakeMutex_);
+    handshakes_[id].cuttable = false;
 }
 
 ULONGLONG Server::LockedFor(const std::string& key, ULONGLONG now) {
@@ -1050,23 +1192,23 @@ void Server::RecordFailure(const std::string& key, ULONGLONG now, size_t limit) 
     }
 }
 
-void Server::StopSession() {
+void Server::StopSession(SessionEnd why) {
     {
         std::lock_guard lock(mutex_);
-        if (session_) session_->Stop();
+        if (session_) session_->Stop(why);
     }
     if (sessionThread_.joinable()) sessionThread_.join();
     std::lock_guard lock(mutex_);
     session_.reset();
 }
 
+// The socket stays open on a refusal: the handshake thread closes it.
 bool Server::CheckPin(Conn& conn, const sockaddr_storage& addr, bool usb, uint32_t pin, const Settings& cfg) {
     auto reject = [&](ErrorCode code, const char* text) {
         std::vector<uint8_t> e(1 + strlen(text));
         e[0] = code;
         memcpy(e.data() + 1, text, e.size() - 1);
         SendMsg(conn, Msg::Error, e.data(), uint32_t(e.size()));
-        closesocket(conn.s);
         return false;
     };
     if (!usb || cfg.requireUsbPin) {
@@ -1096,7 +1238,7 @@ bool Server::CheckPin(Conn& conn, const sockaddr_storage& addr, bool usb, uint32
     return true;
 }
 
-void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
+bool Server::Handle(SOCKET s, const sockaddr_storage& addr, uint64_t id) {
     TuneSocket(s, true);
     DWORD timeout = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
@@ -1115,90 +1257,74 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
         e[0] = code;
         memcpy(e.data() + 1, text, e.size() - 1);
         SendMsg(conn, Msg::Error, e.data(), uint32_t(e.size()));
-        closesocket(s);
+        return false;
     };
 
     // A TLS ClientHello starts with 0x16, a plain hello with 0x81 or 0x89: one peeked byte tells them apart,
     // so tablet apps from before TLS keep working and the message formats did not have to change.
     char firstByte = 0;
-    if (recv(s, &firstByte, 1, MSG_PEEK) != 1) {
-        closesocket(s);
-        return;
-    }
+    if (recv(s, &firstByte, 1, MSG_PEEK) != 1) return false;
     std::string tlsInfo;
     if (firstByte == 0x16) {
         if (!tls_ || !(conn.tls = tls_->Accept(s, &tlsInfo))) {
             LOGI("server: TLS handshake with %s failed", AddrToString(addr).c_str());
-            closesocket(s);
-            return;
+            return false;
         }
     }
     const std::string link = std::string(usb ? "USB" : "Wi-Fi") + (conn.tls ? ", " + tlsInfo : ", plain");
 
     Msg type{};
     std::vector<uint8_t> p;
-    if (!RecvMsg(conn, type, p, 1024)) {
-        closesocket(s);
-        return;
-    }
+    if (!RecvMsg(conn, type, p, 1024)) return false;
     // Answered only after the hello was read: closing a socket with unread data resets it, and the tablet would never see the error.
     if (!conn.tls && !usb && cfg.requireEncryption) {
         LOGI("server: refused a plain connection from %s (requireEncryption)", AddrToString(addr).c_str());
         return reject(ErrEncryptionRequired, "This PC only accepts encrypted connections. Update the PadDisplay app on the tablet.");
     }
     if (type == Msg::AudioHello && p.size() >= 7) {
-        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return;
+        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return false;
         bool mutePc = (p[6] & AudioMutePc) != 0;
         LOGI("server: audio connection from %s (%s)%s", usb ? "USB" : AddrToString(addr).c_str(), link.c_str(), mutePc ? " (mute PC)" : "");
+        EndHandshakeDeadline(id);
         std::lock_guard replace(sessionMutex_);
-        if (stopping_) {
-            closesocket(s);
-            return;
-        }
+        if (stopping_) return false;
         StopAudio(); // newest wins
         std::lock_guard lock(mutex_);
         audio_ = std::make_unique<AudioSession>(std::move(conn), mutePc);
         AudioSession* audio = audio_.get();
         audioThread_ = std::thread([audio] { audio->Run(); });
-        return;
+        return true;
     }
     // The tablet's microphone and camera (v4): each on its own connection, so neither can delay the picture or the input.
     if (type == Msg::MicHello && p.size() >= 7) {
-        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return;
+        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return false;
         LOGI("server: microphone connection from %s (%s)", usb ? "USB" : AddrToString(addr).c_str(), link.c_str());
+        EndHandshakeDeadline(id);
         std::lock_guard replace(sessionMutex_);
-        if (stopping_) {
-            closesocket(s);
-            return;
-        }
+        if (stopping_) return false;
         StopMic(); // newest wins
         std::lock_guard lock(mutex_);
         mic_ = std::make_unique<MicSession>(std::move(conn), cfg, status_);
         MicSession* mic = mic_.get();
         micThread_ = std::thread([mic] { mic->Run(); });
-        return;
+        return true;
     }
     if (type == Msg::CamHello && p.size() >= 12) {
-        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return;
+        if (!CheckPin(conn, addr, usb, rd32(&p[2]), cfg)) return false;
         const uint16_t w = rd16(&p[7]), h = rd16(&p[9]);
         const uint8_t fps = p[11];
         LOGI("server: camera connection from %s (%s) %ux%u@%u", usb ? "USB" : AddrToString(addr).c_str(), link.c_str(), w, h, fps);
+        EndHandshakeDeadline(id);
         std::lock_guard replace(sessionMutex_);
-        if (stopping_) {
-            closesocket(s);
-            return;
-        }
+        if (stopping_) return false;
         StopCam();
         std::lock_guard lock(mutex_);
         cam_ = std::make_unique<CamSession>(std::move(conn), cfg, w, h, fps, status_);
         CamSession* cam = cam_.get();
         camThread_ = std::thread([cam] { cam->Run(); });
-        return;
+        return true;
     }
-    if (type != Msg::ClientHello || p.size() < 16) {
-        closesocket(s);
-        return;
-    }
+    if (type != Msg::ClientHello || p.size() < 16) return false;
     ClientHello h;
     h.version = rd16(&p[0]);
     h.screenW = rd16(&p[2]);
@@ -1213,30 +1339,66 @@ void Server::Handle(SOCKET s, const sockaddr_storage& addr) {
     memcpy(h.name, p.data() + nameAt, std::min<size_t>(p.size() - nameAt, sizeof(h.name) - 1));
 
     if (h.version < kMinProtocolVersion || h.version > kProtocolVersion) return reject(ErrVersion, "App and PC versions do not match. Update both.");
-    if (!CheckPin(conn, addr, usb, h.pin, cfg)) return;
+    if (!CheckPin(conn, addr, usb, h.pin, cfg)) return false;
     DWORD zero = 0;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&zero), sizeof(zero));
-    LOGI("server: client '%s' from %s (%s) screen %ux%u@%u dpi %u codecs %u%s%s", h.name, AddrToString(addr).c_str(),
+    LOGI("server: client '%s' from %s (%s) screen %ux%u@%u dpi %u codecs %u%s%s%s", h.name, AddrToString(addr).c_str(),
          link.c_str(), h.screenW, h.screenH, h.maxFps, h.dpi, h.codecMask, h.flags & HelloGamingMode ? ", gaming mode" : "",
-         h.flags & HelloOnlyScreen ? ", only screen" : "");
+         h.flags & HelloOnlyScreen ? ", only screen" : "", h.flags & HelloReconnects ? ", reconnects" : "");
+    EndHandshakeDeadline(id); // ending the previous session below can take seconds
 
     std::lock_guard replace(sessionMutex_);
-    if (stopping_) {
-        closesocket(s);
-        return;
-    }
+    if (stopping_) return false;
     {
         std::mutex sendMutex; // nothing else sends on this connection yet
         WaitingPing waiting(conn, sendMutex);
-        StopSession(); // newest tablet wins
+        StopSession(SessionEnd::Replaced); // newest tablet wins
+        monitorOff_.Cancel(); // a monitor kept for a reconnect is this session's now, windows and all
     }
     std::lock_guard lock(mutex_);
     session_ = std::make_unique<Session>(std::move(conn), h, usb, cfg, status_);
     Session* session = session_.get();
-    sessionThread_ = std::thread([this, session] {
+    tabletConnected_ = true;
+    sessionThread_ = std::thread([this, session, grace = cfg.reconnectGraceSeconds] {
         session->Run();
+        if (session->KeepsMonitorForReconnect()) monitorOff_.Schedule(grace, session->MonitorName());
+        tabletConnected_ = false;
         if (!stopping_ && status_) status_(L"Waiting for tablet");
     });
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+
+void DeferredMonitorOff::Schedule(int seconds, const std::wstring& gdiName) {
+    Cancel();
+    {
+        std::lock_guard lock(mutex_);
+        cancel_ = now_ = false;
+    }
+    thread_ = std::thread([this, seconds, gdiName] {
+        std::unique_lock lock(mutex_);
+        wake_.wait_for(lock, std::chrono::seconds(seconds), [this] { return cancel_ || now_; });
+        const bool cancelled = cancel_;
+        lock.unlock();
+        if (cancelled) return;
+        LOGI("session: the tablet did not come back, switching the virtual monitor off");
+        SwitchVirtualMonitorOff(gdiName);
+    });
+}
+
+void DeferredMonitorOff::Cancel() { Finish(false); }
+
+void DeferredMonitorOff::RunNow() { Finish(true); }
+
+void DeferredMonitorOff::Finish(bool switchOff) {
+    if (!thread_.joinable()) return;
+    {
+        std::lock_guard lock(mutex_);
+        (switchOff ? now_ : cancel_) = true;
+    }
+    wake_.notify_all();
+    thread_.join();
 }
 
 } // namespace pd

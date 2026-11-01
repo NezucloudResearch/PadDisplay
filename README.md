@@ -25,6 +25,7 @@ Use an Android tablet as a **real extended monitor** for your Windows PC, over U
   - The virtual monitor exists only while a tablet is connected. It is switched on when a tablet connects (this adds about 2 seconds to the first picture) and off again when the tablet leaves, and your screens go back to exactly how you had them. While PadDisplay runs with no tablet, Windows shows only your real screens.
   - Your monitor arrangement and each tablet's own setup are remembered.
   - Refresh rate (60/120 Hz) follows the tablet.
+  - Optionally a lower resolution on the PC, upscaled on the tablet's GPU, for less encode and decode work.
 
 ```
 Windows host (C++20)                                               Android app (Kotlin)
@@ -91,12 +92,16 @@ USB = adb reverse tcp:27183 (automatic) · Wi-Fi = UDP discovery on 27184, encry
   - Off: the tablet is an extra monitor next to the PC's own.
   - On: the PC's own screens are switched off while the tablet is connected, and everything moves to the tablet. They come back, arranged as they were, when it disconnects, when PadDisplay exits, and after a restart. A monitor that was dark for a while needs a second or two to wake up.
 - **Switching apps on the tablet:** PadDisplay stays connected while another app is in front or the tablet's screen is off (*Display → Stay connected in the background*, on by default). PC audio, the microphone and the camera keep running, the PC keeps the virtual monitor, and the picture is back as soon as you return. A notification shows meanwhile: tap it to go back, or tap *Disconnect*. While nothing is shown the tablet still receives the picture and throws it away, so disconnect when you are done to save battery. Turn the switch off to disconnect whenever you leave PadDisplay, as before.
+- **Lower resolution, upscaled on the tablet:** in the tablet app, *Display → PC renders at* (Native, 75% or 50%). The PC's virtual monitor switches to that share of the tablet's resolution, so the PC captures and encodes, and the tablet decodes, fewer pixels; the tablet then fills its screen with the picture. Windows draws text sharply at the lower size, just larger. The bitrate cap, not the resolution, decides how much data is sent: a lower resolution spends the same bits on fewer pixels.
+  - *Display → Sharp upscaling* (on by default) upscales on the tablet's GPU with [Snapdragon GSR](https://github.com/SnapdragonStudios/snapdragon-gsr), a one-pass edge-aware filter with sharpening (not a neural network). It runs on Snapdragon (Adreno) and MediaTek (Mali) GPUs. Off = the display hardware's plain stretch. If the GPU can't run it, the plain stretch is used.
+  - Measured with an RTX 4050 Laptop and a Snapdragon 865 tablet (2560x1600, 120 Hz): encoding took 5.9 ms a frame at Native, 3.6 ms at 75% and 2.0 ms at 50%, and decoding 6.9, 6.5 and 5.6 ms. GSR took 2-4 ms of the tablet's time per frame (about 1.3 ms on a Dimensity 8300 phone). From decoded frame to screen, GSR was about 8 ms quicker than the plain stretch at 75% and about 2 ms slower at 50%, where the PC sends more frames than the 120 Hz panel shows.
 - **Gaming mode:** in the tablet app, *Display → Gaming mode*. Turn it on if the picture stutters while a game uses the whole GPU. With little free video memory it can freeze the NVIDIA encoder, so it's off by default.
 - **GPU choice** (tray menu *Encode on*, shown when the PC has more than one GPU, and listing only the GPUs this PC has): the encoder runs on the GPU that draws the virtual monitor, so this picks both. Choose any GPU you like: it is used in every mode, including when the tablet is the PC's only screen. PadDisplay sets its Windows GPU preference to match your choice (that is what keeps the fast capture below available), which takes one restart of PadDisplay: it happens when you choose, or after the tablet disconnects if one is connected, never in the middle of a connection. *Auto* (the default) is only a suggestion: the integrated GPU when the tablet's *Gaming mode* is on or the PC is on battery, and NVIDIA's NVENC otherwise.
   - Measured on a laptop with an Intel UHD and an RTX 4050, 2560x1440 at 120 Hz: with no game, NVENC took 5.4 ms a frame and Quick Sync 7.8 ms, and NVENC used about a quarter of the CPU. With a game using the RTX 4050, NVENC fell to 42-49 fps and slowed the game by about 8%, while Quick Sync held 114-118 fps and the game lost under 2%. If you start a game without Gaming mode, the stream can slow down: connect again with Gaming mode on.
   - **How the picture is captured:** with DXGI Desktop Duplication (changed areas only) when Windows lets PadDisplay see the monitor from the GPU it runs on, which is the case for the GPU you chose. Otherwise, for example when *Auto* moves to the other GPU for gaming or battery, with Windows.Graphics.Capture (whole frames; Windows 10 2004 or later; a little slower on Intel in my tests: about 10 ms against 9 ms to encode a 2560x1600 frame). PadDisplay switches by itself, with no restart. If capture still fails, it stops after about 8 seconds and tells the tablet, instead of leaving it blank.
   - Other GPU combinations (AMD, Intel Arc) were not measured: Auto uses the integrated GPU there.
-- **Exit** from the tray removes the virtual monitor, leaving only your real screens.
+- **If the connection drops** (Wi-Fi gone for a moment, the USB cable pulled and plugged back in, PadDisplay restarting on the PC), the tablet keeps the last picture and connects again by itself for up to a minute. Meanwhile the PC keeps the virtual monitor for 30 seconds (`reconnectGraceSeconds`), so the windows on it stay where they were. When you disconnect on purpose, the monitor goes away at once. In only-screen mode the PC's own screens come back at once in either case.
+- **Exit** from the tray removes the virtual monitor, leaving only your real screens. A connected tablet shows that PadDisplay was closed on the PC, and does not try to reconnect.
 
 ## Build from source
 - **Host:** run `host\build.cmd`.
@@ -125,6 +130,7 @@ Code layout:
 | `matchClientResolution` | 1 | on a tablet's first connection, use its native resolution. After that PadDisplay restores the setup you last used for that tablet (`virtual-monitor.txt`) |
 | `monitorOnlyWhileConnected` | 1 | keep the virtual monitor switched off while no tablet is connected (needs the admin setup step, which registers the on/off tasks). Set to 0 to keep it on whenever PadDisplay runs |
 | `removeMonitorOnExit` | 1 | switch the virtual monitor off when PadDisplay exits |
+| `reconnectGraceSeconds` | 30 | how long the virtual monitor (and the windows on it) waits for a tablet that lost its connection to come back, 0-600. 0 = switch it off at once, as when you disconnect on purpose |
 | `requireUsbPin` | 1 | ask for the PIN over USB too (see [SECURITY.md](SECURITY.md)) |
 | `acceptTabletMic` | 1 | let the tablet's microphone become a PC microphone (the tablet still has to switch it on) |
 | `micBackend` | auto | `auto` (PadDisplay's driver where Windows loads it, otherwise VB-CABLE), `driver` or `cable` to force one |
@@ -143,7 +149,7 @@ Code layout:
 Diagnostics:
 - `PadDisplay.exe --list` shows the displays, the adapters and the virtual display's modes.
 - `PadDisplay.exe --dump out.h264 --seconds 10 [--fps 120] [--codec hevc]` captures and encodes without a tablet.
-- The PC log is `%LOCALAPPDATA%\PadDisplay\host.log`, with a stats line every 10 s.
+- The PC log is `%LOCALAPPDATA%\PadDisplay\host.log`, with a stats line every 10 s. It keeps the runs before (each starts with a `----` line and the date) and moves to `host.old.log` at 2 MB. If PadDisplay crashes, it also writes `crash.dmp` there (see [SECURITY.md](SECURITY.md) before sharing it).
 - On the tablet: `adb logcat -s PadStats PadConn`. Huawei ROMs hide app logs until you run `adb shell setprop log.tag.PadStats V`.
 
 ## Known limits
