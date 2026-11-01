@@ -1,5 +1,5 @@
-# Builds the Windows host and the Android app on every push / pull request and keeps the results
-# as downloadable artifacts. Releases are made by hand from these artifacts.
+# Builds and unit-tests the Windows host and the Android app on every push / pull request and keeps
+# the results as downloadable artifacts. Releases are made by hand from these artifacts.
 name: build
 
 on:
@@ -27,6 +27,12 @@ jobs:
       - name: Build host, installer and portable zip (VS 2022, CMake, Ninja, Inno Setup)
         shell: cmd
         run: host\installer\build-installer.cmd
+      - name: Unit tests
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VS=%%i
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+          cmake --build host\build --target check
       - uses: actions/upload-artifact@v4
         with:
           name: PadDisplay-windows
@@ -51,11 +57,14 @@ jobs:
           # under the licenses this action accepts. Keep the log quiet (it otherwise prints every license).
           packages: platform-tools
           log-accepted-android-sdk-licenses: false
-      - name: Build APK
+      - name: Unit tests
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew testDebugUnitTest --no-daemon
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: PadDisplay-android
