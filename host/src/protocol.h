@@ -57,14 +57,20 @@ enum class Msg : uint8_t {
     SecureText = 0x92,  // u8 flags (bit0 = press Enter after), utf-8 text: type the Windows password into the
                         // locked sign-in screen. Honoured only over an encrypted (or USB) link and only when
                         // lock-screen control is on; the SYSTEM injector types it only onto the sign-in desktop (v5)
+    Bye = 0x93,         // empty: the user disconnected on the tablet, so no reconnect is coming. Hosts before it ignore it
 };
 
 enum Codec : uint8_t { CodecH264 = 1, CodecHEVC = 2 };
 enum CodecMask : uint8_t { MaskH264 = 1, MaskHEVC = 2 };
 enum AudioFlags : uint8_t { AudioMutePc = 1 };
-// Choices made in the tablet app (v3). OnlyScreen: the PC's own screens are off while connected.
-enum HelloFlags : uint8_t { HelloGamingMode = 1, HelloOnlyScreen = 2 };
-enum ErrorCode : uint8_t { ErrBadPin = 1, ErrVersion = 2, ErrNoDisplay = 3, ErrEncoder = 4, ErrLockedOut = 6, ErrEncryptionRequired = 7 };
+// Choices made in the tablet app (v3). OnlyScreen: the PC's own screens are off while connected. Reconnects: the tablet says
+// Bye when the user disconnects and reconnects by itself after losing the link, so the host keeps the virtual monitor for it.
+enum HelloFlags : uint8_t { HelloGamingMode = 1, HelloOnlyScreen = 2, HelloReconnects = 4 };
+// HostClosed and Replaced end a session on purpose: a tablet must not reconnect after them.
+enum ErrorCode : uint8_t {
+    ErrBadPin = 1, ErrVersion = 2, ErrNoDisplay = 3, ErrEncoder = 4, ErrLockedOut = 6, ErrEncryptionRequired = 7,
+    ErrHostClosed = 8, ErrReplaced = 9
+};
 enum TouchKind : uint8_t { TouchDown = 0, TouchMove = 1, TouchUp = 2, TouchCancel = 3 };
 enum PenKind : uint8_t { PenHover = 0, PenDown = 1, PenMove = 2, PenUp = 3, PenLeave = 4 };
 enum PenButtons : uint8_t { PenBarrel = 1, PenEraser = 2 };

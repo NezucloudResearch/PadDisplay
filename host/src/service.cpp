@@ -334,7 +334,7 @@ int RunLogonHost() {
     Server server(s, [](const std::wstring&) {}); // no tray UI here
     if (!server.Start()) { LOGI("logon-host: could not start the server"); if (stop) CloseHandle(stop); return 1; }
     WaitForSingleObject(stop, INFINITE); // the service signals this to stop us
-    server.Stop();
+    server.Stop(SessionEnd::HostRestart); // the user signed in: the tablet reconnects to their own PadDisplay
     if (stop) CloseHandle(stop);
     CoUninitialize();
     LOGI("logon-host: stopped");

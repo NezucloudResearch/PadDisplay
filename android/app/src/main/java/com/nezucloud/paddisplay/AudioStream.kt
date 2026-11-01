@@ -203,6 +203,9 @@ class AudioStream(
             }
         } catch (e: IOException) {
             if (!closed) Log.w(TAG, "audio connection ended: $e")
+        } catch (e: RuntimeException) {
+            // AudioTrack refused (no output device, a bad rate): only the sound ends, not the session.
+            Log.e(TAG, "audio ended by an error", e)
         } finally {
             track?.let {
                 try { it.stop() } catch (_: IllegalStateException) {}

@@ -78,11 +78,24 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private lateinit var passwordButton: TextView // shown while frozen: reopens the box to type the PC's sign-in password
     @Volatile
     private var decoder: VideoDecoder? = null // null while another app is in front: frames are acked and dropped
+    @Volatile
+    private var upscaler: Upscaler? = null    // between the decoder and the screen while the PC renders below the panel size
+    private var renderScale = 100             // percent of the panel's resolution the PC is asked to render
+    private var sharpUpscale = true           // upscale with GSR; off = the display hardware's plain stretch
     private var connection: Connection? = null
     private var audio: AudioStream? = null
     private var mic: MicStream? = null
     private var cam: CameraStream? = null
     private var hostTrust: HostTrust? = null       // shared by the video, audio, microphone and camera connections
+    // The session outlives one connection: after a lost link it connects again with the same hello, for a while.
+    private var sessionActive = false              // connected or reconnecting, with or without a picture
+    private var hello: ByteArray? = null
+    @Volatile
+    private var everConnected = false              // the PC accepted this tablet in this session, so a lost link is worth retrying
+    private var reconnectStartedMs = 0L            // 0 = not reconnecting
+    private var reconnectAttempts = 0
+    private val reconnect = Runnable { connect() }
+    @Volatile
     private var mediaStarted = false
     private var micOn = false
     private var camOn = false
@@ -115,6 +128,8 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private var bytesReceived = 0L
     @Volatile
     private var lastKeyframeReq = 0L
+    private var lastDecoderRebuildMs = 0L         // reader thread only
+    private val decoderRebuilds = ArrayDeque<Long>() // reader thread only: when the last few rebuilds happened
     private var lastStatsMs = 0L
     private var receivedAtLastStats = 0L
     private var gotFirstFrame = false
@@ -132,6 +147,8 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         }
         showStats = prefs.getBoolean("stats", false)
         keepInBackground = prefs.getBoolean("background", true)
+        renderScale = prefs.getInt("renderScale", 100)
+        sharpUpscale = prefs.getBoolean("sharpUpscale", true)
 
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this)
@@ -460,20 +477,21 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         setFrameRate(holder)
         root.removeCallbacks(statsTick)
         root.post(statsTick)
-        if (connection != null) {
+        if (sessionActive) {
             // Back from the background: the session kept running without a picture, so only the decoder is new.
-            attachDecoder(holder.surface)
+            attachDecoder(decoderSurface(holder.surface))
             return
         }
-        decoder = VideoDecoder(holder.surface)
+        decoder = VideoDecoder(decoderSurface(holder.surface))
         val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
         val port = intent.getIntExtra(EXTRA_PORT, Protocol.TCP_PORT)
         val pin = intent.getIntExtra(EXTRA_PIN, 0)
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val w = maxOf(metrics.widthPixels, metrics.heightPixels)
-        val h = minOf(metrics.widthPixels, metrics.heightPixels)
+        // The PC renders, encodes and sends this size; below the panel's, this tablet upscales it.
+        val w = scaledToRender(maxOf(metrics.widthPixels, metrics.heightPixels))
+        val h = scaledToRender(minOf(metrics.widthPixels, metrics.heightPixels))
         var mask = 0
         if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_H264))) mask =
             mask or Protocol.MASK_H264
@@ -481,10 +499,10 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             mask or Protocol.MASK_HEVC
         if (mask == 0) mask = Protocol.MASK_H264
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        var flags = 0
+        var flags = Protocol.HELLO_RECONNECTS
         if (prefs.getBoolean("gamingMode", false)) flags = flags or Protocol.HELLO_GAMING_MODE
         if (prefs.getBoolean("onlyScreen", false)) flags = flags or Protocol.HELLO_ONLY_SCREEN
-        val hello = Protocol.clientHello(
+        hello = Protocol.clientHello(
             w,
             h,
             metrics.densityDpi,
@@ -500,7 +518,8 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         val trust = if (Tls.isLoopback(host)) null else HostTrust(prefs, host)
         hostTrust = trust
         mediaStarted = false
-        connection = Connection(host, port, trust, this).also { it.start(hello) }
+        sessionActive = true
+        connect()
         if (prefs.getBoolean("audio", false)) {
             audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true), trust).also { it.start() }
         }
@@ -513,6 +532,40 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
                 prefs.getBoolean("camToPc", false) && granted(Manifest.permission.CAMERA)
             )
         }
+    }
+
+    private fun connect() {
+        val h = hello ?: return
+        val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
+        val port = intent.getIntExtra(EXTRA_PORT, Protocol.TCP_PORT)
+        connection = Connection(host, port, hostTrust, this).also { it.start(h) }
+    }
+
+    /** [size] at [renderScale], rounded to a multiple of 8, which the PC's encoders and the NV12 format handle best. */
+    private fun scaledToRender(size: Int) = if (renderScale >= 100) size else (size * renderScale / 100 + 4) / 8 * 8
+
+    /**
+     * The surface the decoder draws into: the upscaler's while the PC renders below the panel's size and sharp
+     * upscaling is on, else the screen's own (the display hardware then stretches the picture, with one buffer hop
+     * less). If the GPU cannot run the upscaler, the picture is shown directly rather than not at all.
+     */
+    private fun decoderSurface(screen: Surface): Surface {
+        if (renderScale >= 100 || !sharpUpscale) return screen
+        val u = try {
+            Upscaler(this, screen)
+        } catch (e: Exception) {
+            Log.w("PadDisplay", "upscaler unavailable, plain stretch instead: $e")
+            return screen
+        }
+        if (videoW > 0) u.setVideoSize(videoW, videoH)
+        upscaler = u
+        return u.inputSurface
+    }
+
+    /** After the decoder: it must stop drawing into the upscaler's surface first. */
+    private fun releaseUpscaler() {
+        upscaler?.release()
+        upscaler = null
     }
 
     private fun setFrameRate(holder: SurfaceHolder) {
@@ -554,10 +607,13 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             val d = decoder
             decoder = null // the reader thread now acks and drops frames
             d?.release()
+            releaseUpscaler()
         }
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        upscaler?.setViewSize(width, height)
+    }
 
     /**
      * Wi-Fi power save batches packets (~100 ms beacons). Modes: 0 = system default,
@@ -581,7 +637,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         root.removeCallbacks(statsTick)
-        if (keepInBackground && !isFinishing && connection != null) {
+        if (keepInBackground && !isFinishing && sessionActive) {
             // Another app is in front, or the screen went off: only the picture stops. Audio, microphone, camera
             // and the PC's virtual monitor stay as they are.
             input.releaseMouseButtons()
@@ -592,6 +648,8 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     }
 
     private fun closeSession() {
+        sessionActive = false
+        root.removeCallbacks(reconnect)
         hostReady = false
         KeyRouter.detach()
         releaseAllKeys()
@@ -602,26 +660,62 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             SessionService.onDisconnect = null
             SessionService.stop(this)
         }
-        // The picture's connection first: the PC puts its own screens back when that one ends. Each on its own, because
-        // one that throws must not leave the others open: the microphone and the camera would go on sending.
-        val closing = listOf<() -> Unit>(
-            { connection?.close() },
-            { audio?.close() },
-            { mic?.close() },
-            { cam?.close() },
-            { decoder?.release() })
-        for (close in closing) {
+        // The picture's connection first: the PC puts its own screens back when that one ends.
+        closeEach({ connection?.close() })
+        connection = null
+        stopMediaStreams()
+        closeEach({ decoder?.release() }, { releaseUpscaler() })
+        decoder = null
+    }
+
+    // Each on its own, because one that throws must not leave the others open: the microphone and the camera would go on sending.
+    private fun closeEach(vararg closers: () -> Unit) {
+        for (close in closers) {
             try {
                 close()
             } catch (e: Exception) {
                 Log.e("PadDisplay", "closing the session", e)
             }
         }
-        connection = null
+    }
+
+    private fun stopMediaStreams() {
+        closeEach({ audio?.close() }, { mic?.close() }, { cam?.close() })
         audio = null
         mic = null
         cam = null
-        decoder = null
+        mediaStarted = false
+        micOn = false
+        camOn = false
+        updateBadge()
+    }
+
+    /**
+     * The link to the PC broke after the PC had accepted this tablet (Wi-Fi dropped, the cable was pulled, the PC restarted
+     * PadDisplay): connect again for a while instead of ending. The last picture stays up meanwhile. The PC keeps the virtual
+     * monitor, and the windows on it, waiting for this tablet. UI thread.
+     */
+    private fun reconnectLater(reason: String) {
+        connection = null
+        val now = SystemClock.uptimeMillis()
+        if (reconnectStartedMs == 0L) {
+            Log.i("PadDisplay", "connection lost ($reason): reconnecting")
+            reconnectStartedMs = now
+            reconnectAttempts = 0
+            hostReady = false
+            KeyRouter.detach()
+            releaseAllKeys() // the PC let go of them itself when the session ended
+            input.releaseMouseButtons()
+            stopMediaStreams() // their connections went down with the link; they start again with the new session
+            gotFirstFrame = false
+        }
+        if (now - reconnectStartedMs > 60_000) {
+            fail("Lost the connection to the PC: $reason")
+            return
+        }
+        stats.visibility = View.VISIBLE
+        stats.text = "Connection lost. Reconnecting…"
+        root.postDelayed(reconnect, longArrayOf(500, 1000, 2000)[minOf(reconnectAttempts++, 2)])
     }
 
     override fun onDestroy() {
@@ -646,7 +740,10 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         val granted = { permission: String -> checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED }
         runOnUiThread {
-            if (isFinishing || connection == null) return@runOnUiThread
+            if (isFinishing || !sessionActive) return@runOnUiThread
+            // Already running from the start, or started again after a reconnect.
+            if (audio == null && prefs.getBoolean("audio", false))
+                audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true), hostTrust).also { it.start() }
             if (prefs.getBoolean("micToPc", false)) {
                 if (granted(Manifest.permission.RECORD_AUDIO)) {
                     mic = MicStream(host, port, pin, hostTrust, object : MicStream.Listener {
@@ -710,7 +807,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         mediaBadge.text = "● " + parts.joinToString("  ·  ")
         mediaBadge.visibility = if (parts.isEmpty()) View.GONE else View.VISIBLE
         // The label can't be seen from another app; the notification says it there.
-        if (keepInBackground && connection != null) SessionService.update(
+        if (keepInBackground && sessionActive) SessionService.update(
             this,
             intent.getStringExtra(EXTRA_HOST) ?: "",
             micOn,
@@ -719,6 +816,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     }
 
     override fun onHostHello(version: Int, codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int) {
+        everConnected = true
         startMediaStreams()
         hostVersion = version
         videoW = width
@@ -726,6 +824,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         hostKbps = bitrateKbps
         codecName = if (codec == Protocol.CODEC_HEVC) "HEVC" else "H.264"
         runOnUiThread {
+            reconnectStartedMs = 0L // connected (again)
             hostReady = true
             attachKeys()
             fitSurface()
@@ -735,6 +834,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             synchronized(streamLock) {
                 streamCodec = codec
                 streamFps = fps
+                upscaler?.setVideoSize(width, height)
                 decoder?.configure(codec, width, height, fps)
             }
         } catch (e: Exception) {
@@ -751,6 +851,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     override fun onFrame(ptsUs: Long, keyframe: Boolean, data: ByteArray, offset: Int, length: Int) {
         bytesReceived += length
+        decoder?.let { if (it.broken) rebuildDecoder(it) }
         val ok = try {
             decoder?.queueFrame(data, offset, length, ptsUs, keyframe) ?: true
         } catch (e: IllegalStateException) {
@@ -761,6 +862,35 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             gotFirstFrame = true
             runOnUiThread { if (!showStats) stats.visibility = View.GONE }
         }
+    }
+
+    /**
+     * A codec that failed for good never shows another picture, so it is replaced by a new one set up as the last
+     * (reader thread, only after a failure). A decoder that keeps failing is a dead end: the session ends then.
+     */
+    private fun rebuildDecoder(broken: VideoDecoder) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastDecoderRebuildMs < 1000) return
+        lastDecoderRebuildMs = now
+        while (decoderRebuilds.isNotEmpty() && now - decoderRebuilds.first() > 10_000) decoderRebuilds.removeFirst()
+        if (decoderRebuilds.size >= 5) {
+            fail("Decoder error: this tablet's video decoder keeps failing.")
+            return
+        }
+        decoderRebuilds.addLast(now)
+        try {
+            synchronized(streamLock) {
+                if (decoder !== broken || streamCodec == 0) return
+                broken.configure(streamCodec, videoW, videoH, streamFps)
+                streamConfig?.let { broken.queueConfig(it, it.size) }
+            }
+        } catch (e: Exception) {
+            fail("Decoder error: ${e.message}")
+            return
+        }
+        Log.w("PadDisplay", "decoder failed and was started again")
+        lastKeyframeReq = 0L
+        requestKeyframe()
     }
 
     override fun onPing(rttUs: Int, bitrateKbps: Int) {
@@ -819,8 +949,12 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         if (pcFrozen && passwordDialog == null && !isFinishing && hasWindowFocus()) showPasswordDialog()
     }
 
-    override fun onClosed(reason: String?) {
-        if (reason != null) fail(reason)
+    override fun onClosed(connection: Connection, reason: String?) {
+        if (reason == null) return // closed on purpose: by this app, or by the PC with an error it shows
+        runOnUiThread {
+            if (connection !== this.connection || isFinishing) return@runOnUiThread
+            if (everConnected && !connection.endedByBug) reconnectLater(reason) else fail(reason)
+        }
     }
 
     private fun fail(reason: String) {
@@ -867,13 +1001,18 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
                 val n = d.decodeCount.getAndSet(0)
                 val decMs = if (n > 0) d.decodeUsTotal.getAndSet(0) / 1000f / n else 0f
                 val dropped = d.framesDropped.getAndSet(0)
+                val u = upscaler
+                val upscaled = if (u == null) "" else {
+                    val draws = u.drawCount.getAndSet(0)
+                    String.format(" · GSR upscale %.1f ms", if (draws > 0) u.drawUsTotal.getAndSet(0) / 1000f / draws else 0f)
+                }
 
                 @Suppress("DEPRECATION")
                 val panelHz = windowManager.defaultDisplay.refreshRate.roundToInt()
                 val a = audio
                 val line = String.format(
-                    "%s %dx%d · %.0f fps (panel %d Hz) · %.1f Mbps (cap %.0f) · RTT %.1f ms · decode %.1f ms%s%s · %s",
-                    codecName, videoW, videoH, fps, panelHz, mbps, hostKbps / 1000f, rttUs / 1000f, decMs,
+                    "%s %dx%d · %.0f fps (panel %d Hz) · %.1f Mbps (cap %.0f) · RTT %.1f ms · decode %.1f ms%s%s%s · %s",
+                    codecName, videoW, videoH, fps, panelHz, mbps, hostKbps / 1000f, rttUs / 1000f, decMs, upscaled,
                     if (dropped > 0) " · skipped $dropped" else "",
                     if (a != null) String.format(
                         " · audio buffer %d/%d ms, speed %+.2f%%, underruns %d, dropped %d ms",
@@ -887,7 +1026,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
                 if (gotFirstFrame) Log.i("PadStats", line)
                 if (showStats || !gotFirstFrame) {
                     stats.visibility = View.VISIBLE
-                    stats.text = if (!gotFirstFrame) "Connecting…" else line
+                    stats.text = if (gotFirstFrame) line else if (reconnectStartedMs != 0L) "Connection lost. Reconnecting…" else "Connecting…"
                 }
             }
             receivedAtLastStats = bytesReceived

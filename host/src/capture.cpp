@@ -211,7 +211,9 @@ DesktopCapture::Result DesktopCapture::Next(UINT timeoutMs, ID3D11Texture2D* dst
         DrawCursor(dst); // dst already holds the clean desktop
         return Frame;
     }
-    if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL) return Lost;
+    // A GPU reset or driver update removes the device: like a lost duplication, the session builds everything again.
+    if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+        return Lost;
     if (FAILED(hr)) {
         LOGI("capture: AcquireNextFrame failed 0x%08lx", hr);
         return Failed;

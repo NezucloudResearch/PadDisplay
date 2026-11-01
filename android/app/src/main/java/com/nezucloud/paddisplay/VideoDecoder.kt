@@ -26,6 +26,10 @@ class VideoDecoder(private val surface: Surface) {
     var decoderName = ""
         private set
 
+    /** The codec failed for good (a fatal CodecException, or its output thread died): only a new one shows pictures again. */
+    @Volatile var broken = false
+        private set
+
     private var codec: MediaCodec? = null
     private var outputThread: Thread? = null
     @Volatile private var running = false
@@ -80,6 +84,7 @@ class VideoDecoder(private val surface: Surface) {
         c.start()
         codec = c
         waitingForKeyframe = true
+        broken = false
         running = true
         outputThread = Thread({ outputLoop(c) }, "pd-decoder-out").apply {
             priority = Thread.MAX_PRIORITY
@@ -92,10 +97,14 @@ class VideoDecoder(private val surface: Surface) {
     @Synchronized
     fun queueConfig(data: ByteArray, length: Int) {
         val c = codec ?: return
-        val idx = c.dequeueInputBuffer(100_000)
-        if (idx < 0) return
-        c.getInputBuffer(idx)!!.apply { clear(); put(data, 0, length) }
-        c.queueInputBuffer(idx, 0, length, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+        try {
+            val idx = c.dequeueInputBuffer(100_000)
+            if (idx < 0) return
+            c.getInputBuffer(idx)!!.apply { clear(); put(data, 0, length) }
+            c.queueInputBuffer(idx, 0, length, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+        } catch (e: IllegalStateException) {
+            noteFailure(e)
+        }
     }
 
     /** Returns false when the frame was dropped and a keyframe is needed to resync. */
@@ -103,51 +112,69 @@ class VideoDecoder(private val surface: Surface) {
     fun queueFrame(data: ByteArray, offset: Int, length: Int, ptsUs: Long, keyframe: Boolean): Boolean {
         val c = codec ?: return true
         if (waitingForKeyframe && !keyframe) return false
-        val idx = try { c.dequeueInputBuffer(50_000) } catch (e: IllegalStateException) { -1 }
-        if (idx < 0) {
+        try {
+            val idx = c.dequeueInputBuffer(50_000)
+            if (idx < 0) {
+                waitingForKeyframe = true
+                return false
+            }
+            val buf = c.getInputBuffer(idx)!!
+            buf.clear()
+            if (length > buf.capacity()) {
+                c.queueInputBuffer(idx, 0, 0, ptsUs, 0)
+                waitingForKeyframe = true
+                return false
+            }
+            buf.put(data, offset, length)
+            queuedAt[ptsUs] = System.nanoTime()
+            c.queueInputBuffer(idx, 0, length, ptsUs, if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+        } catch (e: IllegalStateException) {
+            noteFailure(e)
             waitingForKeyframe = true
             return false
         }
-        val buf = c.getInputBuffer(idx)!!
-        buf.clear()
-        if (length > buf.capacity()) {
-            c.queueInputBuffer(idx, 0, 0, ptsUs, 0)
-            waitingForKeyframe = true
-            return false
-        }
-        buf.put(data, offset, length)
-        queuedAt[ptsUs] = System.nanoTime()
-        c.queueInputBuffer(idx, 0, length, ptsUs, if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
         waitingForKeyframe = false
         return true
     }
 
+    // A transient CodecException passes by itself; anything else means this codec will not decode again.
+    private fun noteFailure(e: IllegalStateException) {
+        if (!running || broken || (e is MediaCodec.CodecException && e.isTransient)) return
+        Log.w(TAG, "decoder $decoderName failed: $e")
+        broken = true
+    }
+
     private fun outputLoop(c: MediaCodec) {
         val info = MediaCodec.BufferInfo()
-        while (running) {
-            val idx = try { c.dequeueOutputBuffer(info, 100_000) } catch (e: IllegalStateException) { break }
-            if (idx < 0) continue
-            var current = idx
-            var pts = info.presentationTimeUs
-            // Skip straight to the newest decoded frame.
-            while (true) {
-                val next = try { c.dequeueOutputBuffer(info, 0) } catch (e: IllegalStateException) { -1 }
-                if (next < 0) break
-                c.releaseOutputBuffer(current, false)
-                queuedAt.remove(pts)
-                framesDropped.incrementAndGet()
-                current = next
-                pts = info.presentationTimeUs
-            }
-            try {
+        try {
+            while (running) {
+                val idx = c.dequeueOutputBuffer(info, 100_000)
+                if (idx < 0) continue
+                var current = idx
+                var pts = info.presentationTimeUs
+                // Skip straight to the newest decoded frame.
+                while (true) {
+                    val next = c.dequeueOutputBuffer(info, 0)
+                    if (next < 0) break
+                    c.releaseOutputBuffer(current, false)
+                    queuedAt.remove(pts)
+                    framesDropped.incrementAndGet()
+                    current = next
+                    pts = info.presentationTimeUs
+                }
                 c.releaseOutputBuffer(current, true)
-            } catch (e: IllegalStateException) {
-                break
+                framesRendered.incrementAndGet()
+                queuedAt.remove(pts)?.let {
+                    decodeUsTotal.addAndGet((System.nanoTime() - it) / 1000)
+                    decodeCount.incrementAndGet()
+                }
             }
-            framesRendered.incrementAndGet()
-            queuedAt.remove(pts)?.let {
-                decodeUsTotal.addAndGet((System.nanoTime() - it) / 1000)
-                decodeCount.incrementAndGet()
+        } catch (e: IllegalStateException) {
+            // Also the normal end when release() stops the codec under this thread: running is false then. Otherwise
+            // nothing shows decoded pictures any more, transient error or not.
+            if (running) {
+                Log.w(TAG, "decoder $decoderName output failed: $e")
+                broken = true
             }
         }
     }

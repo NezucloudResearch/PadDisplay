@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 package com.nezucloud.paddisplay
 
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import java.io.BufferedInputStream
@@ -32,7 +34,7 @@ class Connection(private val host: String, private val port: Int, private val tr
         fun onRumble(index: Int, large: Int, small: Int)
         fun onNotice(message: String)
         fun onLockState(frozen: Boolean) // the PC is locked and cannot be shown (true) or streaming again (false)
-        fun onClosed(reason: String?)
+        fun onClosed(connection: Connection, reason: String?) // reason null: closed on purpose, by close() or an error from the PC
     }
 
     companion object {
@@ -42,11 +44,16 @@ class Connection(private val host: String, private val port: Int, private val tr
     }
 
     private val queue = LinkedBlockingQueue<ByteArray>()
+    private val bye = Protocol.message(Protocol.BYE, 0) // compared by identity: the writer's last message
     @Volatile private var socket: Socket? = null
     @Volatile private var rawSocket: Socket? = null // the TCP socket under the TLS one
     @Volatile private var closed = false
+    @Volatile private var closing = false // close() was called: only the goodbye goes out still
+    /** It ended by a bug in this app, not by the network: connecting again would only meet the same bug. */
+    @Volatile var endedByBug = false
+        private set
     private var reader: Thread? = null
-    private var writer: Thread? = null
+    @Volatile private var writer: Thread? = null
 
     fun start(hello: ByteArray) {
         reader = Thread({ readLoop(hello) }, "pd-reader").apply {
@@ -56,13 +63,26 @@ class Connection(private val host: String, private val port: Int, private val tr
     }
 
     fun send(msg: ByteArray) {
-        if (!closed) queue.offer(msg)
+        if (!closed && !closing) queue.offer(msg)
     }
 
+    /**
+     * Ends the connection on purpose (UI thread, never blocks). The writer thread says BYE after what is still queued (the
+     * keys being let go), so the PC knows no reconnect is coming, and hangs up. A writer stuck on a stalled link is cut off.
+     */
     fun close() {
-        closed = true
-        Tls.hangUp(rawSocket) // this runs on the UI thread
-        writer?.interrupt()
+        if (closing) return
+        closing = true
+        if (writer == null) { // not connected yet: nothing to say goodbye on
+            closed = true
+            Tls.hangUp(rawSocket)
+            return
+        }
+        queue.offer(bye)
+        Handler(Looper.getMainLooper()).postDelayed({
+            closed = true
+            Tls.hangUp(rawSocket)
+        }, 500)
     }
 
     private fun readLoop(hello: ByteArray) {
@@ -163,12 +183,17 @@ class Connection(private val host: String, private val port: Int, private val tr
                 reason = if (handshaking) HANDSHAKE_FAILED else e.message ?: e.javaClass.simpleName
             }
             Log.w(TAG, "connection ended: $e")
+        } catch (e: RuntimeException) {
+            // A bug in handling a message (the decoder refusing a buffer, say): end this session, not the whole app.
+            Log.e(TAG, "connection ended by an internal error", e)
+            endedByBug = true
+            if (!closed) reason = "Internal error: ${e.message ?: e.javaClass.simpleName}"
         } finally {
             closed = true
             try { rawSocket?.close() } catch (_: IOException) {}
             try { socket?.close() } catch (_: IOException) {}
             writer?.interrupt()
-            listener.onClosed(reason)
+            listener.onClosed(this, reason)
         }
     }
 
@@ -180,11 +205,16 @@ class Connection(private val host: String, private val port: Int, private val tr
             // nothing else went out for 20 ms keeps the downlink flowing.
             val keepalive = Protocol.message(Protocol.KEEPALIVE, 0)
             while (!closed) {
-                val first = queue.poll(20, TimeUnit.MILLISECONDS) ?: keepalive
-                out.write(first)
+                var last = queue.poll(20, TimeUnit.MILLISECONDS) ?: keepalive
+                out.write(last)
                 // Coalesce whatever else is already queued into the same flush.
-                while (true) out.write(queue.poll() ?: break)
+                while (last !== bye) last = queue.poll()?.also { out.write(it) } ?: break
                 out.flush()
+                if (last === bye) {
+                    closed = true // before the hang-up, so the reader takes the end for the goodbye it is
+                    Tls.hangUp(rawSocket)
+                    return
+                }
             }
         } catch (_: InterruptedException) {
         } catch (_: IOException) {
