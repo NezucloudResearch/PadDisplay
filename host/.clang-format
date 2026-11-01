@@ -1,0 +1,15 @@
+# The host's style. Run clang-format over host/src, host/camera and host/tests only: third_party keeps its own.
+BasedOnStyle: LLVM
+UseTab: Never
+IndentWidth: 4
+TabWidth: 4
+BreakBeforeBraces: Allman
+AllowShortIfStatementsOnASingleLine: false
+IndentCaseLabels: false
+ColumnLimit: 0
+AccessModifierOffset: -4
+NamespaceIndentation: All
+FixNamespaceComments: false
+# Windows headers depend on their order.
+SortIncludes: Never
+ReflowComments: false

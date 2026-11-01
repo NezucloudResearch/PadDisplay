@@ -44,7 +44,22 @@ class MainActivity : Activity() {
             setPadding(pad, ui.dp(28), pad, ui.dp(32))
         }
 
-        // Header
+        addHeader(col)
+        col.addView(connectCard(), spaced(bottom = ui.dp(14)))
+        col.addView(inputCard(), spaced(bottom = ui.dp(14)))
+        col.addView(audioCard(), spaced(bottom = ui.dp(14)))
+        col.addView(mediaCard(), spaced(bottom = ui.dp(14)))
+        col.addView(displayCard(), spaced(bottom = ui.dp(6)))
+
+        setContentView(ScrollView(this).apply {
+            isFillViewport = true
+            addView(col, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL))
+        })
+        discovery = Discovery(this) { showHosts(it) }
+        showHosts(emptyList())
+    }
+
+    private fun addHeader(col: LinearLayout) {
         col.addView(ui.text("PadDisplay", 32f, R.color.pd_text, bold = true))
         val version = packageManager.getPackageInfo(packageName, 0).versionName
         col.addView(ui.caption("by Nezucloud · v$version").apply { setPadding(0, ui.dp(2), 0, 0) })
@@ -58,8 +73,9 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         col.addView(status, spaced(bottom = ui.dp(14)))
+    }
 
-        // Connect
+    private fun connectCard(): LinearLayout {
         val connect = ui.card("Connect")
         connect.addView(ui.primaryButton("Connect over USB") { connect("127.0.0.1", Protocol.TCP_PORT) }, spaced(top = ui.dp(4), bottom = ui.dp(6)))
         connect.addView(ui.caption("Needs USB debugging enabled. The PC app sets up the USB tunnel automatically; the PIN is asked once."))
@@ -84,9 +100,10 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = ui.dp(10) })
         }
         connect.addView(manualRow, spaced(top = ui.dp(8), bottom = ui.dp(10)))
-        col.addView(connect, spaced(bottom = ui.dp(14)))
+        return connect
+    }
 
-        // Input
+    private fun inputCard(): LinearLayout {
         val input = ui.card("Input")
         ui.addRow(input, toggle("Touch acts as mouse",
             "Tap = click, two fingers = scroll / right-click. Off = real Windows multi-touch. The stylus always works as a pen with pressure and tilt.",
@@ -108,16 +125,18 @@ class MainActivity : Activity() {
         ui.addRow(input, toggle("Capture the mouse for games",
             "Relative movement. Ctrl+Alt+Shift+M switches mouse capture while connected.", "mouseCapture", false))
         ui.addRow(input, toggle("Show performance overlay", null, "stats", false))
-        col.addView(input, spaced(bottom = ui.dp(14)))
+        return input
+    }
 
-        // Audio
+    private fun audioCard(): LinearLayout {
         val audio = ui.card("Audio")
         ui.addRow(audio, toggle("Play PC audio on this tablet",
             "Off = no audio is captured or sent at all. On uses about 1.5 Mbps and does not slow the picture.", "audio", false))
         ui.addRow(audio, toggle("Mute the PC's speakers while playing here", null, "audioMutePc", true))
-        col.addView(audio, spaced(bottom = ui.dp(14)))
+        return audio
+    }
 
-        // Microphone and camera
+    private fun mediaCard(): LinearLayout {
         val media = ui.card("Microphone and camera")
         ui.addRow(media, permissionToggle("Use this tablet's microphone as a PC microphone",
             "Needs a virtual microphone on the PC: PadDisplay there offers to set one up the first time. Apps then pick \"CABLE Output\" (VB-CABLE) or \"PadDisplay Virtual Microphone\". Off = the microphone is never used.",
@@ -128,9 +147,10 @@ class MainActivity : Activity() {
         ui.addRow(media, labelled("Camera", segmented("camFacing", 1, listOf(1 to "Front", 0 to "Back"))))
         ui.addRow(media, labelled("Webcam quality", segmented("camQuality", 720, listOf(720 to "720p (recommended)", 1080 to "1080p (uses more Wi-Fi)"))))
         ui.addRow(media, ui.caption("Only this tablet decides: the PC cannot turn the microphone or camera on.").apply { setPadding(0, ui.dp(12), 0, ui.dp(12)) })
-        col.addView(media, spaced(bottom = ui.dp(14)))
+        return media
+    }
 
-        // Display
+    private fun displayCard(): LinearLayout {
         val display = ui.card("Display")
         ui.addRow(display, toggle("Use this tablet as the PC's only screen",
             "Off = an extra screen next to the PC's own. On = the PC's own screens are switched off while this tablet is connected, and come back when it disconnects.",
@@ -157,14 +177,7 @@ class MainActivity : Activity() {
             1 to "High performance (recommended)",
             2 to "Low latency (may stall a few seconds when connecting on some devices)",
             0 to "System default (power saving, choppier)"))))
-        col.addView(display, spaced(bottom = ui.dp(6)))
-
-        setContentView(ScrollView(this).apply {
-            isFillViewport = true
-            addView(col, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL))
-        })
-        discovery = Discovery(this) { showHosts(it) }
-        showHosts(emptyList())
+        return display
     }
 
     private fun spaced(top: Int = 0, bottom: Int = 0) =
@@ -207,7 +220,6 @@ class MainActivity : Activity() {
         for (h in hosts) hostList.addView(hostRow(h), spaced(top = ui.dp(8)))
     }
 
-    private fun isLoopback(host: String) = Tls.isLoopback(host)
 
     // The PIN is required over USB too: the adb tunnel is reachable by any app on this tablet.
     private fun connect(host: String, port: Int) {
@@ -223,7 +235,7 @@ class MainActivity : Activity() {
             textSize = 22f
         }
         AlertDialog.Builder(this)
-            .setTitle(if (isLoopback(host)) "PIN for the PC (USB)" else "PIN for $host")
+            .setTitle(if (Tls.isLoopback(host)) "PIN for the PC (USB)" else "PIN for $host")
             .setMessage((error?.let { "$it\n\n" } ?: "") + "Right-click the PadDisplay icon in the PC's tray to see the PIN. It is asked once and remembered.")
             .setView(field)
             .setPositiveButton("Connect") { _, _ ->
@@ -273,7 +285,7 @@ class MainActivity : Activity() {
                         "If you reinstalled PadDisplay on the PC, or use another Windows account there, compare it with the fingerprint in the PC's tray menu and choose Trust. " +
                         "If you changed nothing, someone on this network may be pretending to be your PC: don't connect.")
                     .setPositiveButton("Trust the new identity") { _, _ ->
-                        prefs.edit().remove("tlsfp_$host").apply()
+                        HostTrust.forget(prefs, host)
                         connect(host, pendingPort)
                     }
                     .setNegativeButton("Cancel", null)
@@ -281,7 +293,7 @@ class MainActivity : Activity() {
             }
             DisplayActivity.RESULT_FAILED -> {
                 showStatus("Last connection to $host: ${error ?: "failed"}" +
-                    if (isLoopback(host)) "\nIs the tablet plugged in with USB debugging on, and PadDisplay running on the PC?" else "")
+                    if (Tls.isLoopback(host)) "\nIs the tablet plugged in with USB debugging on, and PadDisplay running on the PC?" else "")
             }
         }
     }

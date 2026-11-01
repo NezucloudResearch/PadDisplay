@@ -44,15 +44,12 @@ class VideoDecoder(private val surface: Surface) {
         // Enumerating codecs can take hundreds of ms on some ROMs; do it once.
         private val codecInfos: Array<MediaCodecInfo> by lazy { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
 
-        fun hasHardwareDecoder(mime: String): Boolean =
-            codecInfos.any { info ->
-                !info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it.equals(mime, true) }
-            }
+        private fun isHardwareDecoder(info: MediaCodecInfo, mime: String) =
+            !info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it.equals(mime, true) }
 
-        private fun pickDecoder(mime: String): MediaCodecInfo? =
-            codecInfos.firstOrNull { info ->
-                !info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it.equals(mime, true) }
-            }
+        fun hasHardwareDecoder(mime: String) = codecInfos.any { isHardwareDecoder(it, mime) }
+
+        private fun pickDecoder(mime: String) = codecInfos.firstOrNull { isHardwareDecoder(it, mime) }
     }
 
     @Synchronized

@@ -34,6 +34,7 @@ An Android tablet as a real extended monitor for a Windows PC, plus its keyboard
 
 ## Build and run
 
+- Host code lives in subsystem folders under `host/src/` and is formatted with `host/.clang-format` (Allman braces; never `host/third_party`).
 - Host: `host\build.cmd` (VS 2022 Build Tools, CMake, Ninja). It also assembles `host\dist\PadDisplay\`. It cannot link while `PadDisplay.exe` is running: exit it from the tray first (or post `WM_CLOSE` to the window of class `PadDisplayTray`).
 - Tablet: `cd android` then `gradlew assembleRelease`. Install with `adb install -r`; a Huawei tablet may ask for a tap on the tablet.
 - A host build and a baseline build can both exist; run only one at a time (they share port 27183 and the settings in `%LOCALAPPDATA%\PadDisplay`).
@@ -44,7 +45,7 @@ An Android tablet as a real extended monitor for a Windows PC, plus its keyboard
 - **Exit must always exit and clean up:** the port, the virtual monitor, the virtual controllers, and the PC's own screens (only-screen mode). After touching any shutdown or session code, test tray Exit with a tablet connected, and with a controller plugged in.
 - **Only-screen mode** must never be saved into Windows' display database, so a crash or a restart restores the real screens by itself. A UAC prompt (secure desktop) makes `SetDisplayConfig` fail with access denied (5) until it is answered, so one failed restore must never be final: `ShowOnAllAgain` retries in the background.
 - **The secure desktop is no failure.** While `DuplicateOutput` says access denied the session keeps sending pings (`Heartbeat`) and waits, instead of letting the tablet time out or ending the session after 30 s.
-- **Elevation:** Windows (UIPI) drops input to elevated windows from a normal process, so the tablet can only touch Task Manager if PadDisplay is elevated (tray *Run as administrator*, setting `runAsAdmin`). An elevated host also cannot be closed with `WM_CLOSE` or `taskkill` from a normal script, and its mutex cannot be opened by a normal process (`AcquireSingleInstance` treats access denied as "running"). Tests that need it go through an elevated helper and a UAC prompt the user clicks: ask first.
+- **Elevation:** Windows (UIPI) drops input to elevated windows from a normal process, so the tablet can only touch Task Manager if PadDisplay is elevated (tray *Run as administrator*, setting `runAsAdmin`). An elevated host also cannot be closed with `WM_CLOSE` or `taskkill` from a normal script, and its mutex cannot be opened by a normal process (`SingleInstance::Acquire` treats access denied as "running"). Tests that need it go through an elevated helper and a UAC prompt the user clicks: ask first.
 - **Protocol changes:** `host/src/protocol.h`, `android/.../Protocol.kt` and `docs/PROTOCOL.md` change together. A host must keep accepting older clients; bump `kProtocolVersion` when an old client would break.
 - **New input capabilities are security-relevant:** update `SECURITY.md`.
 - **Windows headers define macros** such as `small`, `near`, `far`, `min`, `max`. Do not use them as identifiers.

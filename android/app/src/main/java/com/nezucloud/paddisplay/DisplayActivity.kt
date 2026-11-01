@@ -4,22 +4,18 @@ package com.nezucloud.paddisplay
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
-import android.text.InputType
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.util.Log
-import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PointerIcon
@@ -27,13 +23,8 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
-import android.view.ViewConfiguration
-import android.view.ViewGroup
 import android.view.WindowManager
-import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import kotlin.math.roundToInt
@@ -49,7 +40,6 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         const val RESULT_BAD_PIN = 2
         const val RESULT_FAILED = 3
         const val RESULT_FINGERPRINT_CHANGED = 4 // EXTRA_ERROR carries the fingerprint the PC showed this time
-        private const val SCANCODE_F24 = 0x76
     }
 
     private lateinit var root: FrameLayout
@@ -57,23 +47,12 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private lateinit var stats: TextView
     private lateinit var input: InputCapture
     private lateinit var gamepads: Gamepads
+    private lateinit var keys: KeyForwarder
+    private lateinit var passwordBox: PasswordBox
     private var deviceInput = true    // forward the keyboard, mouse and controllers connected to the tablet
     private var mouseCapture = false  // the mouse sends raw movement (games) instead of pointing at the picture
     private var grabShortcuts = true  // also take the keys Android reserves for itself (needs ShortcutService)
-    private val pressed =
-        BooleanArray(0x200) // PC scancodes sent as down and not yet up, lifted if focus is lost mid-chord
-    private var repeatCode = 0
     private var hostReady = false     // the PC has sent its hello: the connection is live
-    private var hostVersion = 0       // the PC's protocol version (from HostHello); >= 5 supports typing the password
-    private var passwordDialogOpen =
-        false // the tablet's own password box is up: do not forward its keystrokes to the PC
-    private var passwordDialog: AlertDialog? = null // the open password box, so lock/unlock can open or dismiss it
-    private var passwordField: EditText? = null     // the box's text field (while the dialog is up)
-    private var passwordStatus: TextView? = null    // a hint / error line under the field
-    private var passwordSpinner: View? = null        // the "Signing in…" row, shown while waiting for the PC to verify
-    private var passwordButtons: View? = null        // the Cancel / Send row
-    private var passwordSubmitting = false           // a password was sent and we are waiting to see if it unlocks the PC
-    private val passwordTimeout = Runnable { onPasswordVerifyTimedOut() } // fires if no unlock arrives after sending
     private var pcFrozen = false      // the PC is locked and we can't show it: offer (and auto-open) the password box
     private lateinit var passwordButton: TextView // shown while frozen: reopens the box to type the PC's sign-in password
     @Volatile
@@ -83,9 +62,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private var renderScale = 100             // percent of the panel's resolution the PC is asked to render
     private var sharpUpscale = true           // upscale with GSR; off = the display hardware's plain stretch
     private var connection: Connection? = null
-    private var audio: AudioStream? = null
-    private var mic: MicStream? = null
-    private var cam: CameraStream? = null
+    private var media: SessionMedia? = null
     private var hostTrust: HostTrust? = null       // shared by the video, audio, microphone and camera connections
     // The session outlives one connection: after a lost link it connects again with the same hello, for a while.
     private var sessionActive = false              // connected or reconnecting, with or without a picture
@@ -97,8 +74,6 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private val reconnect = Runnable { connect() }
     @Volatile
     private var mediaStarted = false
-    private var micOn = false
-    private var camOn = false
     private lateinit var mediaBadge: TextView
     private var showStats = false
     private var wifiLock: WifiManager.WifiLock? = null
@@ -132,6 +107,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private val decoderRebuilds = ArrayDeque<Long>() // reader thread only: when the last few rebuilds happened
     private var lastStatsMs = 0L
     private var receivedAtLastStats = 0L
+    @Volatile
     private var gotFirstFrame = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -160,56 +136,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
                 Gravity.CENTER
             )
         )
-        val ui = Ui(this)
-        stats = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            background = ui.pill(0xB0101418.toInt())
-            textSize = 12f
-            typeface = Typeface.MONOSPACE
-            setPadding(ui.dp(12), ui.dp(6), ui.dp(12), ui.dp(6))
-            text = "Connecting…"
-        }
-        root.addView(
-            stats,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.START
-            )
-                .apply { setMargins(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12)) })
-        // Shown whenever this tablet's microphone or camera is actually capturing, so it is never silent.
-        mediaBadge = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            background = ui.pill(0xE0B3261E.toInt())
-            textSize = 13f
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(ui.dp(14), ui.dp(6), ui.dp(14), ui.dp(6))
-            visibility = View.GONE
-        }
-        root.addView(
-            mediaBadge,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.END
-            )
-                .apply { setMargins(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12)) })
-        // Shown only while the picture is frozen because the PC is locked and the tablet cannot show that
-        // screen (the host sends LockState); tapping it opens the box to type the PC's sign-in password.
-        passwordButton = ui.text("🔑  Type PC password", 15f, R.color.pd_on_accent, bold = true).apply {
-            background = ui.ripple(ui.pill(ui.color(R.color.pd_accent)), 14)
-            setPadding(ui.dp(22), ui.dp(13), ui.dp(22), ui.dp(13))
-            visibility = View.GONE
-            setOnClickListener { showPasswordDialog() }
-        }
-        root.addView(
-            passwordButton,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            )
-                .apply { setMargins(0, 0, 0, ui.dp(28)) })
+        addOverlays()
         setContentView(root)
         hideSystemUi()
 
@@ -224,6 +151,8 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         mouseCapture = deviceInput && prefs.getBoolean("mouseCapture", false)
         input.deviceInput = deviceInput
         gamepads = Gamepads(this) { msg -> connection?.send(msg) }
+        keys = KeyForwarder(root, gamepads, { msg -> connection?.send(msg) }, { passwordBox.isOpen }, { toggleMouseCapture() })
+        passwordBox = PasswordBox(this, root) { text -> connection?.send(Protocol.secureText(text, true)) }
         if (deviceInput) {
             surfaceView.setOnGenericMotionListener { _, ev -> input.onGenericMotion(ev) }
             surfaceView.setOnCapturedPointerListener { _, ev -> input.onCapturedPointer(ev) }
@@ -234,6 +163,43 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             surfaceView.isFocusableInTouchMode = true
             surfaceView.requestFocus()
         }
+    }
+
+    private fun addOverlays() {
+        val ui = Ui(this)
+        stats = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            background = ui.pill(0xB0101418.toInt())
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setPadding(ui.dp(12), ui.dp(6), ui.dp(12), ui.dp(6))
+            text = "Connecting…"
+        }
+        addOverlay(stats, Gravity.TOP or Gravity.START) { setMargins(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12)) }
+        // Shown whenever this tablet's microphone or camera is actually capturing, so it is never silent.
+        mediaBadge = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            background = ui.pill(0xE0B3261E.toInt())
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(ui.dp(14), ui.dp(6), ui.dp(14), ui.dp(6))
+            visibility = View.GONE
+        }
+        addOverlay(mediaBadge, Gravity.TOP or Gravity.END) { setMargins(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12)) }
+        // Shown only while the picture is frozen because the PC is locked and the tablet cannot show that
+        // screen (the host sends LockState); tapping it opens the box to type the PC's sign-in password.
+        passwordButton = ui.text("🔑  Type PC password", 15f, R.color.pd_on_accent, bold = true).apply {
+            background = ui.ripple(ui.pill(ui.color(R.color.pd_accent)), 14)
+            setPadding(ui.dp(22), ui.dp(13), ui.dp(22), ui.dp(13))
+            visibility = View.GONE
+            setOnClickListener { passwordBox.show() }
+        }
+        addOverlay(passwordButton, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL) { setMargins(0, 0, 0, ui.dp(28)) }
+    }
+
+    private fun addOverlay(view: View, gravity: Int, margins: FrameLayout.LayoutParams.() -> Unit) {
+        val wrap = FrameLayout.LayoutParams.WRAP_CONTENT
+        root.addView(view, FrameLayout.LayoutParams(wrap, wrap, gravity).apply(margins))
     }
 
     private fun hideSystemUi() {
@@ -253,7 +219,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         } else {
             // Another window has the keyboard now: stop asking for keys, and let go of the ones the PC thinks are held.
             KeyRouter.detach()
-            releaseAllKeys()
+            keys.releaseAll()
         }
     }
 
@@ -261,12 +227,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     /** Ask for the keys Android reserves for itself, only while the picture has focus and the PC has answered. */
     private fun attachKeys() {
-        if (hostReady && deviceInput && grabShortcuts && hasWindowFocus()) KeyRouter.attach { ev ->
-            forwardKey(
-                ev,
-                true
-            )
-        }
+        if (hostReady && deviceInput && grabShortcuts && hasWindowFocus()) KeyRouter.attach { ev -> keys.forward(ev, true) }
     }
 
     private fun applyMouseCapture() {
@@ -283,193 +244,10 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         ).show()
     }
 
-    override fun dispatchKeyEvent(ev: KeyEvent): Boolean = (deviceInput && forwardKey(ev)) || super.dispatchKeyEvent(ev)
+    override fun dispatchKeyEvent(ev: KeyEvent): Boolean = (deviceInput && keys.forward(ev)) || super.dispatchKeyEvent(ev)
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean =
         (deviceInput && gamepads.onMotion(ev)) || super.dispatchGenericMotionEvent(ev)
-
-    /**
-     * true = the key went to the PC (or was used here), so Android must not act on it.
-     * [fromService]: the key came through ShortcutService, before Android's own handling. Android then
-     * generates no auto-repeat for it, so it is made here (the PC does not repeat injected keys itself).
-     */
-    private fun forwardKey(ev: KeyEvent, fromService: Boolean = false): Boolean {
-        if (passwordDialogOpen) return false // keystrokes belong to the tablet's password box, not the PC
-        if (gamepads.onKey(ev)) return true
-        // A mouse's side buttons also arrive as Back/Forward keys. They are sent as mouse buttons.
-        if (ev.isFromSource(InputDevice.SOURCE_MOUSE) || ev.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE))
-            return ev.keyCode == KeyEvent.KEYCODE_BACK || ev.keyCode == KeyEvent.KEYCODE_FORWARD
-        val down = ev.action == KeyEvent.ACTION_DOWN
-        if (!down && ev.action != KeyEvent.ACTION_UP) return false
-        // The tablet's own volume buttons stay with the tablet; a keyboard's go to the PC.
-        val volume = ev.keyCode == KeyEvent.KEYCODE_VOLUME_UP || ev.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
-                ev.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
-        if (volume && ev.device?.isExternal != true) return false
-        val code = Keyboard.scancode(ev)
-        if (code == 0) return false
-        if (ev.keyCode == KeyEvent.KEYCODE_M && ev.isCtrlPressed && ev.isAltPressed && ev.isShiftPressed) {
-            if (down && ev.repeatCount == 0) {
-                toggleMouseCapture()
-                // The PC got Ctrl, Alt and Shift but not the M. Released with nothing in between, such
-                // a chord is how Windows switches the input language: put an unused key in between.
-                sendKey(SCANCODE_F24, true)
-                sendKey(SCANCODE_F24, false)
-            }
-            return true
-        }
-        sendKey(code, down) // repeats too: Windows does not repeat an injected key by itself
-        if (fromService) {
-            if (down && code !in noRepeat) {
-                repeatCode = code
-                root.removeCallbacks(repeater)
-                root.postDelayed(repeater, ViewConfiguration.getKeyRepeatTimeout().toLong())
-            } else if (!down && code == repeatCode) {
-                stopRepeat()
-            }
-        }
-        return true
-    }
-
-    // Held modifiers and lock keys are not repeated, as on a real keyboard.
-    private val noRepeat = intArrayOf(
-        0x1D, 0x2A, 0x36, 0x38, 0x3A, 0x45, 0x46, Protocol.KEY_EXTENDED or 0x1D,
-        Protocol.KEY_EXTENDED or 0x38, Protocol.KEY_EXTENDED or 0x5B, Protocol.KEY_EXTENDED or 0x5C, Protocol.KEY_PAUSE
-    )
-
-    private val repeater = object : Runnable {
-        override fun run() {
-            if (repeatCode == 0) return
-            sendKey(repeatCode, true)
-            root.postDelayed(this, ViewConfiguration.getKeyRepeatDelay().toLong())
-        }
-    }
-
-    private fun stopRepeat() {
-        repeatCode = 0
-        root.removeCallbacks(repeater)
-    }
-
-    private fun releaseAllKeys() {
-        stopRepeat()
-        for (c in pressed.indices) if (pressed[c]) sendKey(c, false)
-    }
-
-    private fun sendKey(code: Int, down: Boolean) {
-        if (code in pressed.indices) pressed[code] = down
-        connection?.send(Protocol.message(Protocol.KEY, 3) {
-            it.put((if (down) Protocol.KEY_DOWN else 0).toByte())
-            it.putShort(code.toShort())
-        })
-    }
-
-    // A box to type the PC's Windows password into when the tablet cannot show its locked sign-in screen.
-    // The text is sent over the (encrypted) link and the PC types it into the sign-in field; nothing is kept
-    // here. While the box is up, key events belong to it (passwordDialogOpen), so they are not forwarded.
-    private fun showPasswordDialog() {
-        if (passwordDialog != null) return // already up
-        val ui = Ui(this)
-        val field = ui.field("Windows password").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        // A hint / error line under the field (e.g. "wrong password"); hidden until there is something to say.
-        val status = ui.caption("").apply { setTextColor(ui.color(R.color.pd_danger)); visibility = View.GONE }
-        // The "Signing in…" row shown while the PC verifies the password; hidden until Send is pressed.
-        val spinner = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-            setPadding(0, ui.dp(18), 0, ui.dp(2))
-            addView(ProgressBar(this@DisplayActivity).apply {
-                isIndeterminate = true
-                indeterminateTintList = android.content.res.ColorStateList.valueOf(ui.color(R.color.pd_accent))
-            }, LinearLayout.LayoutParams(ui.dp(26), ui.dp(26)))
-            addView(ui.text("Signing in…", 15f, R.color.pd_text2).apply { setPadding(ui.dp(14), 0, 0, 0) })
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = ui.shape(ui.color(R.color.pd_surface), 20, ui.color(R.color.pd_outline), 1)
-            val side = ui.dp(22)
-            setPadding(side, ui.dp(20), side, ui.dp(18))
-            addView(ui.text("Sign in to the PC", 19f, R.color.pd_text, bold = true))
-            addView(
-                ui.caption("Type the Windows password and send it to the PC's sign-in screen.")
-                    .apply { setPadding(0, ui.dp(6), 0, ui.dp(16)) })
-            addView(
-                field,
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            )
-            addView(status.apply { setPadding(0, ui.dp(10), 0, 0) })
-            addView(spinner)
-        }
-        passwordDialogOpen = true
-        val dialog = AlertDialog.Builder(this).setView(content).create()
-        passwordDialog = dialog
-        passwordField = field
-        passwordStatus = status
-        passwordSpinner = spinner
-        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT)) // show our own rounded surface, not the platform frame
-        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
-        dialog.setOnDismissListener {
-            root.removeCallbacks(passwordTimeout)
-            passwordDialogOpen = false; passwordSubmitting = false
-            passwordDialog = null; passwordField = null; passwordStatus = null; passwordSpinner = null; passwordButtons = null
-            field.text.clear()
-        }
-        // Our own buttons, styled like the connect screen: a tonal Cancel and an accent Send.
-        val buttons = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, ui.dp(18), 0, 0)
-            addView(
-                ui.tonalButton("Cancel") { dialog.dismiss() },
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            addView(ui.primaryButton("Send") { submitPassword() },
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = ui.dp(10) })
-        }
-        passwordButtons = buttons
-        content.addView(buttons)
-        try {
-            dialog.show()
-            field.requestFocus()
-        } catch (_: Exception) { // window not attached (racing a background transition): drop it, reopen on focus
-            passwordDialog = null
-            passwordDialogOpen = false
-        }
-    }
-
-    // Send the typed password and switch the box to a "Signing in…" state: the PC types it into the sign-in
-    // screen and, if it is right, unlocks - which arrives back as LockState(false) and dismisses the box. If no
-    // unlock comes within the timeout, the password was wrong (or did not take), so we show an error and let the
-    // user try again. There is no explicit "wrong password" message from Windows we can read, so the unlock (or
-    // its absence) is the signal.
-    private fun submitPassword() {
-        if (passwordSubmitting) return
-        val text = passwordField?.text?.toString() ?: return
-        if (text.isEmpty()) { showPasswordError("Type the password first."); return }
-        connection?.send(Protocol.secureText(text, true))
-        passwordSubmitting = true
-        passwordStatus?.visibility = View.GONE
-        passwordButtons?.visibility = View.GONE
-        passwordField?.isEnabled = false
-        passwordSpinner?.visibility = View.VISIBLE
-        passwordDialog?.setCancelable(false) // don't let a stray back/tap drop it mid-verify; the timeout restores control
-        root.removeCallbacks(passwordTimeout)
-        root.postDelayed(passwordTimeout, 8000)
-    }
-
-    private fun onPasswordVerifyTimedOut() {
-        if (!passwordSubmitting) return
-        passwordSubmitting = false
-        passwordSpinner?.visibility = View.GONE
-        passwordButtons?.visibility = View.VISIBLE
-        passwordField?.apply { isEnabled = true; text.clear(); requestFocus() }
-        passwordDialog?.setCancelable(true)
-        showPasswordError("That didn't work. Check the password and try again.")
-    }
-
-    private fun showPasswordError(message: String) {
-        passwordStatus?.apply { text = message; visibility = View.VISIBLE }
-    }
 
     // ---- surface lifecycle drives the connection ------------------------------------------
 
@@ -483,46 +261,25 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             return
         }
         decoder = VideoDecoder(decoderSurface(holder.surface))
+        startSession()
+    }
+
+    private fun startSession() {
         val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
         val port = intent.getIntExtra(EXTRA_PORT, Protocol.TCP_PORT)
         val pin = intent.getIntExtra(EXTRA_PIN, 0)
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(metrics)
-        // The PC renders, encodes and sends this size; below the panel's, this tablet upscales it.
-        val w = scaledToRender(maxOf(metrics.widthPixels, metrics.heightPixels))
-        val h = scaledToRender(minOf(metrics.widthPixels, metrics.heightPixels))
-        var mask = 0
-        if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_H264))) mask =
-            mask or Protocol.MASK_H264
-        if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_HEVC))) mask =
-            mask or Protocol.MASK_HEVC
-        if (mask == 0) mask = Protocol.MASK_H264
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        var flags = Protocol.HELLO_RECONNECTS
-        if (prefs.getBoolean("gamingMode", false)) flags = flags or Protocol.HELLO_GAMING_MODE
-        if (prefs.getBoolean("onlyScreen", false)) flags = flags or Protocol.HELLO_ONLY_SCREEN
-        hello = Protocol.clientHello(
-            w,
-            h,
-            metrics.densityDpi,
-            mask,
-            pin,
-            refreshHz,
-            flags,
-            "${Build.MANUFACTURER} ${Build.MODEL}"
-        )
+        hello = makeHello(pin)
         gotFirstFrame = false
         if (!Tls.isLoopback(host)) acquireWifiLock()
         // Everything but USB (the loopback tunnel never touches the network) is encrypted and pinned to the PC's certificate.
         val trust = if (Tls.isLoopback(host)) null else HostTrust(prefs, host)
         hostTrust = trust
         mediaStarted = false
+        media = SessionMedia(this, host, port, pin, trust, prefs) { updateBadge() }
         sessionActive = true
         connect()
-        if (prefs.getBoolean("audio", false)) {
-            audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true), trust).also { it.start() }
-        }
+        media?.startAudio()
         if (keepInBackground) {
             val granted = { permission: String -> checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED }
             SessionService.onDisconnect = { finish() }
@@ -532,6 +289,27 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
                 prefs.getBoolean("camToPc", false) && granted(Manifest.permission.CAMERA)
             )
         }
+    }
+
+    private fun makeHello(pin: Int): ByteArray {
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        // The PC renders, encodes and sends this size; below the panel's, this tablet upscales it.
+        val w = scaledToRender(maxOf(metrics.widthPixels, metrics.heightPixels))
+        val h = scaledToRender(minOf(metrics.widthPixels, metrics.heightPixels))
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        var flags = Protocol.HELLO_RECONNECTS
+        if (prefs.getBoolean("gamingMode", false)) flags = flags or Protocol.HELLO_GAMING_MODE
+        if (prefs.getBoolean("onlyScreen", false)) flags = flags or Protocol.HELLO_ONLY_SCREEN
+        return Protocol.clientHello(w, h, metrics.densityDpi, supportedCodecs(), pin, refreshHz, flags, "${Build.MANUFACTURER} ${Build.MODEL}")
+    }
+
+    private fun supportedCodecs(): Int {
+        var mask = 0
+        if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_H264))) mask = mask or Protocol.MASK_H264
+        if (VideoDecoder.hasHardwareDecoder(VideoDecoder.mimeFor(Protocol.CODEC_HEVC))) mask = mask or Protocol.MASK_HEVC
+        return if (mask == 0) Protocol.MASK_H264 else mask
     }
 
     private fun connect() {
@@ -650,9 +428,11 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     private fun closeSession() {
         sessionActive = false
         root.removeCallbacks(reconnect)
+        reconnectStartedMs = 0L // a later session starts with its own minute of retries
+        everConnected = false
         hostReady = false
         KeyRouter.detach()
-        releaseAllKeys()
+        keys.releaseAll()
         wifiLock?.release()
         wifiLock = null
         if (serviceStarted) {
@@ -668,25 +448,9 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
         decoder = null
     }
 
-    // Each on its own, because one that throws must not leave the others open: the microphone and the camera would go on sending.
-    private fun closeEach(vararg closers: () -> Unit) {
-        for (close in closers) {
-            try {
-                close()
-            } catch (e: Exception) {
-                Log.e("PadDisplay", "closing the session", e)
-            }
-        }
-    }
-
     private fun stopMediaStreams() {
-        closeEach({ audio?.close() }, { mic?.close() }, { cam?.close() })
-        audio = null
-        mic = null
-        cam = null
+        media?.stop()
         mediaStarted = false
-        micOn = false
-        camOn = false
         updateBadge()
     }
 
@@ -704,7 +468,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
             reconnectAttempts = 0
             hostReady = false
             KeyRouter.detach()
-            releaseAllKeys() // the PC let go of them itself when the session ended
+            keys.releaseAll() // the PC let go of them itself when the session ended
             input.releaseMouseButtons()
             stopMediaStreams() // their connections went down with the link; they start again with the new session
             gotFirstFrame = false
@@ -719,7 +483,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     }
 
     override fun onDestroy() {
-        passwordDialog?.dismiss() // don't leak the window
+        passwordBox.dismiss() // don't leak the window
         closeSession() // ended while in the background, where the surface was already gone
         KeyRouter.detach()
         input.release()
@@ -729,80 +493,17 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     // ---- Connection.Listener (reader thread) -----------------------------------------------
 
-    // The microphone and camera connections open only once the PC has accepted the PIN on the video connection, so a wrong
-    // PIN is counted once and not once per connection, and only if the user switched them on and Android allows it.
     private fun startMediaStreams() {
         if (mediaStarted) return
         mediaStarted = true
-        val host = intent.getStringExtra(EXTRA_HOST) ?: return
-        val port = intent.getIntExtra(EXTRA_PORT, Protocol.TCP_PORT)
-        val pin = intent.getIntExtra(EXTRA_PIN, 0)
-        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        val granted = { permission: String -> checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED }
         runOnUiThread {
-            if (isFinishing || !sessionActive) return@runOnUiThread
-            // Already running from the start, or started again after a reconnect.
-            if (audio == null && prefs.getBoolean("audio", false))
-                audio = AudioStream(host, port, pin, prefs.getBoolean("audioMutePc", true), hostTrust).also { it.start() }
-            if (prefs.getBoolean("micToPc", false)) {
-                if (granted(Manifest.permission.RECORD_AUDIO)) {
-                    mic = MicStream(host, port, pin, hostTrust, object : MicStream.Listener {
-                        override fun onMicState(active: Boolean) {
-                            micOn = active; runOnUiThread { updateBadge() }
-                        }
-
-                        override fun onMicNotice(message: String) {
-                            runOnUiThread {
-                                Toast.makeText(
-                                    this@DisplayActivity,
-                                    "Microphone: $message",
-                                    Toast.LENGTH_LONG
-                                ).show()
-                            }
-                        }
-                    }).also { it.start() }
-                } else {
-                    Toast.makeText(
-                        this,
-                        "Microphone: permission was taken away in Android's settings",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-            if (prefs.getBoolean("camToPc", false)) {
-                if (granted(Manifest.permission.CAMERA)) {
-                    cam = CameraStream(
-                        applicationContext,
-                        host,
-                        port,
-                        pin,
-                        hostTrust,
-                        prefs.getInt("camFacing", 1) == 1,
-                        prefs.getInt("camQuality", 720) != 1080,
-                        object : CameraStream.Listener {
-                            override fun onCameraState(streaming: Boolean) {
-                                camOn = streaming; runOnUiThread { updateBadge() }
-                            }
-
-                            override fun onCameraNotice(message: String) {
-                                runOnUiThread {
-                                    Toast.makeText(
-                                        this@DisplayActivity,
-                                        "Camera: $message",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                }
-                            }
-                        }).also { it.start() }
-                } else {
-                    Toast.makeText(this, "Camera: permission was taken away in Android's settings", Toast.LENGTH_LONG)
-                        .show()
-                }
-            }
+            if (!isFinishing && sessionActive) media?.startCapture()
         }
     }
 
     private fun updateBadge() {
+        val micOn = media?.micOn == true
+        val camOn = media?.camOn == true
         val parts = listOfNotNull(if (micOn) "Microphone on" else null, if (camOn) "Camera on" else null)
         mediaBadge.text = "● " + parts.joinToString("  ·  ")
         mediaBadge.visibility = if (parts.isEmpty()) View.GONE else View.VISIBLE
@@ -818,7 +519,6 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     override fun onHostHello(version: Int, codec: Int, width: Int, height: Int, fps: Int, bitrateKbps: Int) {
         everConnected = true
         startMediaStreams()
-        hostVersion = version
         videoW = width
         videoH = height
         hostKbps = bitrateKbps
@@ -925,10 +625,10 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
     // The PC is locked and the tablet can't show that screen (frozen) → offer the password box; the unlock that
     // follows a correct password arrives here as frozen=false and dismisses it. Only a v5 host sends this, so
-    // receiving it is itself proof the host can type the password - do NOT gate on hostVersion, which is still 0
-    // here: when the tablet connects while already locked the host never sent HostHello (capture is refused on
-    // the secure desktop), so onHostHello has not run. When frozen, auto-open the box so the user need not hunt
-    // for a button; the button stays as a way back if they dismiss it.
+    // receiving it is itself proof the host can type the password. It cannot be told from the host's version: when
+    // the tablet connects while already locked the host never sent HostHello (capture is refused on the secure
+    // desktop). When frozen, auto-open the box so the user need not hunt for a button; the button stays as a way
+    // back if they dismiss it.
     override fun onLockState(frozen: Boolean) {
         runOnUiThread {
             pcFrozen = frozen
@@ -937,8 +637,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
                 if (!gotFirstFrame) stats.text = "PC locked — type your password" // not "Connecting…": we are connected
                 openPasswordDialogIfFrozen()
             } else {
-                root.removeCallbacks(passwordTimeout) // the password worked (or the PC unlocked on its own)
-                passwordDialog?.dismiss() // signed in / streaming again
+                passwordBox.dismiss() // signed in / streaming again
             }
         }
     }
@@ -946,7 +645,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
     // Open the box by itself when the PC is frozen on the sign-in screen - but only while the window is actually
     // in front (showing a dialog on a backgrounded activity throws). onWindowFocusChanged reopens it on return.
     private fun openPasswordDialogIfFrozen() {
-        if (pcFrozen && passwordDialog == null && !isFinishing && hasWindowFocus()) showPasswordDialog()
+        if (pcFrozen && !isFinishing && hasWindowFocus()) passwordBox.show()
     }
 
     override fun onClosed(connection: Connection, reason: String?) {
@@ -1009,7 +708,7 @@ class DisplayActivity : Activity(), Connection.Listener, SurfaceHolder.Callback 
 
                 @Suppress("DEPRECATION")
                 val panelHz = windowManager.defaultDisplay.refreshRate.roundToInt()
-                val a = audio
+                val a = media?.audio
                 val line = String.format(
                     "%s %dx%d · %.0f fps (panel %d Hz) · %.1f Mbps (cap %.0f) · RTT %.1f ms · decode %.1f ms%s%s%s · %s",
                     codecName, videoW, videoH, fps, panelHz, mbps, hostKbps / 1000f, rttUs / 1000f, decMs, upscaled,

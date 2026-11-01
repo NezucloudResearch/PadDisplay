@@ -150,7 +150,7 @@ class InputCapture(private val view: View, private val send: (ByteArray) -> Unit
 
     /** history < 0 = current sample. */
     private fun sendTouchFrame(ev: MotionEvent, history: Int) {
-        val n = minOf(ev.pointerCount, 10)
+        val n = minOf(ev.pointerCount, Protocol.MAX_TOUCH_POINTS)
         val size = maxOf(view.width, 1).toFloat()
         send(Protocol.message(Protocol.TOUCH, 1 + n * 10) {
             it.put(n.toByte())
@@ -217,89 +217,103 @@ class InputCapture(private val view: View, private val send: (ByteArray) -> Unit
     }
 
     private fun handleMouse(ev: MotionEvent) {
-        val x = ev.x
-        val y = ev.y
         when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                state = State.PENDING
-                downX = x
-                downY = y
-                // Snap a quick second tap onto the first so Windows sees a double-click.
-                if (SystemClock.uptimeMillis() - lastTapMs < 400 && hypot(x - lastTapX, y - lastTapY) < slop * 4) {
-                    downX = lastTapX
-                    downY = lastTapY
-                }
-                mouse(Protocol.MOUSE_MOVE, downX, downY)
-                handler.postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
-            }
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                handler.removeCallbacks(longPress)
-                if (state == State.DRAGGING) mouse(Protocol.MOUSE_LEFT_UP, x, y)
-                if (state != State.DONE) {
-                    state = State.TWO_FINGER
-                    twoStartMs = SystemClock.uptimeMillis()
-                    twoMoved = false
-                    val (cx, cy) = centroid(ev)
-                    lastCx = cx
-                    lastCy = cy
-                    scrollAccX = 0f
-                    scrollAccY = 0f
-                }
-            }
-            MotionEvent.ACTION_MOVE -> when (state) {
-                State.PENDING -> if (hypot(x - downX, y - downY) > slop) {
-                    handler.removeCallbacks(longPress)
-                    state = State.DRAGGING
-                    mouse(Protocol.MOUSE_LEFT_DOWN, downX, downY)
-                    mouse(Protocol.MOUSE_MOVE, x, y)
-                }
-                State.DRAGGING -> mouse(Protocol.MOUSE_MOVE, x, y)
-                State.TWO_FINGER -> {
-                    val (cx, cy) = centroid(ev)
-                    // 40 px of finger travel = one wheel notch (120); natural (content follows finger) direction.
-                    scrollAccY += (cy - lastCy) * 3f
-                    scrollAccX += -(cx - lastCx) * 3f
-                    lastCx = cx
-                    lastCy = cy
-                    if (abs(scrollAccY) + abs(scrollAccX) > slop * 3) twoMoved = true
-                    val wv = scrollAccY.toInt()
-                    val wh = scrollAccX.toInt()
-                    if (wv != 0 || wh != 0) {
-                        mouse(Protocol.MOUSE_WHEEL, cx, cy, wv, wh)
-                        scrollAccY -= wv
-                        scrollAccX -= wh
-                    }
-                }
-                else -> {}
-            }
-            MotionEvent.ACTION_POINTER_UP -> if (state == State.TWO_FINGER) {
-                if (!twoMoved && SystemClock.uptimeMillis() - twoStartMs < 300) {
-                    val (cx, cy) = centroid(ev)
-                    rightClick(cx, cy)
-                }
-                state = State.DONE
-            }
-            MotionEvent.ACTION_UP -> {
-                handler.removeCallbacks(longPress)
-                when (state) {
-                    State.PENDING -> {
-                        mouse(Protocol.MOUSE_LEFT_DOWN, downX, downY)
-                        mouse(Protocol.MOUSE_LEFT_UP, downX, downY)
-                        lastTapMs = SystemClock.uptimeMillis()
-                        lastTapX = downX
-                        lastTapY = downY
-                    }
-                    State.DRAGGING -> mouse(Protocol.MOUSE_LEFT_UP, x, y)
-                    else -> {}
-                }
-                state = State.IDLE
-            }
+            MotionEvent.ACTION_DOWN -> onFingerDown(ev.x, ev.y)
+            MotionEvent.ACTION_POINTER_DOWN -> onSecondFinger(ev)
+            MotionEvent.ACTION_MOVE -> onFingersMoved(ev)
+            MotionEvent.ACTION_POINTER_UP -> onSecondFingerLifted(ev)
+            MotionEvent.ACTION_UP -> onFingerUp(ev.x, ev.y)
             MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPress)
-                if (state == State.DRAGGING) mouse(Protocol.MOUSE_LEFT_UP, x, y)
+                if (state == State.DRAGGING) mouse(Protocol.MOUSE_LEFT_UP, ev.x, ev.y)
                 state = State.IDLE
             }
         }
+    }
+
+    private fun onFingerDown(x: Float, y: Float) {
+        state = State.PENDING
+        downX = x
+        downY = y
+        // Snap a quick second tap onto the first so Windows sees a double-click.
+        if (SystemClock.uptimeMillis() - lastTapMs < 400 && hypot(x - lastTapX, y - lastTapY) < slop * 4) {
+            downX = lastTapX
+            downY = lastTapY
+        }
+        mouse(Protocol.MOUSE_MOVE, downX, downY)
+        handler.postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+    }
+
+    private fun onSecondFinger(ev: MotionEvent) {
+        handler.removeCallbacks(longPress)
+        if (state == State.DRAGGING) mouse(Protocol.MOUSE_LEFT_UP, ev.x, ev.y)
+        if (state == State.DONE) return
+        state = State.TWO_FINGER
+        twoStartMs = SystemClock.uptimeMillis()
+        twoMoved = false
+        val (cx, cy) = centroid(ev)
+        lastCx = cx
+        lastCy = cy
+        scrollAccX = 0f
+        scrollAccY = 0f
+    }
+
+    private fun onFingersMoved(ev: MotionEvent) {
+        val x = ev.x
+        val y = ev.y
+        when (state) {
+            State.PENDING -> if (hypot(x - downX, y - downY) > slop) {
+                handler.removeCallbacks(longPress)
+                state = State.DRAGGING
+                mouse(Protocol.MOUSE_LEFT_DOWN, downX, downY)
+                mouse(Protocol.MOUSE_MOVE, x, y)
+            }
+            State.DRAGGING -> mouse(Protocol.MOUSE_MOVE, x, y)
+            State.TWO_FINGER -> scrollWithTwoFingers(ev)
+            else -> {}
+        }
+    }
+
+    private fun scrollWithTwoFingers(ev: MotionEvent) {
+        val (cx, cy) = centroid(ev)
+        // 40 px of finger travel = one wheel notch (120); natural (content follows finger) direction.
+        scrollAccY += (cy - lastCy) * 3f
+        scrollAccX += -(cx - lastCx) * 3f
+        lastCx = cx
+        lastCy = cy
+        if (abs(scrollAccY) + abs(scrollAccX) > slop * 3) twoMoved = true
+        val wv = scrollAccY.toInt()
+        val wh = scrollAccX.toInt()
+        if (wv != 0 || wh != 0) {
+            mouse(Protocol.MOUSE_WHEEL, cx, cy, wv, wh)
+            scrollAccY -= wv
+            scrollAccX -= wh
+        }
+    }
+
+    private fun onSecondFingerLifted(ev: MotionEvent) {
+        if (state != State.TWO_FINGER) return
+        if (!twoMoved && SystemClock.uptimeMillis() - twoStartMs < 300) {
+            val (cx, cy) = centroid(ev)
+            rightClick(cx, cy)
+        }
+        state = State.DONE
+    }
+
+    private fun onFingerUp(x: Float, y: Float) {
+        handler.removeCallbacks(longPress)
+        when (state) {
+            State.PENDING -> {
+                mouse(Protocol.MOUSE_LEFT_DOWN, downX, downY)
+                mouse(Protocol.MOUSE_LEFT_UP, downX, downY)
+                lastTapMs = SystemClock.uptimeMillis()
+                lastTapX = downX
+                lastTapY = downY
+            }
+            State.DRAGGING -> mouse(Protocol.MOUSE_LEFT_UP, x, y)
+            else -> {}
+        }
+        state = State.IDLE
     }
 
     // ---- mouse connected to the tablet ----------------------------------------------------

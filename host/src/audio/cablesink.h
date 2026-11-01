@@ -1,0 +1,70 @@
+// PadDisplay by Nezucloud. Copyright (c) 2026 Nezucloud.
+// SPDX-License-Identifier: MIT
+// The tablet's microphone through a virtual audio cable (VB-CABLE, shipped with PadDisplay and installed on request). Windows
+// only shows microphones that a signed kernel driver provides; PadDisplay's own driver is not Microsoft-signed, so on a PC with
+// Secure Boot the audio is played into the cable's playback device ("CABLE Input") and apps record from its recording
+// device ("CABLE Output"). Used when PadDisplay's own driver cannot load (see micbackend.h).
+#pragma once
+#include "jitterbuffer.h"
+
+#include <atomic>
+#include <cstdint>
+#include <string>
+#include <thread>
+
+namespace pd
+{
+
+    // Is a playback device whose name contains `preferred` (default "CABLE Input") active? name = its full name when it is.
+    // Any thread; initialises COM for the call.
+    bool CableInstalled(const std::wstring &preferred, std::wstring *name = nullptr);
+    // The ID of the cable's other end, the recording device that apps pick as their microphone ("CABLE Output"): the recording
+    // device of the same audio adapter as the playback device above. Empty = not found. Any thread.
+    std::wstring CableRecordingDeviceId(const std::wstring &preferred);
+    // The ID of the first active recording device whose name contains `wanted`. Empty = not found. Any thread.
+    std::wstring RecordingDeviceId(const std::wstring &wanted);
+
+    struct CableStream;
+
+    class CableOutput
+    {
+    public:
+        CableOutput(std::wstring preferredName, bool minPeriod);
+        ~CableOutput();
+        // Finds the cable, starts the render thread and waits until the stream plays. false = why says what went wrong.
+        bool Open(std::wstring &why);
+        // The tablet's audio (48 kHz mono s16), from the network thread. Waits at most for the audio thread to take one device buffer.
+        void Write(const int16_t *samples, size_t count);
+        // The tablet's microphone stops or starts (nobody records / somebody records again). Any thread. The audio left in the
+        // buffer is dropped and the next audio builds its cushion first, without that counting as an underrun or a gap.
+        void Restart();
+        bool Failed() const { return failed_; } // the audio side ended (the device went away, or could not be used)
+        void Close();
+        uint64_t Underruns() const { return buffer_.Underruns(); }
+        uint64_t Dropped() const { return buffer_.Dropped(); }
+        // How regularly the tablet's audio arrived (milliseconds between Write calls): a gap longer than the cushion is an underrun.
+        double MaxGapMs() const { return maxGapUs_ / 1000.0; }
+        uint64_t GapsOver15Ms() const { return gaps15_; }
+
+    private:
+        void RenderLoop(std::wstring deviceId);
+        bool StartStream(const CableStream &stream);
+        void PlayUntilEnded(const CableStream &stream);
+        void ReportOpened(bool ok);
+        void NoteArrival();
+
+        std::wstring preferred_;
+        bool minPeriod_;
+        std::thread thread_;
+        std::atomic<bool> stop_{false};
+        std::atomic<bool> failed_{false};
+        void *started_ = nullptr; // an event handle; signalled once the render thread knows whether the stream runs
+        std::atomic<bool> startedOk_{false};
+        std::atomic<bool> paused_{false}; // Restart(), for the network thread
+
+        JitterBuffer buffer_;
+        uint64_t lastWriteUs_ = 0; // network thread only
+        std::atomic<uint64_t> maxGapUs_{0}, gaps15_{0};
+    };
+
+} // namespace pd

@@ -77,7 +77,7 @@ Filename: "{app}\PadDisplay.exe"; Description: "Start PadDisplay"; Flags: nowait
 Filename: "{app}\PadDisplay.exe"; Parameters: "--uninstall-setup"; Flags: runhidden waituntilterminated; RunOnceId: "PadDisplaySetup"
 
 [UninstallDelete]
-; The virtual camera lives here because the Windows camera service loads it (see InstallCamera in src\vcam.cpp).
+; The virtual camera lives here because the Windows camera service loads it (see InstallCamera in src\camera\vcam.cpp).
 Type: filesandordirs; Name: "{commonpf64}\PadDisplay\Camera"
 Type: dirifempty; Name: "{app}"
 
