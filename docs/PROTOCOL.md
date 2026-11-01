@@ -93,7 +93,7 @@ To receive PC audio, the tablet opens a **second** TCP connection to the same po
 | host → client | 0x06 | AudioFormat | u32 sampleRate, u8 channels (2), u8 bitsPerSample (16) |
 | host → client | 0x07 | AudioData | u64 ptsUs, interleaved s16le PCM (about 10 ms per packet, following the Windows mix period) |
 
-- **Source:** the host captures the default output device with WASAPI loopback, which is taken before the PC's mute and volume, and down-mixes it to stereo.
+- **Source:** the host captures the default output device with WASAPI loopback, which is taken before the PC's mute and volume, and down-mixes it to stereo. When the default output changes, the host reopens the capture on the new device and sends a new `AudioFormat`.
 - **Sending:** the host only sends when the socket is writable right away; otherwise it drops the packet. It never queues.
 - **Client:** the client never sends on this connection, so the host treats "readable" as "closed" and restores the PC's mute state immediately.
 - **Playback:** the tablet plays through an `AudioTrack` with a 15 ms start threshold and keeps its queue near an adaptive target.
@@ -130,7 +130,7 @@ To use the tablet's camera as a PC webcam, the tablet opens a connection and sen
 | host → client | 0x0A | CamState | u8 active: 1 = an app on the PC has the webcam open, 0 = nobody does |
 | host → client | 0x0B | CamKeyframeReq | empty: the host could not decode, send an IDR |
 
-- **The camera runs only while someone uses the webcam.** After `CamHello` the host sends `CamState` 0. The tablet turns its camera and encoder on when it receives 1 and off (camera light off) when it receives 0. The host decides by watching whether the virtual camera's reader is asking for frames, about every 250 ms. Frames that arrive while the state is 0 are dropped.
+- **The camera runs only while someone uses the webcam.** After `CamHello` the host sends `CamState` 0. The tablet turns its camera and encoder on when it receives 1 and off (camera light off) when it receives 0. The host decides by watching whether the virtual camera's reader is asking for frames, about every 250 ms. Frames that arrive while the state is 0 are dropped, and after a drop the host skips frames until the next keyframe, which is the first frame of the restarted encoder.
 - **Encoding:** hardware H.264 from the camera's surface, no B-frames, an IDR only on request, CBR (about 4 Mbps at 720p30, 8 Mbps at 1080p30). Sizes up to 1920×1080.
 - **PC side:** the host decodes with the Media Foundation H.264 decoder in low-latency mode and writes the newest frame into a shared-memory slot that the virtual camera's media source (loaded by Windows' Frame Server) reads at 30 fps. There is no queue: a late frame is simply replaced. With no frame for 1 s, apps see a dark "no signal" picture.
 - **Refusals:** before Windows 11, before the one-time setup, or with `acceptTabletCamera` off, the host sends one `Notice` and ends the connection.

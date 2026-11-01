@@ -24,7 +24,7 @@ class FingerprintChangedException(val seen: String) : CertificateException("the 
  * or someone else's PC, never becomes the remembered identity.
  */
 class HostTrust(private val prefs: SharedPreferences, host: String) {
-    private val prefKey = "tlsfp_$host"
+    private val prefKey = prefKeyFor(host)
     private val lock = Any()
     private var pinned: String? = prefs.getString(prefKey, null)
     private var firstSeen: String? = null
@@ -35,7 +35,7 @@ class HostTrust(private val prefs: SharedPreferences, host: String) {
     }
 
     /** Called during the handshake with the fingerprint of the certificate the PC presented. */
-    private fun check(fingerprint: String) = synchronized(lock) {
+    internal fun check(fingerprint: String) = synchronized(lock) {
         val expected = pinned ?: firstSeen
         if (expected == null) firstSeen = fingerprint
         else if (expected != fingerprint) throw FingerprintChangedException(fingerprint)
@@ -50,11 +50,6 @@ class HostTrust(private val prefs: SharedPreferences, host: String) {
         }
     }
 
-    fun forget() = synchronized(lock) {
-        pinned = null
-        firstSeen = null
-        prefs.edit().remove(prefKey).apply()
-    }
 
     private inner class PinningTrustManager : X509TrustManager {
         override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = throw CertificateException("not a server")
@@ -68,6 +63,11 @@ class HostTrust(private val prefs: SharedPreferences, host: String) {
     }
 
     companion object {
+        private fun prefKeyFor(host: String) = "tlsfp_$host"
+
+        /** The user trusts a new identity for [host]: the next connection pins whatever the PC shows then. */
+        fun forget(prefs: SharedPreferences, host: String) = prefs.edit().remove(prefKeyFor(host)).apply()
+
         /** "AB:CD:..." (SHA-256 of the certificate), the same text the PC shows in its tray menu. */
         fun fingerprintOf(cert: X509Certificate): String =
             MessageDigest.getInstance("SHA-256").digest(cert.encoded).joinToString(":") { "%02X".format(it) }

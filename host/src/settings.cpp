@@ -7,112 +7,140 @@
 #include <algorithm>
 #include <random>
 
-namespace pd {
+namespace pd
+{
+    namespace
+    {
 
-std::wstring AppDataDir() {
-    PWSTR base = nullptr;
-    std::wstring dir;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) dir = base;
-    CoTaskMemFree(base);
-    dir += L"\\PadDisplay";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    return dir;
-}
+        constexpr wchar_t kSection[] = L"host";
+        constexpr uint32_t kPinMin = 100000, kPinMax = 999999;
 
-static std::wstring IniPath() { return AppDataDir() + L"\\settings.ini"; }
+        class IniReader
+        {
+        public:
+            explicit IniReader(const std::wstring &path) : path_(path) {}
+            void Int(const wchar_t *key, int &value) const { value = int(GetPrivateProfileIntW(kSection, key, value, path_.c_str())); }
+            void Clamped(const wchar_t *key, int &value, int lowest, int highest) const
+            {
+                Int(key, value);
+                value = std::clamp(value, lowest, highest);
+            }
+            void Bool(const wchar_t *key, bool &value) const { value = GetPrivateProfileIntW(kSection, key, value, path_.c_str()) != 0; }
+            void Text(const wchar_t *key, std::wstring &value) const
+            {
+                wchar_t buffer[512];
+                GetPrivateProfileStringW(kSection, key, value.c_str(), buffer, 512, path_.c_str());
+                value = buffer;
+            }
+            void Number(const wchar_t *key, uint32_t &value) const
+            {
+                std::wstring text = L"0";
+                Text(key, text);
+                value = uint32_t(wcstoul(text.c_str(), nullptr, 10));
+            }
 
-static int GetInt(const wchar_t* key, int def) {
-    return int(GetPrivateProfileIntW(L"host", key, def, IniPath().c_str()));
-}
+        private:
+            const std::wstring &path_;
+        };
 
-static std::wstring GetStr(const wchar_t* key, const std::wstring& def) {
-    wchar_t buf[512];
-    GetPrivateProfileStringW(L"host", key, def.c_str(), buf, 512, IniPath().c_str());
-    return buf;
-}
+        class IniWriter
+        {
+        public:
+            explicit IniWriter(const std::wstring &path) : path_(path) {}
+            void Int(const wchar_t *key, int value) const { Text(key, std::to_wstring(value)); }
+            void Clamped(const wchar_t *key, int value, int, int) const { Int(key, value); }
+            void Bool(const wchar_t *key, bool value) const { Int(key, value); }
+            void Text(const wchar_t *key, const std::wstring &value) const { WritePrivateProfileStringW(kSection, key, value.c_str(), path_.c_str()); }
+            void Number(const wchar_t *key, uint32_t value) const { Text(key, std::to_wstring(value)); }
 
-static void PutStr(const wchar_t* key, const std::wstring& v) {
-    WritePrivateProfileStringW(L"host", key, v.c_str(), IniPath().c_str());
-}
+        private:
+            const std::wstring &path_;
+        };
 
-static void PutInt(const wchar_t* key, long long v) { PutStr(key, std::to_wstring(v)); }
+        // The one list of what settings.ini holds. Reading and writing both walk it, so a key cannot end up in only one of them.
+        template <class Ini, class AnySettings>
+        void ForEachSetting(const Ini &ini, AnySettings &s)
+        {
+            ini.Int(L"usbBitrateMbps", s.usbBitrateMbps);
+            ini.Int(L"wifiBitrateMbps", s.wifiBitrateMbps);
+            ini.Int(L"minBitrateMbps", s.minBitrateMbps);
+            ini.Bool(L"adaptive", s.adaptive);
+            ini.Clamped(L"maxFramesInFlight", s.maxFramesInFlight, 1, 10);
+            ini.Bool(L"wifiQos", s.wifiQos);
+            ini.Text(L"codec", s.codec);
+            ini.Clamped(L"maxFps", s.maxFps, 10, 240);
+            ini.Text(L"encoder", s.encoder);
+            ini.Text(L"gpu", s.gpu);
+            ini.Clamped(L"nvencPreset", s.nvencPreset, 0, 7);
+            ini.Bool(L"gamingMode", s.gamingMode);
+            ini.Bool(L"drawCursor", s.drawCursor);
+            ini.Bool(L"matchClientResolution", s.matchClientResolution);
+            ini.Bool(L"monitorOnlyWhileConnected", s.monitorOnlyWhileConnected);
+            ini.Bool(L"removeMonitorOnExit", s.removeMonitorOnExit);
+            ini.Clamped(L"reconnectGraceSeconds", s.reconnectGraceSeconds, 0, 600);
+            ini.Bool(L"gpuMaxPerformance", s.gpuMaxPerformance);
+            ini.Text(L"display", s.displayOverride);
+            ini.Text(L"adbPath", s.adbPath);
+            ini.Bool(L"requireUsbPin", s.requireUsbPin);
+            ini.Bool(L"requireEncryption", s.requireEncryption);
+            ini.Bool(L"acceptTabletMic", s.acceptTabletMic);
+            ini.Text(L"micBackend", s.micBackend);
+            ini.Text(L"micDevice", s.micDevice);
+            ini.Bool(L"cableMinPeriod", s.cableMinPeriod);
+            ini.Bool(L"acceptTabletCamera", s.acceptTabletCamera);
+            ini.Bool(L"uacClickableOnTablet", s.uacClickableOnTablet);
+            ini.Bool(L"lockScreenControl", s.lockScreenControl);
+            ini.Bool(L"preSignInAccess", s.preSignInAccess);
+            ini.Bool(L"runAsAdmin", s.runAsAdmin);
+            ini.Bool(L"autostartTask", s.autostartTask);
+            ini.Number(L"pin", s.pin);
+        }
 
-void Settings::Load() {
-    usbBitrateMbps = GetInt(L"usbBitrateMbps", usbBitrateMbps);
-    wifiBitrateMbps = GetInt(L"wifiBitrateMbps", wifiBitrateMbps);
-    minBitrateMbps = GetInt(L"minBitrateMbps", minBitrateMbps);
-    adaptive = GetInt(L"adaptive", adaptive) != 0;
-    wifiQos = GetInt(L"wifiQos", wifiQos) != 0;
-    maxFramesInFlight = std::clamp(GetInt(L"maxFramesInFlight", maxFramesInFlight), 1, 10);
-    codec = GetStr(L"codec", codec);
-    maxFps = std::clamp(GetInt(L"maxFps", maxFps), 10, 240);
-    encoder = GetStr(L"encoder", encoder);
-    gpu = GetStr(L"gpu", gpu);
-    nvencPreset = std::clamp(GetInt(L"nvencPreset", nvencPreset), 0, 7);
-    gamingMode = GetInt(L"gamingMode", gamingMode) != 0;
-    drawCursor = GetInt(L"drawCursor", drawCursor) != 0;
-    matchClientResolution = GetInt(L"matchClientResolution", matchClientResolution) != 0;
-    monitorOnlyWhileConnected = GetInt(L"monitorOnlyWhileConnected", monitorOnlyWhileConnected) != 0;
-    removeMonitorOnExit = GetInt(L"removeMonitorOnExit", removeMonitorOnExit) != 0;
-    reconnectGraceSeconds = std::clamp(GetInt(L"reconnectGraceSeconds", reconnectGraceSeconds), 0, 600);
-    gpuMaxPerformance = GetInt(L"gpuMaxPerformance", gpuMaxPerformance) != 0;
-    profile = GetInt(L"profile", profile) != 0;
-    displayOverride = GetStr(L"display", L"");
-    adbPath = GetStr(L"adbPath", L"");
-    requireUsbPin = GetInt(L"requireUsbPin", requireUsbPin) != 0;
-    requireEncryption = GetInt(L"requireEncryption", requireEncryption) != 0;
-    acceptTabletMic = GetInt(L"acceptTabletMic", acceptTabletMic) != 0;
-    micBackend = GetStr(L"micBackend", micBackend);
-    micDevice = GetStr(L"micDevice", L"");
-    cableMinPeriod = GetInt(L"cableMinPeriod", cableMinPeriod) != 0;
-    acceptTabletCamera = GetInt(L"acceptTabletCamera", acceptTabletCamera) != 0;
-    uacClickableOnTablet = GetInt(L"uacClickableOnTablet", uacClickableOnTablet) != 0;
-    lockScreenControl = GetInt(L"lockScreenControl", lockScreenControl) != 0;
-    preSignInAccess = GetInt(L"preSignInAccess", preSignInAccess) != 0;
-    runAsAdmin = GetInt(L"runAsAdmin", runAsAdmin) != 0;
-    autostartTask = GetInt(L"autostartTask", autostartTask) != 0;
-    pin =uint32_t(wcstoul(GetStr(L"pin", L"0").c_str(), nullptr, 10));
-    if (pin < 100000 || pin > 999999) {
-        std::random_device rd;
-        pin = 100000 + rd() % 900000;
+        uint32_t NewPin()
+        {
+            std::random_device random;
+            return kPinMin + random() % (kPinMax - kPinMin + 1);
+        }
+
+        std::wstring IniPath() { return AppDataDir() + L"\\settings.ini"; }
+
+    } // namespace
+
+    std::wstring AppDataDir()
+    {
+        PWSTR base = nullptr;
+        std::wstring dir;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)))
+            dir = base;
+        CoTaskMemFree(base);
+        dir += L"\\PadDisplay";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
     }
-    Save();
-}
 
-void Settings::Save() const {
-    PutInt(L"usbBitrateMbps", usbBitrateMbps);
-    PutInt(L"wifiBitrateMbps", wifiBitrateMbps);
-    PutInt(L"minBitrateMbps", minBitrateMbps);
-    PutInt(L"adaptive", adaptive);
-    PutInt(L"maxFramesInFlight", maxFramesInFlight);
-    PutInt(L"wifiQos", wifiQos);
-    PutStr(L"codec", codec);
-    PutInt(L"maxFps", maxFps);
-    PutStr(L"encoder", encoder);
-    PutStr(L"gpu", gpu);
-    PutInt(L"nvencPreset", nvencPreset);
-    PutInt(L"gamingMode", gamingMode);
-    PutInt(L"drawCursor", drawCursor);
-    PutInt(L"matchClientResolution", matchClientResolution);
-    PutInt(L"monitorOnlyWhileConnected", monitorOnlyWhileConnected);
-    PutInt(L"removeMonitorOnExit", removeMonitorOnExit);
-    PutInt(L"reconnectGraceSeconds", reconnectGraceSeconds);
-    PutInt(L"gpuMaxPerformance", gpuMaxPerformance);
-    PutStr(L"display", displayOverride);
-    PutStr(L"adbPath", adbPath);
-    PutInt(L"requireUsbPin", requireUsbPin);
-    PutInt(L"requireEncryption", requireEncryption);
-    PutInt(L"acceptTabletMic", acceptTabletMic);
-    PutStr(L"micBackend", micBackend);
-    PutStr(L"micDevice", micDevice);
-    PutInt(L"cableMinPeriod", cableMinPeriod);
-    PutInt(L"acceptTabletCamera", acceptTabletCamera);
-    PutInt(L"uacClickableOnTablet", uacClickableOnTablet);
-    PutInt(L"lockScreenControl", lockScreenControl);
-    PutInt(L"preSignInAccess", preSignInAccess);
-    PutInt(L"runAsAdmin", runAsAdmin);
-    PutInt(L"autostartTask", autostartTask);
-    PutInt(L"pin", pin);
-}
+    std::wstring MachineDataDir()
+    {
+        wchar_t programData[MAX_PATH] = {};
+        const DWORD n = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+        std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(programData) : std::wstring(L"C:\\ProgramData");
+        dir += L"\\PadDisplay";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
+    }
+
+    void Settings::Load() { LoadFrom(IniPath()); }
+    void Settings::Save() const { SaveTo(IniPath()); }
+
+    void Settings::LoadFrom(const std::wstring &iniPath)
+    {
+        const IniReader ini(iniPath);
+        ForEachSetting(ini, *this);
+        ini.Bool(L"profile", profile); // a diagnostic switch: it stays out of the file until someone adds it by hand
+        if (pin < kPinMin || pin > kPinMax)
+            pin = NewPin();
+        SaveTo(iniPath);
+    }
+
+    void Settings::SaveTo(const std::wstring &iniPath) const { ForEachSetting(IniWriter(iniPath), *this); }
 
 } // namespace pd

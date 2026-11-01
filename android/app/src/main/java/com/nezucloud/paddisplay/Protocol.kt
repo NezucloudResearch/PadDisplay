@@ -113,6 +113,7 @@ object Protocol {
     const val PAD_X = 0x4000
     const val PAD_Y = 0x8000
 
+    const val MAX_TOUCH_POINTS = 10
     const val COORD_MAX = 65535
     const val PRESSURE_MAX = 1024
 
@@ -143,7 +144,7 @@ object Protocol {
             it.putShort(screenH.toShort())
             it.putShort(dpi.toShort())
             it.put(codecMask.toByte())
-            it.put(10)
+            it.put(MAX_TOUCH_POINTS.toByte())
             it.putInt(pin)
             it.putShort(maxFps.toShort())
             it.put(flags.toByte())

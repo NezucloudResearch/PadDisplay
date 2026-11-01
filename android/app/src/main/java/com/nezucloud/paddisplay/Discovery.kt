@@ -17,11 +17,21 @@ class Discovery(context: Context, private val onUpdate: (List<Host>) -> Unit) {
 
     data class Host(val name: String, val address: String, val port: Int, val lastSeenMs: Long)
 
+    companion object {
+        /** null = not a PadDisplay beacon. */
+        internal fun parseBeacon(msg: String, address: String, nowMs: Long): Host? {
+            val parts = msg.trim().split(" ", limit = 4)
+            if (parts.size < 4 || parts[0] != "PADDISPLAY") return null
+            val port = parts[2].toIntOrNull() ?: return null
+            return Host(parts[3], address, port, nowMs)
+        }
+    }
+
     private val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
     private val main = Handler(Looper.getMainLooper())
     private val hosts = LinkedHashMap<String, Host>()
     @Volatile private var running = false
-    private var socket: DatagramSocket? = null
+    @Volatile private var socket: DatagramSocket? = null // stop() closes it from the UI thread, which wakes the receive at once
     private var thread: Thread? = null
     private var lock: WifiManager.MulticastLock? = null
 
@@ -68,10 +78,8 @@ class Discovery(context: Context, private val onUpdate: (List<Host>) -> Unit) {
     }
 
     private fun parse(msg: String, address: String) {
-        val parts = msg.trim().split(" ", limit = 4)
-        if (parts.size < 4 || parts[0] != "PADDISPLAY") return
-        val port = parts[2].toIntOrNull() ?: return
-        synchronized(hosts) { hosts[address] = Host(parts[3], address, port, SystemClock.elapsedRealtime()) }
+        val host = parseBeacon(msg, address, SystemClock.elapsedRealtime()) ?: return
+        synchronized(hosts) { hosts[address] = host }
         publish()
     }
 

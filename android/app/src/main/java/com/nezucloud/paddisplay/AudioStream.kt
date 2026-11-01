@@ -10,12 +10,9 @@ import android.util.Log
 import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
-import kotlin.math.floor
 import kotlin.math.sign
 
 /**
@@ -34,11 +31,11 @@ import kotlin.math.sign
  *   tablet's audio system stalling).
  */
 class AudioStream(
-    private val host: String,
-    private val port: Int,
+    host: String,
+    port: Int,
     private val pin: Int,
     private val mutePc: Boolean,
-    private val trust: HostTrust?, // null over USB; otherwise the same pinned TLS as the video connection
+    trust: HostTrust?,
 ) {
 
     companion object {
@@ -55,8 +52,7 @@ class AudioStream(
     }
 
     @Volatile private var closed = false
-    @Volatile private var socket: Socket? = null
-    @Volatile private var rawSocket: Socket? = null // the TCP socket under the TLS one
+    private val pc = PcSocket(host, port, trust)
     private var thread: Thread? = null
 
     // Stats for the overlay.
@@ -80,19 +76,13 @@ class AudioStream(
 
     fun close() {
         closed = true
-        Tls.hangUp(rawSocket)
+        pc.hangUp()
     }
 
     private fun run() {
         var track: AudioTrack? = null
         try {
-            val raw = Socket()
-            rawSocket = raw
-            socket = raw
-            raw.tcpNoDelay = true
-            raw.receiveBufferSize = 64 shl 10
-            raw.connect(InetSocketAddress(host, port), 3000)
-            val s: Socket = if (trust != null) Tls.wrap(raw, host, port, trust).also { socket = it } else raw
+            val s = pc.connect { it.receiveBufferSize = 64 shl 10 }
             s.getOutputStream().apply {
                 write(Protocol.message(Protocol.AUDIO_HELLO, 7) {
                     it.putShort(Protocol.VERSION.toShort())
@@ -211,8 +201,7 @@ class AudioStream(
                 try { it.stop() } catch (_: IllegalStateException) {}
                 it.release()
             }
-            try { rawSocket?.close() } catch (_: IOException) {}
-            try { socket?.close() } catch (_: IOException) {}
+            pc.closeQuietly()
         }
     }
 
@@ -238,42 +227,4 @@ class AudioStream(
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-
-    /**
-     * Stereo linear-interpolation resampler for tiny speed changes. Continuous across packets: the
-     * last frame of the previous packet is kept so there is no seam. ratio 1.0 = bit-exact copy.
-     */
-    private class DriftResampler {
-        private var pos = 0.0 // read position in the current packet, in frames; -1 = previous packet's last frame
-        private var prevL = 0f
-        private var prevR = 0f
-
-        fun reset() {
-            pos = 0.0
-            prevL = 0f
-            prevR = 0f
-        }
-
-        fun process(inp: ShortArray, frames: Int, ratio: Double, out: ShortArray): Int {
-            var n = 0
-            val max = out.size / 2
-            while (pos <= frames - 1 && n < max) {
-                val i0 = floor(pos).toInt() // -1 .. frames-1
-                val frac = (pos - i0).toFloat()
-                val l0 = if (i0 < 0) prevL else inp[2 * i0].toFloat()
-                val r0 = if (i0 < 0) prevR else inp[2 * i0 + 1].toFloat()
-                val i1 = i0 + 1
-                val l1 = if (i1 < frames) inp[2 * i1].toFloat() else l0
-                val r1 = if (i1 < frames) inp[2 * i1 + 1].toFloat() else r0
-                out[2 * n] = (l0 + (l1 - l0) * frac).toInt().toShort()
-                out[2 * n + 1] = (r0 + (r1 - r0) * frac).toInt().toShort()
-                n++
-                pos += ratio
-            }
-            pos -= frames
-            prevL = inp[2 * (frames - 1)].toFloat()
-            prevR = inp[2 * (frames - 1) + 1].toFloat()
-            return n
-        }
-    }
 }

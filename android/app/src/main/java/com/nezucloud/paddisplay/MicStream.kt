@@ -11,7 +11,6 @@ import android.os.SystemClock
 import android.util.Log
 import java.io.DataInputStream
 import java.io.IOException
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -31,7 +30,7 @@ class MicStream(
     private val host: String,
     private val port: Int,
     private val pin: Int,
-    private val trust: HostTrust?, // null over USB; otherwise the same pinned TLS as the video connection
+    trust: HostTrust?,
     private val listener: Listener,
 ) {
     interface Listener {
@@ -51,8 +50,7 @@ class MicStream(
 
     @Volatile private var closed = false
     @Volatile private var noticed = false
-    @Volatile private var socket: Socket? = null
-    @Volatile private var rawSocket: Socket? = null
+    private val pc = PcSocket(host, port, trust)
     private var thread: Thread? = null
 
     private val lock = ReentrantLock()
@@ -69,7 +67,7 @@ class MicStream(
 
     fun close() {
         closed = true
-        Tls.hangUp(rawSocket)
+        pc.hangUp()
         lock.withLock { pcSpoke.signalAll() }
     }
 
@@ -114,12 +112,7 @@ class MicStream(
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         var record: AudioRecord? = null
         try {
-            val raw = Socket()
-            rawSocket = raw
-            socket = raw
-            raw.tcpNoDelay = true
-            raw.connect(InetSocketAddress(host, port), 3000)
-            val s: Socket = if (trust != null) Tls.wrap(raw, host, port, trust).also { socket = it } else raw
+            val s = pc.connect()
             val out = s.getOutputStream()
             out.write(Protocol.message(Protocol.MIC_HELLO, 7) {
                 it.putShort(Protocol.VERSION.toShort())
@@ -136,6 +129,8 @@ class MicStream(
             val bb = ByteBuffer.wrap(msg).order(ByteOrder.LITTLE_ENDIAN)
             bb.put(0, Protocol.MIC_DATA.toByte())
             bb.putInt(1, 8 + SAMPLES * 2)
+            bb.position(Protocol.HEADER_SIZE + 8)
+            val samplesInMsg = bb.asShortBuffer()
             val keepalive = Protocol.message(Protocol.MIC_DATA, 8) { it.putLong(0) } // no samples: the PC only notes that we are here
             val pcm = ShortArray(SAMPLES)
             var lastSent = connectedAt
@@ -167,8 +162,8 @@ class MicStream(
                 }
                 if (closed) break
                 bb.putLong(Protocol.HEADER_SIZE, SystemClock.elapsedRealtimeNanos() / 1000)
-                bb.position(Protocol.HEADER_SIZE + 8)
-                bb.asShortBuffer().put(pcm)
+                samplesInMsg.clear()
+                samplesInMsg.put(pcm)
                 out.write(msg)
                 out.flush()
                 lastSent = SystemClock.elapsedRealtime()
@@ -183,8 +178,7 @@ class MicStream(
         } finally {
             closed = true
             record?.let { closeMicrophone(it) }
-            try { rawSocket?.close() } catch (_: IOException) {}
-            try { socket?.close() } catch (_: IOException) {}
+            pc.closeQuietly()
             listener.onMicState(false)
         }
     }

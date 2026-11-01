@@ -25,8 +25,6 @@ import android.util.Size
 import android.view.Surface
 import java.io.DataInputStream
 import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executor
@@ -40,10 +38,10 @@ import java.util.concurrent.Executor
  */
 class CameraStream(
     private val context: Context,
-    private val host: String,
-    private val port: Int,
+    host: String,
+    port: Int,
     private val pin: Int,
-    private val trust: HostTrust?, // null over USB; otherwise the same pinned TLS as the video connection
+    trust: HostTrust?,
     private val front: Boolean,
     private val height720: Boolean, // true = 1280x720, false = 1920x1080
     private val listener: Listener,
@@ -60,8 +58,7 @@ class CameraStream(
 
     @Volatile private var closed = false
     @Volatile private var noticed = false
-    @Volatile private var socket: Socket? = null
-    @Volatile private var rawSocket: Socket? = null
+    private val pc = PcSocket(host, port, trust)
     private var thread: Thread? = null
     private val sendLock = Any()
     private var out: java.io.OutputStream? = null
@@ -84,7 +81,7 @@ class CameraStream(
 
     fun close() {
         closed = true
-        Tls.hangUp(rawSocket)
+        pc.hangUp()
         cameraHandler.post {
             stopCapture()
             cameraThread.quitSafely()
@@ -94,13 +91,7 @@ class CameraStream(
     private fun run() {
         try {
             size = chooseSize()
-            val raw = Socket()
-            rawSocket = raw
-            socket = raw
-            raw.tcpNoDelay = true
-            raw.trafficClass = 0xA0 // DSCP CS5, like the video
-            raw.connect(InetSocketAddress(host, port), 3000)
-            val s: Socket = if (trust != null) Tls.wrap(raw, host, port, trust).also { socket = it } else raw
+            val s = pc.connect { it.trafficClass = 0xA0 } // DSCP CS5, like the video
             out = s.getOutputStream()
             send(Protocol.message(Protocol.CAM_HELLO, 12) {
                 it.putShort(Protocol.VERSION.toShort())
@@ -138,8 +129,7 @@ class CameraStream(
             Log.w(TAG, "camera failed: $e")
         } finally {
             closed = true
-            try { rawSocket?.close() } catch (_: IOException) {}
-            try { socket?.close() } catch (_: IOException) {}
+            pc.closeQuietly()
             cameraHandler.post {
                 stopCapture()
                 cameraThread.quitSafely()
@@ -272,9 +262,9 @@ class CameraStream(
             }
         }
         Log.i(TAG, "encoder ${codec.name} configured at level $level")
+        encoder = codec // first: stopCapture releases it if the next two calls fail
         inputSurface = codec.createInputSurface()
         codec.start()
-        encoder = codec
         encoderThread = Thread({ drainEncoder(codec) }, "pd-cam-enc").apply {
             priority = Thread.MAX_PRIORITY
             start()
@@ -286,10 +276,7 @@ class CameraStream(
         try {
             while (!closed) {
                 val index = codec.dequeueOutputBuffer(info, 100_000)
-                if (index < 0) {
-                    if (index == MediaCodec.INFO_TRY_AGAIN_LATER || index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
-                    continue
-                }
+                if (index < 0) continue // nothing yet, or a format change: the PC reads the format from the stream itself
                 val buf = codec.getOutputBuffer(index)
                 if (buf != null && info.size > 0) {
                     buf.position(info.offset)
